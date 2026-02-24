@@ -1,0 +1,31 @@
+# Node / Frontend
+node_modules/
+dist/
+.svelte-kit/
+.vercel
+.output
+.DS_Store
+*.log
+
+# Rust / Backend
+src-tauri/target/
+src-tauri/gen/schemas/
+src-tauri/capabilities/
+
+# Testing
+test-results/
+playwright-report/
+blob-report/
+
+# OS / IDE
+.vscode/
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# VCS
+.git/
+.jj/
