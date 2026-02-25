@@ -34,81 +34,90 @@ impl Parser for PluggableParser {
 
         // Use the relative path itself as the fallback ID to keep extensions intact
         let fallback_node_id = relative_path.to_string();
+        let filename = Path::new(relative_path)
+            .file_name()
+            .and_then(|f| f.to_str())
+            .unwrap_or(relative_path);
 
         let tree = match ts_parser.parse(content, None) {
             Some(t) => t,
             None => return (nodes, edges),
         };
 
-                    let mut node_label = fallback_node_id.clone();
-                    let mut functions = Vec::new();
-                    let mut file_edges = Vec::new();
-        
-                    if let Some(q) = &query {
-                        let mut cursor = QueryCursor::new();
-                        let mut matches = cursor.matches(q, tree.root_node(), content.as_bytes());
-        
-                        while let Some(m) = matches.next() {
-                            let mut current_edge_target = None;
-                            let mut current_edge_kind = self.default_edge_kind.to_string();
-                            let mut current_func_name = None;
-                            let mut current_func_kind = "def".to_string();
-        
-                            for cap in m.captures {
-                                let capture_name = &q.capture_names()[cap.index as usize];
-                                if let Ok(text) = cap.node.utf8_text(content.as_bytes()) {
-                                    let clean_text = text.trim_matches(|c| c == '\'' || c == '"').to_string();
-                                    match *capture_name {
-                                        "node.name" => {
-                                            if node_label == fallback_node_id {
-                                                node_label = clean_text;
-                                            }
-                                        }
-                                        "func.name" => {
-                                            current_func_name = Some(clean_text);
-                                        }
-                                        "func.kind" => {
-                                            current_func_kind = clean_text;
-                                        }
-                                        "edge.target" => {
-                                            current_edge_target = Some(clean_text);
-                                        }
-                                        "edge.kind" => {
-                                            current_edge_kind = clean_text;
-                                        }
-                                        _ => {}
-                                    }
+        let mut extracted_name = None;
+        let mut functions = Vec::new();
+        let mut file_edges = Vec::new();
+
+        if let Some(q) = &query {
+            let mut cursor = QueryCursor::new();
+            let mut matches = cursor.matches(q, tree.root_node(), content.as_bytes());
+
+            while let Some(m) = matches.next() {
+                let mut current_edge_target = None;
+                let mut current_edge_kind = self.default_edge_kind.to_string();
+                let mut current_func_name = None;
+                let mut current_func_kind = "def".to_string();
+
+                for cap in m.captures {
+                    let capture_name = &q.capture_names()[cap.index as usize];
+                    if let Ok(text) = cap.node.utf8_text(content.as_bytes()) {
+                        let clean_text = text.trim_matches(|c| c == '\'' || c == '"').to_string();
+                        match *capture_name {
+                            "node.name" => {
+                                if extracted_name.is_none() {
+                                    extracted_name = Some(clean_text);
                                 }
                             }
-        
-                            if let Some(target) = current_edge_target {
-                                file_edges.push(Edge {
-                                    source: fallback_node_id.clone(),
-                                    target,
-                                    kind: current_edge_kind,
-                                });
+                            "func.name" => {
+                                current_func_name = Some(clean_text);
                             }
-        
-                            if let Some(name) = current_func_name {
-                                functions.push(Func {
-                                    name,
-                                    arity: 0,
-                                    kind: current_func_kind,
-                                });
+                            "func.kind" => {
+                                current_func_kind = clean_text;
                             }
+                            "edge.target" => {
+                                current_edge_target = Some(clean_text);
+                            }
+                            "edge.kind" => {
+                                current_edge_kind = clean_text;
+                            }
+                            _ => {}
                         }
                     }
-        
-                    nodes.push(Node {
-                        id: fallback_node_id.clone(),
-                        label: node_label,
-                        kind: self.default_node_kind.into(),
-                        file: relative_path.to_string(),
-                        line_count: content.lines().count(),
-                        change_status: "unchanged".into(),
-                        functions,
+                }
+
+                if let Some(target) = current_edge_target {
+                    file_edges.push(Edge {
+                        source: fallback_node_id.clone(),
+                        target,
+                        kind: current_edge_kind,
                     });
-                    edges.extend(file_edges);
-                (nodes, edges)
+                }
+
+                if let Some(name) = current_func_name {
+                    functions.push(Func {
+                        name,
+                        arity: 0,
+                        kind: current_func_kind,
+                    });
+                }
+            }
+        }
+
+        let node_label = match extracted_name {
+            Some(name) if name != filename => format!("{} ({})", filename, name),
+            _ => filename.to_string(),
+        };
+
+        nodes.push(Node {
+            id: fallback_node_id.clone(),
+            label: node_label,
+            kind: self.default_node_kind.into(),
+            file: relative_path.to_string(),
+            line_count: content.lines().count(),
+            change_status: "unchanged".into(),
+            functions,
+        });
+        edges.extend(file_edges);
+        (nodes, edges)
     }
 }

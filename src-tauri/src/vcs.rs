@@ -52,7 +52,7 @@ pub fn get_current_branch(repo: &Path) -> String {
     match detect_engine(repo) {
         VCSEngine::JJ => {
             let output = std::process::Command::new("jj")
-                .args(["log", "--no-graph", "-r", "@", "-T", "bookmarks.join(', ')"])
+                .args(["--no-pager", "log", "--no-graph", "-r", "@", "-T", "bookmarks.join(', ')"])
                 .current_dir(repo)
                 .output();
             if let Ok(o) = output {
@@ -62,7 +62,7 @@ pub fn get_current_branch(repo: &Path) -> String {
         },
         VCSEngine::Git => {
             let output = std::process::Command::new("git")
-                .args(["rev-parse", "--abbrev-ref", "HEAD"])
+                .args(["--no-pager", "rev-parse", "--abbrev-ref", "HEAD"])
                 .current_dir(repo)
                 .output();
             if let Ok(o) = output {
@@ -86,7 +86,7 @@ pub fn get_all_files(repo: &Path) -> Vec<String> {
     match detect_engine(repo) {
         VCSEngine::JJ => {
             let output = std::process::Command::new("jj")
-                .args(["files"])
+                .args(["--no-pager", "file", "list"])
                 .current_dir(repo)
                 .output();
             if let Ok(o) = output {
@@ -95,7 +95,7 @@ pub fn get_all_files(repo: &Path) -> Vec<String> {
         },
         VCSEngine::Git => {
             let output = std::process::Command::new("git")
-                .args(["ls-files"])
+                .args(["--no-pager", "ls-files"])
                 .current_dir(repo)
                 .output();
             if let Ok(o) = output {
@@ -118,7 +118,7 @@ pub fn get_file_diff(repo: &Path, file: &str, since: Option<&str>) -> String {
 
 fn get_git_changes(repo: &Path, limit: usize) -> Vec<Change> {
     let output = std::process::Command::new("git")
-        .args(["log", "-n", &limit.to_string(), "--pretty=format:%h\t%s\t%ai"])
+        .args(["--no-pager", "log", "-n", &limit.to_string(), "--pretty=format:%h\t%s\t%ai"])
         .current_dir(repo)
         .output();
 
@@ -146,7 +146,7 @@ fn get_git_changes(repo: &Path, limit: usize) -> Vec<Change> {
 
 fn get_git_branches(repo: &Path) -> Vec<Bookmark> {
     let output = std::process::Command::new("git")
-        .args(["branch", "--format=%(refname:short)\t%(objectname:short)"])
+        .args(["--no-pager", "branch", "--format=%(refname:short)\t%(objectname:short)"])
         .current_dir(repo)
         .output();
 
@@ -181,7 +181,7 @@ fn get_git_changed_files(repo: &Path, since: &str) -> HashMap<String, String> {
         };
         
         let output = std::process::Command::new("git")
-            .args(["diff", "--name-status", &rev])
+            .args(["--no-pager", "diff", "--name-status", &rev])
             .current_dir(repo)
             .output();
 
@@ -206,7 +206,7 @@ fn get_git_changed_files(repo: &Path, since: &str) -> HashMap<String, String> {
 }
 
 fn get_git_file_diff(repo: &Path, file: &str, since: Option<&str>) -> String {
-    let mut args = vec!["diff".to_string()];
+    let mut args = vec!["--no-pager".to_string(), "diff".to_string()];
     if let Some(s) = since {
         let rev = if s == "@" || s == "HEAD" {
             "HEAD".to_string()

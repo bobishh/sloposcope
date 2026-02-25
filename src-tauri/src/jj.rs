@@ -7,6 +7,7 @@ use crate::vcs::{Bookmark, Change};
 pub fn changes(repo: &Path, limit: usize) -> Vec<Change> {
     let output = Command::new("jj")
         .args([
+            "--no-pager",
             "log",
             "--no-graph",
             "-r",
@@ -42,7 +43,7 @@ pub fn changes(repo: &Path, limit: usize) -> Vec<Change> {
 /// List all bookmarks (branches) in the repo.
 pub fn bookmarks(repo: &Path) -> Vec<Bookmark> {
     let output = Command::new("jj")
-        .args(["bookmark", "list"])
+        .args(["--no-pager", "bookmark", "list"])
         .current_dir(repo)
         .output();
 
@@ -70,7 +71,7 @@ pub fn bookmarks(repo: &Path) -> Vec<Bookmark> {
 
 /// Get files changed since a revset, with their status.
 pub fn changed_files(repo: &Path, revset: &str) -> HashMap<String, String> {
-    let mut args = vec!["diff".to_string(), "--summary".to_string()];
+    let mut args = vec!["--no-pager".to_string(), "diff".to_string(), "--summary".to_string()];
     
     if revset == "00000000" || revset == "zzzzzzzz" || revset == "root()" {
         return HashMap::new();
@@ -109,7 +110,7 @@ pub fn changed_files(repo: &Path, revset: &str) -> HashMap<String, String> {
 
 /// Get the diff for a single file, optionally since a revset.
 pub fn file_diff(repo: &Path, file: &str, since: Option<&str>) -> String {
-    let mut args = vec!["diff".to_string(), "--git".to_string()];
+    let mut args = vec!["--no-pager".to_string(), "diff".to_string(), "--git".to_string()];
     if let Some(s) = since {
         if s == "00000000" || s == "zzzzzzzz" || s == "root()" {
             // Root has no diff

@@ -1,29 +1,33 @@
 <script>
   import { onMount, onDestroy } from 'svelte';
   import { EditorView, basicSetup } from 'codemirror';
-  import { javascript } from '@codemirror/lang-javascript';
-  import { html } from '@codemirror/lang-html';
-  import { markdown } from '@codemirror/lang-markdown';
-  import { python } from '@codemirror/lang-python';
-  import { rust } from '@codemirror/lang-rust';
-  import { sql } from '@codemirror/lang-sql';
+  import { languages } from '@codemirror/language-data';
   import { oneDark } from '@codemirror/theme-one-dark';
-  import { EditorState } from '@codemirror/state';
+  import { EditorState, Compartment } from '@codemirror/state';
+  import { LanguageDescription } from '@codemirror/language';
 
   let { value = $bindable(''), file = '', theme = 'midnight' } = $props();
 
   let editorContainer;
   let view;
+  const languageConf = new Compartment();
 
-  function getLanguage(filename) {
-    if (filename.endsWith('.js') || filename.endsWith('.ts') || filename.endsWith('.svelte')) return javascript();
-    if (filename.endsWith('.html') || filename.endsWith('.heex')) return html();
-    if (filename.endsWith('.md')) return markdown();
-    if (filename.endsWith('.py')) return python();
-    if (filename.endsWith('.rs')) return rust();
-    if (filename.endsWith('.sql')) return sql();
-    // Ruby is often handled by StreamLanguage if @codemirror/lang-ruby is missing
-    return [];
+  async function updateLanguage(filename) {
+    if (!view) return;
+    
+    const desc = LanguageDescription.matchFilename(languages, filename) || 
+                 LanguageDescription.matchLanguageName(languages, filename.split('.').pop() || '');
+
+    if (desc) {
+      const lang = await desc.load();
+      view.dispatch({
+        effects: languageConf.reconfigure(lang)
+      });
+    } else {
+      view.dispatch({
+        effects: languageConf.reconfigure([])
+      });
+    }
   }
 
   $effect(() => {
@@ -35,12 +39,19 @@
     }
   });
 
-  onMount(() => {
+  $effect(() => {
+    // Update language when file prop changes
+    if (view && file) {
+      updateLanguage(file);
+    }
+  });
+
+  onMount(async () => {
     const state = EditorState.create({
       doc: value,
       extensions: [
         basicSetup,
-        getLanguage(file),
+        languageConf.of([]),
         theme === 'midnight' ? oneDark : [],
         EditorView.updateListener.of((update) => {
           if (update.docChanged) {
@@ -58,6 +69,8 @@
       state,
       parent: editorContainer
     });
+
+    if (file) updateLanguage(file);
   });
 
   onDestroy(() => {

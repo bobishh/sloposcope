@@ -15,17 +15,44 @@ struct AppState {
     parsers: Vec<Box<dyn Parser>>,
     last_fingerprint: Mutex<u64>,
     watcher: Mutex<Option<RecommendedWatcher>>,
+    graph: Mutex<Graph>,
+    last_since: Mutex<Option<String>>,
+}
+
+fn resolve_graph_edges(g: &mut Graph) {
+    let all_node_ids: Vec<String> = g.nodes.iter().map(|n| n.id.clone()).collect();
+    
+    for edge in &mut g.edges {
+        let target = &edge.target;
+        if all_node_ids.contains(target) { continue; }
+
+        let normalized = target.replace("::", "/").replace("crate/", "").trim_start_matches("./").to_string();
+        if let Some(found) = all_node_ids.iter().find(|id| id.as_str() == normalized.as_str() || id.ends_with(&normalized) || id.replace("/", ".").contains(target)) {
+            edge.target = found.clone();
+            continue;
+        }
+
+        if let Some(found) = all_node_ids.iter().find(|id| {
+            let id_no_ext = id.split('.').next().unwrap_or(id);
+            id_no_ext.contains(target) || target.contains(id_no_ext)
+        }) {
+            edge.target = found.clone();
+        }
+    }
 }
 
 fn perform_graph_build(parsers: &[Box<dyn Parser>], repo: PathBuf, since: Option<String>) -> Graph {
     let mut g = Graph::new();
 
+    println!("[BACKEND] Starting graph build for repo: {:?}", repo);
     let files_to_process = if let Some(ref revset) = since {
         let changed = vcs::get_changed_files(&repo, revset);
         changed.keys().cloned().collect::<Vec<String>>()
     } else {
         vcs::get_all_files(&repo)
     };
+
+    println!("[BACKEND] Files to process: {}", files_to_process.len());
 
     for rel_path in files_to_process {
         let full_path = repo.join(&rel_path);
@@ -40,43 +67,7 @@ fn perform_graph_build(parsers: &[Box<dyn Parser>], repo: PathBuf, since: Option
         }
     }
 
-    // --- Post-process edges to resolve targets to IDs ---
-    // Many parsers find targets like "crate::foo" or "./bar.svelte", but node IDs are "src/foo.rs" or "src/bar.svelte"
-    let all_node_ids: Vec<String> = g.nodes.iter().map(|n| n.id.clone()).collect();
-    
-    for edge in &mut g.edges {
-        let target = &edge.target;
-        
-        // 1. Direct match (best case)
-        if all_node_ids.contains(target) {
-            continue;
-        }
-
-        // 2. Try various normalizations
-        let normalized = target
-            .replace("::", "/")
-            .replace("crate/", "")
-            .trim_start_matches("./")
-            .to_string();
-
-        if let Some(found) = all_node_ids.iter().find(|id| {
-            id.as_str() == normalized.as_str() || 
-            id.ends_with(&normalized) || 
-            id.replace("/", ".").contains(target)
-        }) {
-            edge.target = found.clone();
-            continue;
-        }
-
-        // 3. Last resort: check if target is a substring of any ID (module match)
-        if let Some(found) = all_node_ids.iter().find(|id| {
-            let id_no_ext = id.split('.').next().unwrap_or(id);
-            id_no_ext.contains(target) || target.contains(id_no_ext)
-        }) {
-            edge.target = found.clone();
-        }
-    }
-
+    resolve_graph_edges(&mut g);
     g.finalize();
 
     if let Some(revset) = since {
@@ -119,6 +110,7 @@ async fn select_repo(app: AppHandle, state: tauri::State<'_, AppState>) -> Resul
         
         let fp = fingerprint(&path_buf);
         *state.last_fingerprint.lock() = fp;
+        *state.last_since.lock() = None;
 
         let watcher = setup_watcher(&app);
         *state.watcher.lock() = watcher;
@@ -131,8 +123,23 @@ async fn select_repo(app: AppHandle, state: tauri::State<'_, AppState>) -> Resul
 
 #[tauri::command]
 async fn get_graph(state: tauri::State<'_, AppState>, since: Option<String>) -> Result<Graph, String> {
+    {
+        let last_since = state.last_since.lock();
+        if *last_since == since {
+            return Ok(state.graph.lock().clone());
+        }
+    }
+
     let repo = state.repo.lock().clone();
-    let g = perform_graph_build(&state.parsers, repo, since);
+    let g = perform_graph_build(&state.parsers, repo, since.clone());
+    
+    {
+        let mut graph = state.graph.lock();
+        *graph = g.clone();
+        let mut last_since = state.last_since.lock();
+        *last_since = since;
+    }
+    
     Ok(g)
 }
 
@@ -186,23 +193,54 @@ fn setup_watcher(app: &AppHandle) -> Option<RecommendedWatcher> {
 
     let mut watcher = match notify::recommended_watcher(move |res: Result<Event, _>| {
         if let Ok(event) = res {
-            let interesting = event.paths.iter().any(|p| {
-                let s = p.display().to_string();
-                !s.contains("/.git/") && !s.contains("/.jj/") && !s.contains("/_build/") && !s.contains("/deps/") && !s.contains("/node_modules/") && !s.contains("/target/")
-            });
+            if let Some(state) = handle.try_state::<AppState>() {
+                let repo = state.repo.lock().clone();
+                
+                let interesting_paths: Vec<PathBuf> = event.paths.iter()
+                    .filter(|p| {
+                        let s = p.display().to_string();
+                        !s.contains("/.git/") && !s.contains("/.jj/") && !s.contains("/_build/") && !s.contains("/deps/") && !s.contains("/node_modules/") && !s.contains("/target/")
+                    })
+                    .cloned()
+                    .collect();
 
-            if interesting {
-                if let Some(state) = handle.try_state::<AppState>() {
-                    let repo = state.repo.lock().clone();
-                    let current = fingerprint(&repo);
-                    let mut last = state.last_fingerprint.lock();
-                    if current != *last {
-                        *last = current;
-                        let graph = perform_graph_build(&state.parsers, repo.clone(), None);
-                        let changes = vcs::get_changes(&repo, 20);
+                if !interesting_paths.is_empty() {
+                    // 1. Emit heat events immediately
+                    for path in &interesting_paths {
+                        if let Ok(rel) = path.strip_prefix(&repo) {
+                            let _ = handle.emit("file-touched", rel.display().to_string());
+                        }
+                    }
+
+                    // 2. Perform incremental graph update
+                    let mut graph = state.graph.lock();
+                    let mut changed = false;
+
+                    for path in &interesting_paths {
+                        if let Ok(rel_path_buf) = path.strip_prefix(&repo) {
+                            let rel_path = rel_path_buf.display().to_string();
+                            let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+                            
+                            if let Some(parser) = state.parsers.iter().find(|p| p.extensions().contains(&ext)) {
+                                if let Ok(source) = std::fs::read_to_string(path) {
+                                    // Remove old version of this file's nodes
+                                    graph.nodes.retain(|n| n.file != rel_path);
+                                    // Parse and add new version
+                                    let (new_nodes, new_edges) = parser.parse_file(&repo, &rel_path, &source);
+                                    graph.add_nodes(new_nodes);
+                                    graph.add_edges(new_edges);
+                                    changed = true;
+                                }
+                            }
+                        }
+                    }
+
+                    if changed {
+                        resolve_graph_edges(&mut graph);
+                        graph.finalize();
                         let _ = handle.emit("graph-updated", serde_json::json!({
-                            "graph": graph,
-                            "changes": changes,
+                            "graph": &*graph,
+                            "changes": vcs::get_changes(&repo, 20),
                         }));
                     }
                 }
@@ -385,6 +423,7 @@ pub fn run() {
         }),
     ];
 
+    let g = perform_graph_build(&parsers, repo.clone(), Some("@".to_string()));
     let fp = graph::source_fingerprint(&repo);
 
     tauri::Builder::default()
@@ -394,6 +433,8 @@ pub fn run() {
             parsers,
             last_fingerprint: Mutex::new(fp),
             watcher: Mutex::new(None),
+            graph: Mutex::new(g),
+            last_since: Mutex::new(Some("@".to_string())),
         })
         .invoke_handler(tauri::generate_handler![
             get_graph,

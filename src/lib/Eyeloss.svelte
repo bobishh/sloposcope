@@ -3,7 +3,29 @@
   import Window from './Window.svelte';
   import Editor from './Editor.svelte';
 
-  let { graph = { nodes: [], edges: [] }, since = null, changes = [], bookmarks = [], getFileDiff, getFileSource, saveFile, theme = 'midnight', onSelectSince } = $props();
+  let { 
+    graph = { nodes: [], edges: [] }, 
+    since = null, 
+    changes = [], 
+    bookmarks = [], 
+    getFileDiff, 
+    getFileSource, 
+    saveFile, 
+    theme = 'midnight', 
+    touchHeat = new Map(),
+    onSelectSince 
+  } = $props();
+
+  function getNodeHeat(nodeId) {
+    if (touchHeat.size === 0) return 0;
+    const val = touchHeat.get(nodeId);
+    if (val === undefined) return 0;
+    
+    // Calculate rank
+    const sortedValues = Array.from(touchHeat.values()).sort((a, b) => a - b);
+    const rank = sortedValues.indexOf(val);
+    return (rank + 1) / sortedValues.length;
+  }
 
   let canvas;
   let width = $state(0);
@@ -312,7 +334,7 @@
     }
 
     const clusterKeys = Object.keys(clusters);
-    const clusterSpread = Math.sqrt(clusterKeys.length) * 600;
+    const clusterSpread = Math.sqrt(clusterKeys.length) * 1200;
 
     const clusterCenters = {};
     clusterKeys.forEach((key, i) => {
@@ -351,11 +373,11 @@
       nodeMap[n.id] = n;
     }
 
-    const repulsionStrength = 18000;
-    const springStrength = 0.004;
-    const springLength = 300;
-    const centerGravity = 0.001;
-    const clusterGravity = 0.025;
+    const repulsionStrength = 35000;
+    const springStrength = 0.003;
+    const springLength = 450;
+    const centerGravity = 0.0008;
+    const clusterGravity = 0.015;
     const damping = 0.82;
     const maxVelocity = 20;
 
@@ -374,7 +396,7 @@
     }
 
     const cKeys = Object.keys(clusterCenters);
-    const interClusterRepulsion = 80000;
+    const interClusterRepulsion = 150000;
     const clusterForces = {};
     for (const key of cKeys) clusterForces[key] = { x: 0, y: 0 };
 
@@ -672,6 +694,21 @@
       ctx.fillStyle = fillColor;
       ctx.fillRect(x0, y0, w, h);
 
+      // Heat Highlight (Recently Touched)
+      const heat = getNodeHeat(node.file);
+      if (heat > 0) {
+        ctx.save();
+        // Bright Orange Heat Glow
+        const heatAlpha = 0.3 + 0.5 * heat;
+        ctx.shadowBlur = 15 * heat;
+        ctx.shadowColor = `rgba(255, 100, 0, ${heatAlpha})`;
+        ctx.strokeStyle = `rgba(255, 140, 0, ${heatAlpha})`;
+        ctx.lineWidth = 1 + 3 * heat;
+        // Stroke slightly outside the node
+        ctx.strokeRect(x0 - 1.5, y0 - 1.5, w + 3, h + 3);
+        ctx.restore();
+      }
+
       if ((cs === 'added' || cs === 'modified') && !isDimmed) {
         ctx.strokeStyle = cs === 'added' ? '#4a7c44' : '#b87333';
         ctx.lineWidth = 1;
@@ -889,8 +926,11 @@
     const _drag = draggedNode;
     const _diff = fileDiff;
     const _sigs = showSignatures;
+    const _heat = touchHeat;
 
     if (!canvas || _w === 0 || _h === 0) return;
+
+    if (_heat.size > 0) animating = true;
 
     function loop() {
       if (animating) {
@@ -970,16 +1010,22 @@
     <div class="eyeloss-timeline">
       <div class="eyeloss-timeline__track">
         {#each [...changes].reverse() as change, i}
+          {@const tickHeat = (i + 1) / changes.length}
           <button
             class="eyeloss-timeline__tick"
             class:eyeloss-timeline__tick--active={isTickActive(change, i, changes.length)}
             class:eyeloss-timeline__tick--wc={i === changes.length - 1}
             type="button"
             onclick={(e) => onSelectSince && onSelectSince(change.id, e)}
-            title={`${change.id}: ${change.description} (${change.timestamp})`}
+            style:--tick-heat={tickHeat}
           >
+            {#if change.description && change.description.trim() !== ''}
+              <div class="eyeloss-timeline__tick-meta">
+                <span class="eyeloss-timeline__tick-desc">{change.description}</span>
+              </div>
+            {/if}
             <span class="eyeloss-timeline__dot"></span>
-            <div class="eyeloss-timeline__tick-meta">
+            <div class="eyeloss-timeline__tick-info">
               <span class="eyeloss-timeline__tick-id">{change.id}</span>
               <span class="eyeloss-timeline__tick-time">
                 {change.timestamp.split(' ')[0]}<br/>
@@ -1036,7 +1082,7 @@
               <span>Diff Changes</span>
             </div>
             
-            <div class="eyeloss-split-diff">
+            <div class="eyeloss-split-diff" style:filter={`brightness(${1 + getNodeHeat(selectedNode.file) * 0.5})`}>
               {#each diffChunks as chunk, i}
                 <div class="diff-chunk-wrapper">
                   <button 

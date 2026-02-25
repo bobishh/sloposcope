@@ -40,13 +40,17 @@
   let changes = $state([]);
   let bookmarks = $state([]);
   let currentBranch = $state('');
-  let since = $state(null); 
+  let since = $state('@'); 
   let loading = $state(true); // Initial load
   let refreshing = $state(false); // Update state
   let currentFortune = $state('');
   let repoPath = $state('');
   let showDropdown = $state(false);
   let highlightedIndex = $state(-1);
+
+  // Heatmap state
+  let touchHeat = $state(new Map());
+  let heatCounter = 0;
 
   function updateFortune() {
     const committers = changes.map(c => c.description.split(' ')[0]).filter(n => n && n.length > 2);
@@ -106,7 +110,18 @@
         invoke('get_current_branch'),
       ]);
       console.log(`[FRONTEND] Received data. Nodes: ${g.nodes.length}`);
-      graph = g;
+      
+      // If initial load of working copy/HEAD is empty, fallback to the last actual commit
+      if (isInitial && g.nodes.length === 0 && (since === '@' || since === 'HEAD') && c.length > 1) {
+        const fallback = c[1].id;
+        console.log(`[FRONTEND] Initial graph for ${since} is empty, falling back to ${fallback}`);
+        since = fallback;
+        const g2 = await invoke('get_graph', { since: fallback });
+        graph = g2;
+      } else {
+        graph = g;
+      }
+
       changes = c;
       bookmarks = b;
       currentBranch = curr;
@@ -179,6 +194,19 @@
       console.log('[FRONTEND] Graph updated event received');
       graph = event.payload.graph;
       changes = event.payload.changes;
+    });
+
+    listen('file-touched', (event) => {
+      const path = event.payload;
+      console.log(`[FRONTEND] File touched: ${path}`);
+      
+      touchHeat.set(path, ++heatCounter);
+      if (touchHeat.size > 100) {
+        const oldestKey = touchHeat.keys().next().value;
+        touchHeat.delete(oldestKey);
+      }
+      // Force reactivity in Svelte 5 for Map
+      touchHeat = new Map(touchHeat);
     });
   });
 </script>
@@ -281,6 +309,7 @@
     {getFileSource} 
     {saveFile} 
     {theme} 
+    {touchHeat}
     onSelectSince={setSince} 
   />
 </div>
