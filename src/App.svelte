@@ -24,6 +24,75 @@
     if (DEBUG_LOGS) console.log(...args);
   }
 
+  function normalizeTouchedPath(path) {
+    if (!path) return '';
+    return String(path)
+      .replaceAll('\\', '/')
+      .replace(/^\.\/+/, '')
+      .replace(/^\/+/, '');
+  }
+
+  function seedHeatmapFromGraph(g) {
+    if (!g || !Array.isArray(g.nodes)) return;
+    let changed = false;
+    for (const node of g.nodes) {
+      const status = String(node?.change_status || '');
+      if (status !== 'added' && status !== 'modified') continue;
+      const file = normalizeTouchedPath(node?.file || node?.id);
+      if (!file) continue;
+      if (!heatmapData.has(file)) {
+        heatmapData.set(file, { seq: ++heatCounter, touchedAt: Date.now() });
+        changed = true;
+      }
+    }
+    if (changed) {
+      heatmapData = new Map(heatmapData);
+    }
+  }
+
+  function traceNow() {
+    try {
+      return new Date().toISOString();
+    } catch (_e) {
+      return 'unknown-time';
+    }
+  }
+
+  function summarizeResult(value) {
+    if (Array.isArray(value)) return `array(len=${value.length})`;
+    if (value && typeof value === 'object') {
+      if (Array.isArray(value.nodes) && Array.isArray(value.edges)) {
+        return `graph(nodes=${value.nodes.length}, edges=${value.edges.length})`;
+      }
+      const keys = Object.keys(value);
+      return `object(keys=${keys.length})`;
+    }
+    return String(value);
+  }
+
+  async function invokeTraced(cmd, args, options = {}) {
+    const warnAfterMs = Number(options.warnAfterMs ?? 5000);
+    const started = performance.now();
+    debugLog(`[FRONTEND][TRACE] ${traceNow()} -> ${cmd}`, args);
+    const warnTimer = setTimeout(() => {
+      const elapsed = Math.round(performance.now() - started);
+      console.warn(`[FRONTEND][TRACE] ${traceNow()} still waiting for ${cmd} (${elapsed}ms elapsed)`, args);
+    }, warnAfterMs);
+
+    try {
+      const result = await invoke(cmd, args);
+      const elapsed = Math.round(performance.now() - started);
+      debugLog(`[FRONTEND][TRACE] ${traceNow()} <- ${cmd} (${elapsed}ms) ${summarizeResult(result)}`);
+      return result;
+    } catch (error) {
+      const elapsed = Math.round(performance.now() - started);
+      console.error(`[FRONTEND][TRACE] ${traceNow()} !! ${cmd} failed after ${elapsed}ms`, error, args);
+      throw error;
+    } finally {
+      clearTimeout(warnTimer);
+    }
+  }
+
   const MOCK_CHANGES = [
     { id: 'deadbeef', description: 'Working copy', timestamp: '2026-02-24 23:00' },
     { id: 'c0ffee11', description: 'Refactor parser pipeline', timestamp: '2026-02-24 22:30' },
@@ -156,8 +225,9 @@
   });
 
   async function loadTimelineChanges() {
-    const c = await invoke('get_changes', { limit: ALL_CHANGES_LIMIT });
+    const c = await invokeTraced('get_changes', { limit: ALL_CHANGES_LIMIT }, { warnAfterMs: 8000 });
     const unique = uniqueChanges(c);
+    debugLog(`[FRONTEND][TRACE] timeline fetched raw=${c?.length || 0}, unique=${unique.length}`);
     changes = unique;
     changesLimit = unique.length;
     hasMoreChanges = false; // We paginate locally after prefetching full history.
@@ -179,13 +249,14 @@
     try {
       debugLog(`[FRONTEND] Starting loadGraph (initial: ${isInitial}) since: ${sinceArg}`);
       const [g, b, curr] = await Promise.all([
-        invoke('get_graph', { since: sinceArg }),
-        invoke('get_bookmarks'),
-        invoke('get_current_branch'),
+        invokeTraced('get_graph', { since: sinceArg }, { warnAfterMs: 8000 }),
+        invokeTraced('get_bookmarks', {}, { warnAfterMs: 8000 }),
+        invokeTraced('get_current_branch', {}, { warnAfterMs: 8000 }),
       ]);
 
       debugLog(`[FRONTEND] Received data. Nodes: ${g.nodes.length}`);
       graph = g;
+      seedHeatmapFromGraph(g);
       bookmarks = b;
       currentBranch = curr;
     } catch (e) {
@@ -205,7 +276,7 @@
     let loadedCount = 0;
     try {
       const targetLimit = Math.max(changes.length, changesLimit) + CHANGES_PAGE_SIZE;
-      const expanded = await invoke('get_changes', { limit: targetLimit });
+      const expanded = await invokeTraced('get_changes', { limit: targetLimit }, { warnAfterMs: 8000 });
       const expandedUnique = uniqueChanges(expanded);
       const existingIds = new Set(changes.map(c => c.id));
       const tail = expandedUnique.filter(c => !existingIds.has(c.id));
@@ -247,7 +318,8 @@
 
   async function selectRepo() {
     try {
-      const newPath = await invoke('select_repo');
+      const newPath = await invokeTraced('select_repo', {}, { warnAfterMs: 10000 });
+      debugLog(`[FRONTEND][TRACE] repo selected: ${newPath}`);
       repoPath = newPath;
       since = '@';
       await Promise.all([loadTimelineChanges(), loadGraph(true)]);
@@ -269,26 +341,33 @@
   }
 
   async function getFileSource(file) {
-    return invoke('get_file_source', { file });
+    return invokeTraced('get_file_source', { file }, { warnAfterMs: 6000 });
   }
 
   async function getFileDiff(file) {
-    return invoke('get_file_diff', { file, since: since === '@' ? null : since });
+    return invokeTraced('get_file_diff', { file, since: since === '@' ? null : since }, { warnAfterMs: 6000 });
   }
 
   async function saveFile(file, content) {
-    return invoke('save_file', { file, content });
+    return invokeTraced('save_file', { file, content }, { warnAfterMs: 6000 });
   }
 
   onMount(async () => {
+    const mountStart = performance.now();
+    debugLog(`[FRONTEND][TRACE] ${traceNow()} onMount start`);
     applyTheme();
+    debugLog(`[FRONTEND][TRACE] ${traceNow()} theme applied`);
     refreshFortune();
-    repoPath = await invoke('get_repo_path');
+    debugLog(`[FRONTEND][TRACE] ${traceNow()} fortune refreshed`);
+    repoPath = await invokeTraced('get_repo_path', {}, { warnAfterMs: 8000 });
+    debugLog(`[FRONTEND][TRACE] ${traceNow()} repo path resolved: ${repoPath}`);
     await Promise.all([loadTimelineChanges(), loadGraph(true)]);
+    debugLog(`[FRONTEND][TRACE] ${traceNow()} initial data loaded in ${Math.round(performance.now() - mountStart)}ms`);
 
     listen('graph-updated', (event) => {
       debugLog('[FRONTEND] Graph updated event received');
       graph = event.payload.graph;
+      seedHeatmapFromGraph(event.payload.graph);
       if (event.payload.current_branch) {
         currentBranch = event.payload.current_branch;
       }
@@ -296,10 +375,13 @@
         bookmarks = event.payload.bookmarks;
       }
       loadTimelineChanges().catch((e) => console.error('[FRONTEND] Failed to refresh timeline changes:', e));
+    }).catch((e) => {
+      console.error('[FRONTEND] Failed to register graph-updated listener:', e);
     });
 
     listen('file-touched', (event) => {
-      const path = event.payload;
+      const path = normalizeTouchedPath(event.payload);
+      if (!path) return;
       debugLog(`[FRONTEND] File touched: ${path}`);
       
       heatmapData.set(path, { seq: ++heatCounter, touchedAt: Date.now() });
@@ -317,7 +399,10 @@
       }
       // Force reactivity in Svelte 5 for Map
       heatmapData = new Map(heatmapData);
+    }).catch((e) => {
+      console.error('[FRONTEND] Failed to register file-touched listener:', e);
     });
+    debugLog(`[FRONTEND][TRACE] ${traceNow()} listeners registered`);
   });
 
 </script>
@@ -413,6 +498,7 @@
     {hasMoreChanges}
     onSelectSince={setSince} 
     onLoadMoreChanges={loadMoreChanges}
+    onProjectChange={selectRepo}
   />
 
   {#if loading || refreshing || loadingMore}

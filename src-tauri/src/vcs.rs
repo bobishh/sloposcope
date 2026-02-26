@@ -2,6 +2,7 @@ use crate::jj;
 use serde::Serialize;
 use std::collections::HashMap;
 use std::path::Path;
+use std::time::Instant;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct Change {
@@ -35,24 +36,61 @@ pub fn detect_engine(repo: &Path) -> VCSEngine {
 }
 
 pub fn get_changes(repo: &Path, limit: usize, before_id: Option<String>) -> Vec<Change> {
-    match detect_engine(repo) {
+    let started = Instant::now();
+    let engine = detect_engine(repo);
+    let changes = match engine {
         VCSEngine::JJ => jj::changes(repo, limit, before_id),
         VCSEngine::Git => get_git_changes(repo, limit, before_id),
         VCSEngine::None => vec![],
+    };
+    if crate::debug_enabled() {
+        let engine_label = match engine {
+            VCSEngine::JJ => "jj",
+            VCSEngine::Git => "git",
+            VCSEngine::None => "none",
+        };
+        println!(
+            "[BACKEND][vcs] get_changes engine={} count={} took={}ms",
+            engine_label,
+            changes.len(),
+            started.elapsed().as_millis()
+        );
     }
+    changes
 }
 
 pub fn get_bookmarks(repo: &Path) -> Vec<Bookmark> {
-    match detect_engine(repo) {
+    let started = Instant::now();
+    let engine = detect_engine(repo);
+    let bookmarks = match engine {
         VCSEngine::JJ => jj::bookmarks(repo),
         VCSEngine::Git => get_git_branches(repo),
         VCSEngine::None => vec![],
+    };
+    if crate::debug_enabled() {
+        let engine_label = match engine {
+            VCSEngine::JJ => "jj",
+            VCSEngine::Git => "git",
+            VCSEngine::None => "none",
+        };
+        println!(
+            "[BACKEND][vcs] get_bookmarks engine={} count={} took={}ms",
+            engine_label,
+            bookmarks.len(),
+            started.elapsed().as_millis()
+        );
     }
+    bookmarks
 }
 
 pub fn get_current_branch(repo: &Path) -> String {
-    match detect_engine(repo) {
+    let started = Instant::now();
+    let engine = detect_engine(repo);
+    let branch = match engine {
         VCSEngine::JJ => {
+            if crate::debug_enabled() {
+                println!("[BACKEND][vcs] running jj current-branch command");
+            }
             let output = std::process::Command::new("jj")
                 .args([
                     "--no-pager",
@@ -77,6 +115,9 @@ pub fn get_current_branch(repo: &Path) -> String {
             }
         }
         VCSEngine::Git => {
+            if crate::debug_enabled() {
+                println!("[BACKEND][vcs] running git current-branch command");
+            }
             let output = std::process::Command::new("git")
                 .args(["--no-pager", "rev-parse", "--abbrev-ref", "HEAD"])
                 .current_dir(repo)
@@ -88,12 +129,31 @@ pub fn get_current_branch(repo: &Path) -> String {
             }
         }
         VCSEngine::None => "".into(),
+    };
+    if crate::debug_enabled() {
+        let engine_label = match engine {
+            VCSEngine::JJ => "jj",
+            VCSEngine::Git => "git",
+            VCSEngine::None => "none",
+        };
+        println!(
+            "[BACKEND][vcs] get_current_branch engine={} value='{}' took={}ms",
+            engine_label,
+            branch,
+            started.elapsed().as_millis()
+        );
     }
+    branch
 }
 
 pub fn get_current_revision(repo: &Path) -> String {
-    match detect_engine(repo) {
+    let started = Instant::now();
+    let engine = detect_engine(repo);
+    let revision = match engine {
         VCSEngine::JJ => {
+            if crate::debug_enabled() {
+                println!("[BACKEND][vcs] running jj current-revision command");
+            }
             let output = std::process::Command::new("jj")
                 .args([
                     "--no-pager",
@@ -113,6 +173,9 @@ pub fn get_current_revision(repo: &Path) -> String {
             }
         }
         VCSEngine::Git => {
+            if crate::debug_enabled() {
+                println!("[BACKEND][vcs] running git current-revision command");
+            }
             let output = std::process::Command::new("git")
                 .args(["--no-pager", "rev-parse", "--verify", "HEAD"])
                 .current_dir(repo)
@@ -124,28 +187,108 @@ pub fn get_current_revision(repo: &Path) -> String {
             }
         }
         VCSEngine::None => String::new(),
+    };
+    if crate::debug_enabled() {
+        let engine_label = match engine {
+            VCSEngine::JJ => "jj",
+            VCSEngine::Git => "git",
+            VCSEngine::None => "none",
+        };
+        println!(
+            "[BACKEND][vcs] get_current_revision engine={} value='{}' took={}ms",
+            engine_label,
+            if revision.len() > 12 {
+                &revision[..12]
+            } else {
+                &revision
+            },
+            started.elapsed().as_millis()
+        );
     }
+    revision
 }
 
 pub fn get_changed_files(repo: &Path, since: &str) -> HashMap<String, String> {
-    match detect_engine(repo) {
+    let started = Instant::now();
+    let engine = detect_engine(repo);
+    let mut changed = match engine {
         VCSEngine::JJ => jj::changed_files(repo, since),
         VCSEngine::Git => get_git_changed_files(repo, since),
         VCSEngine::None => HashMap::new(),
+    };
+    let before_filter = changed.len();
+    changed.retain(|path, _| !should_ignore_graph_path(path));
+    if crate::debug_enabled() {
+        let engine_label = match engine {
+            VCSEngine::JJ => "jj",
+            VCSEngine::Git => "git",
+            VCSEngine::None => "none",
+        };
+        println!(
+            "[BACKEND][vcs] get_changed_files engine={} since='{}' count={} filtered_out={} took={}ms",
+            engine_label,
+            since,
+            changed.len(),
+            before_filter.saturating_sub(changed.len()),
+            started.elapsed().as_millis()
+        );
     }
+    changed
+}
+
+fn should_ignore_graph_path(path: &str) -> bool {
+    let normalized = path.replace('\\', "/").trim_start_matches("./").to_string();
+    if normalized.is_empty() {
+        return true;
+    }
+
+    for segment in normalized.split('/') {
+        match segment {
+            ".git" | ".jj" | "node_modules" | "target" | "_build" | "deps" | "dist"
+            | ".svelte-kit" | ".output" => return true,
+            _ => {}
+        }
+    }
+
+    normalized.starts_with("src-tauri/gen/")
 }
 
 pub fn get_file_diff(repo: &Path, file: &str, since: Option<&str>) -> String {
-    match detect_engine(repo) {
+    let started = Instant::now();
+    let engine = detect_engine(repo);
+    let diff = match engine {
         VCSEngine::JJ => jj::file_diff(repo, file, since),
         VCSEngine::Git => get_git_file_diff(repo, file, since),
         VCSEngine::None => String::new(),
+    };
+    if crate::debug_enabled() {
+        let engine_label = match engine {
+            VCSEngine::JJ => "jj",
+            VCSEngine::Git => "git",
+            VCSEngine::None => "none",
+        };
+        println!(
+            "[BACKEND][vcs] get_file_diff engine={} file={} bytes={} took={}ms",
+            engine_label,
+            file,
+            diff.len(),
+            started.elapsed().as_millis()
+        );
     }
+    diff
 }
 
 // --- Git Implementation ---
 
 fn get_git_changes(repo: &Path, limit: usize, before_id: Option<String>) -> Vec<Change> {
+    let started = Instant::now();
+    if crate::debug_enabled() {
+        println!(
+            "[BACKEND][vcs/git] get_git_changes start limit={} before_id={:?}",
+            limit, before_id
+        );
+        println!("[BACKEND][vcs/git] running git log for commit history");
+    }
     let output = std::process::Command::new("git")
         .args(["--no-pager", "log", "--pretty=format:%h\t%s\t%ai"])
         .current_dir(repo)
@@ -179,10 +322,17 @@ fn get_git_changes(repo: &Path, limit: usize, before_id: Option<String>) -> Vec<
     };
 
     if all_commits.is_empty() {
+        if crate::debug_enabled() {
+            println!(
+                "[BACKEND][vcs/git] get_git_changes empty history took={}ms",
+                started.elapsed().as_millis()
+            );
+        }
         return vec![];
     }
 
-    match before_id {
+    let total_commits = all_commits.len();
+    let page = match before_id {
         None => {
             let mut page = vec![Change {
                 id: "@".to_string(),
@@ -207,10 +357,24 @@ fn get_git_changes(repo: &Path, limit: usize, before_id: Option<String>) -> Vec<
                 None => vec![],
             }
         }
+    };
+
+    if crate::debug_enabled() {
+        println!(
+            "[BACKEND][vcs/git] get_git_changes done commits_total={} returned={} took={}ms",
+            total_commits,
+            page.len(),
+            started.elapsed().as_millis()
+        );
     }
+    page
 }
 
 fn get_git_branches(repo: &Path) -> Vec<Bookmark> {
+    let started = Instant::now();
+    if crate::debug_enabled() {
+        println!("[BACKEND][vcs/git] running git branch for bookmarks");
+    }
     let output = std::process::Command::new("git")
         .args([
             "--no-pager",
@@ -220,7 +384,7 @@ fn get_git_branches(repo: &Path) -> Vec<Bookmark> {
         .current_dir(repo)
         .output();
 
-    if let Ok(o) = output {
+    let bookmarks = if let Ok(o) = output {
         String::from_utf8_lossy(&o.stdout)
             .lines()
             .filter_map(|l| {
@@ -235,15 +399,30 @@ fn get_git_branches(repo: &Path) -> Vec<Bookmark> {
             .collect()
     } else {
         vec![]
+    };
+
+    if crate::debug_enabled() {
+        println!(
+            "[BACKEND][vcs/git] get_git_branches count={} took={}ms",
+            bookmarks.len(),
+            started.elapsed().as_millis()
+        );
     }
+    bookmarks
 }
 
 fn get_git_changed_files(repo: &Path, since: &str) -> HashMap<String, String> {
+    let started = Instant::now();
+    if crate::debug_enabled() {
+        println!(
+            "[BACKEND][vcs/git] get_git_changed_files start since='{}'",
+            since
+        );
+    }
     let mut combined_map = HashMap::new();
 
-    // Split on ' | ' to support aggregate revsets
+    // 1. Get tracked changes (staged and committed)
     for part in since.split(" | ") {
-        // If it looks like a single commit (not a range), show its changes
         let rev = if part == "@" || part == "HEAD" {
             "HEAD".to_string()
         } else if part.contains("..") {
@@ -252,34 +431,63 @@ fn get_git_changed_files(repo: &Path, since: &str) -> HashMap<String, String> {
             format!("{}~1..{}", part, part)
         };
 
-        let output = std::process::Command::new("git")
+        if crate::debug_enabled() {
+            println!("[BACKEND][vcs/git] running git diff --name-status {}", rev);
+        }
+        if let Ok(o) = std::process::Command::new("git")
             .args(["--no-pager", "diff", "--name-status", &rev])
             .current_dir(repo)
-            .output();
-
-        if let Ok(o) = output {
-            for line in String::from_utf8_lossy(&o.stdout).lines() {
-                let mut parts = line.split_whitespace();
-                let status = parts.next().unwrap_or("");
-                let file = parts.next().unwrap_or("").to_string();
-                if file.is_empty() {
-                    continue;
+            .output()
+        {
+            if o.status.success() {
+                for line in String::from_utf8_lossy(&o.stdout).lines() {
+                    let mut parts = line.split_whitespace();
+                    if let (Some(status), Some(file)) = (parts.next(), parts.next()) {
+                        let status_str = match status.chars().next() {
+                            Some('A') => "added",
+                            Some('M') => "modified",
+                            Some('D') => "deleted",
+                            _ => "modified",
+                        };
+                        combined_map.insert(file.to_string(), status_str.to_string());
+                    }
                 }
-
-                let status_str = match status.chars().next() {
-                    Some('A') => "added",
-                    Some('M') => "modified",
-                    Some('D') => "deleted",
-                    _ => "modified",
-                };
-                combined_map.insert(file, status_str.to_string());
             }
         }
+    }
+
+    // 2. If @ or HEAD is involved, also include untracked files
+    if since.contains("@") || since.contains("HEAD") {
+        if crate::debug_enabled() {
+            println!("[BACKEND][vcs/git] running git ls-files for untracked");
+        }
+        if let Ok(o) = std::process::Command::new("git")
+            .args(["--no-pager", "ls-files", "--others", "--exclude-standard"])
+            .current_dir(repo)
+            .output()
+        {
+            if o.status.success() {
+                for file in String::from_utf8_lossy(&o.stdout).lines() {
+                    if !file.trim().is_empty() {
+                        combined_map.insert(file.trim().to_string(), "added".to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    if crate::debug_enabled() {
+        println!(
+            "[BACKEND][vcs/git] get_git_changed_files done count={} took={}ms",
+            combined_map.len(),
+            started.elapsed().as_millis()
+        );
     }
     combined_map
 }
 
 fn get_git_file_diff(repo: &Path, file: &str, since: Option<&str>) -> String {
+    let started = Instant::now();
     let mut args = vec!["--no-pager".to_string(), "diff".to_string()];
     if let Some(s) = since {
         let rev = if s == "@" || s == "HEAD" {
@@ -294,16 +502,28 @@ fn get_git_file_diff(repo: &Path, file: &str, since: Option<&str>) -> String {
     args.push("--".to_string());
     args.push(file.to_string());
 
+    if crate::debug_enabled() {
+        println!("[BACKEND][vcs/git] running git diff for file={}", file);
+    }
     let output = std::process::Command::new("git")
         .args(&args)
         .current_dir(repo)
         .output();
 
-    if let Ok(o) = output {
+    let diff = if let Ok(o) = output {
         String::from_utf8_lossy(&o.stdout).to_string()
     } else {
         String::new()
+    };
+
+    if crate::debug_enabled() {
+        println!(
+            "[BACKEND][vcs/git] get_git_file_diff bytes={} took={}ms",
+            diff.len(),
+            started.elapsed().as_millis()
+        );
     }
+    diff
 }
 
 #[cfg(test)]

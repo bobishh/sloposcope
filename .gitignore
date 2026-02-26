@@ -11,6 +11,8 @@ dist/
 src-tauri/target/
 src-tauri/gen/schemas/
 src-tauri/capabilities/
+!src-tauri/capabilities/
+!src-tauri/capabilities/default.json
 
 # Testing
 test-results/

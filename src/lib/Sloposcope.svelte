@@ -1,6 +1,9 @@
 <script>
+  import { onMount } from 'svelte';
   import Window from './Window.svelte';
   import Editor from './Editor.svelte';
+  import Robot from './Robot.svelte';
+  import { setupShortcuts } from './shortcuts.js';
 
   let { 
     graph = { nodes: [], edges: [] }, 
@@ -14,9 +17,94 @@
     heatmapData = new Map(),
     onSelectSince,
     onLoadMoreChanges,
+    onProjectChange,
     loadingMore = false,
     hasMoreChanges = true
   } = $props();
+
+  function normalizeFilePath(path) {
+    if (!path) return '';
+    return String(path)
+      .replaceAll('\\', '/')
+      .replace(/^\.\/+/, '')
+      .replace(/^\/+/, '');
+  }
+
+  function findNodeByFilePath(file) {
+    const normalizedFile = normalizeFilePath(file);
+    if (!normalizedFile) return null;
+
+    return (
+      simNodes.find((n) => normalizeFilePath(n.file) === normalizedFile) ||
+      simNodes.find((n) => normalizeFilePath(n.id) === normalizedFile) ||
+      simNodes.find((n) => normalizeFilePath(n.file).endsWith(`/${normalizedFile}`)) ||
+      simNodes.find((n) => normalizeFilePath(n.id).endsWith(`/${normalizedFile}`)) ||
+      null
+    );
+  }
+
+  let lastEditedNode = $derived.by(() => {
+    if (!heatmapData || heatmapData.size === 0) return null;
+
+    const touchedFiles = [];
+    for (const [file, info] of heatmapData.entries()) {
+      touchedFiles.push({
+        file,
+        touchedAt: getHeatTouchedAt(info) ?? 0,
+      });
+    }
+
+    touchedFiles.sort((a, b) => b.touchedAt - a.touchedAt);
+    for (const entry of touchedFiles) {
+      const matched = findNodeByFilePath(entry.file);
+      if (matched) return matched;
+    }
+
+    return null;
+  });
+
+  let robotTarget = $derived.by(() => {
+    const fallbackNode =
+      simNodes.find((n) => n.change_status === 'modified' || n.change_status === 'added') ||
+      simNodes[0] ||
+      null;
+    const targetNode = lastEditedNode || fallbackNode;
+    if (!targetNode) return { x: 0, y: 0, active: false };
+    const screen = worldToScreen(targetNode.x, targetNode.y);
+    const size = getNodeSize(targetNode);
+    // Keep robot on the edited document (upper-right area), not floating far away.
+    const desiredX = screen.x + size.w * 0.22;
+    const desiredY = screen.y - size.h * 0.28;
+    if (width <= 0 || height <= 0) {
+      return { x: desiredX, y: desiredY, active: true };
+    }
+
+    const marginX = 56;
+    const marginY = 56;
+    return {
+      x: Math.max(marginX, Math.min(width - marginX, desiredX)),
+      y: Math.max(marginY, Math.min(height - marginY, desiredY)),
+      active: true,
+    };
+  });
+
+  let searchInput = $state(null);
+  let highlightedSearchIndex = $state(-1);
+
+  onMount(() => {
+    return setupShortcuts(
+      () => onProjectChange?.(),
+      () => {
+        panelCollapsed = false;
+        setTimeout(() => searchInput?.focus(), 10);
+      },
+      (dir) => {
+        if (filteredNodes.length === 0) return;
+        highlightedSearchIndex = (highlightedSearchIndex + dir + filteredNodes.length) % filteredNodes.length;
+        focusNode(filteredNodes[highlightedSearchIndex]);
+      }
+    );
+  });
 
   const TIMELINE_MIN_PAGE_SIZE = 8;
   const TIMELINE_TICK_WIDTH = 40;
@@ -766,17 +854,19 @@
     return sourceReferenceLinks.find((ref) => ref.token.toLowerCase() === token.toLowerCase()) || null;
   }
 
-  async function openSourceWindowForReference(ref) {
-    if (!ref?.file) return;
+  async function openSourceWindow(file, title) {
+    if (!file) return;
+    const normalized = normalizeFilePath(file);
+    if (!normalized) return;
 
-    const existing = sourceWindows.find((w) => w.file === ref.file);
+    const existing = sourceWindows.find((w) => normalizeFilePath(w.file) === normalized);
     if (existing) return;
 
     const slot = sourceWindows.length % 4;
     const sourceWindow = {
       id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-      file: ref.file,
-      title: ref.title || getShortName(ref.file),
+      file: normalized,
+      title: title || getShortName(normalized),
       content: '',
       loading: true,
       x: Math.max(20, 28 + slot * 34),
@@ -788,17 +878,27 @@
     sourceWindows = [...sourceWindows, sourceWindow];
 
     try {
-      const source = await getFileSource(ref.file);
+      const source = await getFileSource(normalized);
       sourceWindows = sourceWindows.map((w) =>
         w.id === sourceWindow.id ? { ...w, content: source || '', loading: false } : w
       );
     } catch (e) {
       sourceWindows = sourceWindows.map((w) =>
         w.id === sourceWindow.id
-          ? { ...w, content: `Failed to load source for ${ref.file}`, loading: false }
+          ? { ...w, content: `Failed to load source for ${normalized}`, loading: false }
           : w
       );
     }
+  }
+
+  async function openSourceWindowForReference(ref) {
+    if (!ref?.file) return;
+    await openSourceWindow(ref.file, ref.title || getShortName(ref.file));
+  }
+
+  async function openSelectedSourceWindow() {
+    if (!selectedNode?.file) return;
+    await openSourceWindow(selectedNode.file, getShortName(selectedNode.id));
   }
 
   function handleEditorTokenClick(token) {
@@ -1361,18 +1461,18 @@
       // Heat Highlight (Recently touched): animated glow + pulse outline.
       if (hasHeat) {
         ctx.save();
-        const glowAlpha = 0.16 + 0.62 * heat * (0.45 + 0.55 * heatPulse);
-        const glowBlur = 8 + 26 * heat * (0.4 + 0.6 * heatPulse);
+        const glowAlpha = 0.25 + 0.75 * heat * (0.45 + 0.55 * heatPulse);
+        const glowBlur = 12 + 34 * heat * (0.4 + 0.6 * heatPulse);
         ctx.shadowBlur = glowBlur;
         ctx.shadowColor = `rgba(255, 130, 20, ${glowAlpha})`;
-        ctx.strokeStyle = `rgba(255, 200, 80, ${0.35 + 0.50 * heatPulse})`;
-        ctx.lineWidth = 1.4 + 2.8 * heat * (0.45 + 0.55 * heatPulse);
+        ctx.strokeStyle = `rgba(255, 200, 80, ${0.45 + 0.55 * heatPulse})`;
+        ctx.lineWidth = 2.5 + 4.5 * heat * (0.45 + 0.55 * heatPulse);
         ctx.stroke(bodyPath);
 
         // Secondary ring to make pulse timing explicit.
         ctx.shadowBlur = 0;
-        ctx.strokeStyle = `rgba(255, 235, 150, ${0.10 + 0.35 * heatPulse})`;
-        ctx.lineWidth = 0.9 + 1.1 * heat;
+        ctx.strokeStyle = `rgba(255, 235, 150, ${0.15 + 0.45 * heatPulse})`;
+        ctx.lineWidth = 1.2 + 1.8 * heat;
         ctx.stroke(bodyPath);
         ctx.restore();
       }
@@ -1685,6 +1785,7 @@
     {#if !panelCollapsed}
       <div class="eyeloss-nav-panel__search">
         <input
+          bind:this={searchInput}
           type="text"
           placeholder="Filter nodes..."
           bind:value={searchQuery}
@@ -1692,13 +1793,13 @@
         />
       </div>
       <ul class="eyeloss-nav-panel__list">
-        {#each filteredNodes as node}
+        {#each filteredNodes as node, i}
           <li>
             <button
               class="eyeloss-nav-panel__item"
-              class:eyeloss-nav-panel__item--active={selectedNode && selectedNode.id === node.id}
+              class:eyeloss-nav-panel__item--active={(selectedNode && selectedNode.id === node.id) || highlightedSearchIndex === i}
               type="button"
-              onclick={() => focusNode(node)}
+              onclick={() => { focusNode(node); highlightedSearchIndex = i; }}
             >
               <span class="eyeloss-nav-panel__dot" data-ns={getNamespace(node.id)}></span>
               <span class="eyeloss-nav-panel__name">{getShortName(node.id)}</span>
@@ -1789,6 +1890,14 @@
           <div class="tabs" style="display: flex; gap: 4px;">
             <button class="btn {viewMode === 'diff' ? 'btn-primary' : ''}" style="font-size: 0.6rem; padding: 2px 6px;" onclick={() => viewMode = 'diff'}>Diff</button>
             <button class="btn {viewMode === 'source' ? 'btn-primary' : ''}" style="font-size: 0.6rem; padding: 2px 6px;" onclick={() => viewMode = 'source'}>Source</button>
+            <button
+              class="btn btn-ghost"
+              style="font-size: 0.6rem; padding: 2px 6px;"
+              onclick={openSelectedSourceWindow}
+              title="Open this file in a floating source window"
+            >
+              Open Window
+            </button>
           </div>
         </div>
         
@@ -1930,4 +2039,12 @@
       </div>
     </Window>
   {/each}
+
+  <svg style="position: absolute; top: 0; left: 0; width: 100%; height: 100%; pointer-events: none; z-index: 25000;">
+    <Robot
+      targetX={robotTarget.x}
+      targetY={robotTarget.y}
+      active={robotTarget.active}
+    />
+  </svg>
 </div>

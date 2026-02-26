@@ -9,6 +9,7 @@ use parking_lot::Mutex;
 use parser::{Parser, PluggableParser};
 use std::path::PathBuf;
 use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager};
 
 struct AppState {
@@ -74,6 +75,16 @@ fn perform_graph_build(
     since: Option<String>,
     include_neighbors: bool,
 ) -> Graph {
+    let started = Instant::now();
+    if debug_enabled() {
+        println!(
+            "[BACKEND][build] start repo={} since={:?} include_neighbors={}",
+            repo.display(),
+            since,
+            include_neighbors
+        );
+    }
+
     let mut g = Graph::new();
     let files_to_process = if let Some(ref revset) = since {
         let changed = vcs::get_changed_files(&repo, revset);
@@ -85,6 +96,17 @@ fn perform_graph_build(
             .collect::<Vec<String>>()
     };
 
+    if debug_enabled() {
+        println!(
+            "[BACKEND][build] changed-file candidates={} (repo={})",
+            files_to_process.len(),
+            repo.display()
+        );
+    }
+
+    let mut parsed_files = 0usize;
+    let mut unsupported_files = 0usize;
+    let mut unreadable_files = 0usize;
     for rel_path in files_to_process {
         let full_path = repo.join(&rel_path);
         let ext = full_path.extension().and_then(|e| e.to_str()).unwrap_or("");
@@ -94,7 +116,12 @@ fn perform_graph_build(
                 let (nodes, edges) = parser.parse_file(&repo, &rel_path, &source);
                 g.add_nodes(nodes);
                 g.add_edges(edges);
+                parsed_files += 1;
+            } else {
+                unreadable_files += 1;
             }
+        } else {
+            unsupported_files += 1;
         }
     }
 
@@ -106,6 +133,18 @@ fn perform_graph_build(
         g.filter_to_changes(&changed, include_neighbors);
     }
 
+    if debug_enabled() {
+        println!(
+            "[BACKEND][build] done nodes={} edges={} parsed={} unsupported={} unreadable={} took={}ms",
+            g.nodes.len(),
+            g.edges.len(),
+            parsed_files,
+            unsupported_files,
+            unreadable_files,
+            started.elapsed().as_millis()
+        );
+    }
+
     g
 }
 
@@ -113,10 +152,34 @@ fn fingerprint(repo: &PathBuf) -> u64 {
     graph::source_fingerprint(repo)
 }
 
+fn resolve_initial_repo() -> PathBuf {
+    let from_arg = std::env::args().nth(1).map(PathBuf::from);
+    if let Some(path) = from_arg {
+        return path;
+    }
+
+    let cwd = std::env::current_dir().expect("no cwd");
+    let mut candidate = cwd.clone();
+    loop {
+        if !matches!(vcs::detect_engine(&candidate), vcs::VCSEngine::None) {
+            return candidate;
+        }
+        if !candidate.pop() {
+            break;
+        }
+    }
+    cwd
+}
+
 // --- Tauri commands ---
 
 #[tauri::command]
 async fn select_repo(app: AppHandle, state: tauri::State<'_, AppState>) -> Result<String, String> {
+    let started = Instant::now();
+    if debug_enabled() {
+        println!("[BACKEND][cmd] select_repo start");
+    }
+
     use tauri_plugin_dialog::DialogExt;
 
     let (tx, rx) = std::sync::mpsc::channel();
@@ -153,8 +216,21 @@ async fn select_repo(app: AppHandle, state: tauri::State<'_, AppState>) -> Resul
         let watcher = setup_watcher(&app);
         *state.watcher.lock() = watcher;
 
+        if debug_enabled() {
+            println!(
+                "[BACKEND][cmd] select_repo done path={} took={}ms",
+                path_buf.display(),
+                started.elapsed().as_millis()
+            );
+        }
         Ok(path_buf.display().to_string())
     } else {
+        if debug_enabled() {
+            println!(
+                "[BACKEND][cmd] select_repo cancelled after {}ms",
+                started.elapsed().as_millis()
+            );
+        }
         Err("No folder selected".into())
     }
 }
@@ -165,8 +241,17 @@ async fn get_graph(
     since: Option<String>,
     include_neighbors: Option<bool>,
 ) -> Result<Graph, String> {
+    let started = Instant::now();
     let include_neighbors = include_neighbors.unwrap_or(false);
     let repo = state.repo.lock().clone();
+    if debug_enabled() {
+        println!(
+            "[BACKEND][cmd] get_graph start repo={} since={:?} include_neighbors={}",
+            repo.display(),
+            since,
+            include_neighbors
+        );
+    }
     let current_branch = vcs::get_current_branch(&repo);
     let current_revision = vcs::get_current_revision(&repo);
     {
@@ -179,6 +264,12 @@ async fn get_graph(
             && *last_branch == current_branch
             && *last_revision == current_revision
         {
+            if debug_enabled() {
+                println!(
+                    "[BACKEND][cmd] get_graph cache-hit took={}ms",
+                    started.elapsed().as_millis()
+                );
+            }
             return Ok(state.graph.lock().clone());
         }
     }
@@ -198,6 +289,15 @@ async fn get_graph(
         *last_revision = current_revision;
     }
 
+    if debug_enabled() {
+        println!(
+            "[BACKEND][cmd] get_graph done nodes={} edges={} took={}ms",
+            g.nodes.len(),
+            g.edges.len(),
+            started.elapsed().as_millis()
+        );
+    }
+
     Ok(g)
 }
 
@@ -207,51 +307,179 @@ fn get_changes(
     limit: Option<usize>,
     before_id: Option<String>,
 ) -> Vec<vcs::Change> {
+    let started = Instant::now();
     let repo = state.repo.lock().clone();
-    vcs::get_changes(&repo, limit.unwrap_or(20), before_id)
+    let limit = limit.unwrap_or(20);
+    if debug_enabled() {
+        println!(
+            "[BACKEND][cmd] get_changes start repo={} limit={} before_id={:?}",
+            repo.display(),
+            limit,
+            before_id
+        );
+    }
+    let changes = vcs::get_changes(&repo, limit, before_id);
+    if debug_enabled() {
+        println!(
+            "[BACKEND][cmd] get_changes done count={} took={}ms",
+            changes.len(),
+            started.elapsed().as_millis()
+        );
+    }
+    changes
 }
 
 #[tauri::command]
 fn get_bookmarks(state: tauri::State<AppState>) -> Vec<vcs::Bookmark> {
+    let started = Instant::now();
     let repo = state.repo.lock().clone();
-    vcs::get_bookmarks(&repo)
+    let bookmarks = vcs::get_bookmarks(&repo);
+    if debug_enabled() {
+        println!(
+            "[BACKEND][cmd] get_bookmarks repo={} count={} took={}ms",
+            repo.display(),
+            bookmarks.len(),
+            started.elapsed().as_millis()
+        );
+    }
+    bookmarks
 }
 
 #[tauri::command]
 fn get_current_branch(state: tauri::State<AppState>) -> String {
+    let started = Instant::now();
     let repo = state.repo.lock().clone();
-    vcs::get_current_branch(&repo)
+    let branch = vcs::get_current_branch(&repo);
+    if debug_enabled() {
+        println!(
+            "[BACKEND][cmd] get_current_branch repo={} branch='{}' took={}ms",
+            repo.display(),
+            branch,
+            started.elapsed().as_millis()
+        );
+    }
+    branch
 }
 
 #[tauri::command]
 fn get_file_diff(state: tauri::State<AppState>, file: String, since: Option<String>) -> String {
+    let started = Instant::now();
     let repo = state.repo.lock().clone();
-    vcs::get_file_diff(&repo, &file, since.as_deref())
+    let diff = vcs::get_file_diff(&repo, &file, since.as_deref());
+    if debug_enabled() {
+        println!(
+            "[BACKEND][cmd] get_file_diff file={} bytes={} took={}ms",
+            file,
+            diff.len(),
+            started.elapsed().as_millis()
+        );
+    }
+    diff
 }
 
 #[tauri::command]
 fn get_file_source(state: tauri::State<AppState>, file: String) -> String {
+    let started = Instant::now();
     let repo = state.repo.lock().clone();
     let path = repo.join(&file);
-    std::fs::read_to_string(path)
-        .unwrap_or_else(|_| "--- FILE DELETED OR INACCESSIBLE ---".to_string())
+    let content = std::fs::read_to_string(path)
+        .unwrap_or_else(|_| "--- FILE DELETED OR INACCESSIBLE ---".to_string());
+    if debug_enabled() {
+        println!(
+            "[BACKEND][cmd] get_file_source file={} bytes={} took={}ms",
+            file,
+            content.len(),
+            started.elapsed().as_millis()
+        );
+    }
+    content
 }
 
 #[tauri::command]
 fn save_file(state: tauri::State<AppState>, file: String, content: String) -> Result<(), String> {
+    let started = Instant::now();
     let repo = state.repo.lock().clone();
     let path = repo.join(&file);
-    std::fs::write(path, content).map_err(|e| e.to_string())
+    let bytes = content.len();
+    let result = std::fs::write(path, content).map_err(|e| e.to_string());
+    if debug_enabled() {
+        match &result {
+            Ok(_) => println!(
+                "[BACKEND][cmd] save_file file={} bytes={} took={}ms",
+                file,
+                bytes,
+                started.elapsed().as_millis()
+            ),
+            Err(err) => println!(
+                "[BACKEND][cmd] save_file file={} failed='{}' took={}ms",
+                file,
+                err,
+                started.elapsed().as_millis()
+            ),
+        }
+    }
+    result
 }
 
 #[tauri::command]
 fn get_repo_path(state: tauri::State<AppState>) -> String {
-    state.repo.lock().display().to_string()
+    let path = state.repo.lock().display().to_string();
+    if debug_enabled() {
+        println!("[BACKEND][cmd] get_repo_path -> {}", path);
+    }
+    path
 }
 
-// --- File watcher ---
+// --- File watcher and polling ---
+
+fn refresh_vcs_state(handle: &AppHandle) {
+    if let Some(state) = handle.try_state::<AppState>() {
+        let repo = state.repo.lock().clone();
+        let current_branch = vcs::get_current_branch(&repo);
+        let current_revision = vcs::get_current_revision(&repo);
+        let last_branch = state.last_branch.lock().clone();
+        let last_revision = state.last_revision.lock().clone();
+
+        if current_branch == last_branch && current_revision == last_revision {
+            return;
+        }
+
+        if debug_enabled() {
+            println!(
+                "[BACKEND] VCS state changed: branch '{}' -> '{}', rev '{}' -> '{}'. Rebuilding graph.",
+                last_branch,
+                current_branch,
+                if last_revision.len() > 12 { &last_revision[..12] } else { &last_revision },
+                if current_revision.len() > 12 { &current_revision[..12] } else { &current_revision },
+            );
+        }
+
+        let since = state.last_since.lock().clone();
+        let include_neighbors = *state.last_include_neighbors.lock();
+        let rebuilt = perform_graph_build(&state.parsers, repo.clone(), since, include_neighbors);
+        {
+            let mut graph = state.graph.lock();
+            *graph = rebuilt.clone();
+        }
+        *state.last_branch.lock() = current_branch.clone();
+        *state.last_revision.lock() = current_revision;
+
+        let _ = handle.emit(
+            "graph-updated",
+            serde_json::json!({
+                "graph": rebuilt,
+                "changes": vcs::get_changes(&repo, 20, None),
+                "bookmarks": vcs::get_bookmarks(&repo),
+                "current_branch": current_branch,
+            }),
+        );
+    }
+}
 
 fn setup_watcher(app: &AppHandle) -> Option<RecommendedWatcher> {
+    if debug_enabled() {
+        println!("[BACKEND][watcher] setup start");
+    }
     let handle = app.clone();
 
     let mut watcher = match notify::recommended_watcher(move |res: Result<Event, _>| {
@@ -270,8 +498,12 @@ fn setup_watcher(app: &AppHandle) -> Option<RecommendedWatcher> {
                     let s = p.display().to_string();
                     s.contains("/_build/")
                         || s.contains("/deps/")
+                        || s.contains("/dist/")
+                        || s.contains("/.svelte-kit/")
+                        || s.contains("/.output/")
                         || s.contains("/node_modules/")
                         || s.contains("/target/")
+                        || s.contains("/src-tauri/gen/")
                 };
 
                 let vcs_meta_changed = event.paths.iter().any(|p| is_vcs_meta_path(p));
@@ -285,39 +517,7 @@ fn setup_watcher(app: &AppHandle) -> Option<RecommendedWatcher> {
                 // Branch/bookmark/HEAD updates may only touch .git/.jj metadata.
                 // Rebuild from current filters so UI follows VCS changes immediately.
                 if vcs_meta_changed {
-                    let current_branch = vcs::get_current_branch(&repo);
-                    let current_revision = vcs::get_current_revision(&repo);
-                    let last_branch = state.last_branch.lock().clone();
-                    let last_revision = state.last_revision.lock().clone();
-                    if current_branch == last_branch && current_revision == last_revision {
-                        return;
-                    }
-                    println!(
-                        "[BACKEND] VCS state changed: branch '{}' -> '{}', rev '{}' -> '{}'. Rebuilding graph.",
-                        last_branch,
-                        current_branch,
-                        if last_revision.len() > 12 { &last_revision[..12] } else { &last_revision },
-                        if current_revision.len() > 12 { &current_revision[..12] } else { &current_revision },
-                    );
-                    let since = state.last_since.lock().clone();
-                    let include_neighbors = *state.last_include_neighbors.lock();
-                    let rebuilt =
-                        perform_graph_build(&state.parsers, repo.clone(), since, include_neighbors);
-                    {
-                        let mut graph = state.graph.lock();
-                        *graph = rebuilt.clone();
-                    }
-                    *state.last_branch.lock() = current_branch.clone();
-                    *state.last_revision.lock() = current_revision;
-                    let _ = handle.emit(
-                        "graph-updated",
-                        serde_json::json!({
-                            "graph": rebuilt,
-                            "changes": vcs::get_changes(&repo, 20, None),
-                            "bookmarks": vcs::get_bookmarks(&repo),
-                            "current_branch": current_branch,
-                        }),
-                    );
+                    refresh_vcs_state(&handle);
                     return;
                 }
 
@@ -396,8 +596,17 @@ fn setup_watcher(app: &AppHandle) -> Option<RecommendedWatcher> {
     if let Some(state) = app.try_state::<AppState>() {
         let repo_path = state.repo.lock().clone();
         let _ = watcher.watch(&repo_path, RecursiveMode::Recursive);
+        if debug_enabled() {
+            println!(
+                "[BACKEND][watcher] watching repo={} recursively",
+                repo_path.display()
+            );
+        }
     }
 
+    if debug_enabled() {
+        println!("[BACKEND][watcher] setup complete");
+    }
     Some(watcher)
 }
 
@@ -405,12 +614,12 @@ fn setup_watcher(app: &AppHandle) -> Option<RecommendedWatcher> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let repo = std::env::args()
-        .nth(1)
-        .map(PathBuf::from)
-        .unwrap_or_else(|| std::env::current_dir().expect("no cwd"));
-
+    let boot_start = Instant::now();
+    let repo = resolve_initial_repo();
     let repo = repo.canonicalize().unwrap_or(repo);
+    if debug_enabled() {
+        println!("[BACKEND][boot] run start repo={}", repo.display());
+    }
 
     let parsers: Vec<Box<dyn Parser>> = vec![
         Box::new(PluggableParser {
@@ -565,10 +774,21 @@ pub fn run() {
         }),
     ];
 
+    let graph_start = Instant::now();
     let g = perform_graph_build(&parsers, repo.clone(), Some("@".to_string()), false);
     let fp = graph::source_fingerprint(&repo);
     let branch = vcs::get_current_branch(&repo);
     let revision = vcs::get_current_revision(&repo);
+    if debug_enabled() {
+        println!(
+            "[BACKEND][boot] initial graph/build metadata done nodes={} edges={} branch='{}' rev='{}' took={}ms",
+            g.nodes.len(),
+            g.edges.len(),
+            branch,
+            if revision.len() > 12 { &revision[..12] } else { &revision },
+            graph_start.elapsed().as_millis()
+        );
+    }
 
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
@@ -595,11 +815,30 @@ pub fn run() {
             select_repo,
         ])
         .setup(|app| {
+            if debug_enabled() {
+                println!("[BACKEND][boot] tauri setup start");
+            }
+            let handle = app.handle().clone();
+            std::thread::spawn(move || loop {
+                std::thread::sleep(Duration::from_secs(5));
+                refresh_vcs_state(&handle);
+            });
+
             let watcher = setup_watcher(app.handle());
             let state = app.state::<AppState>();
             *state.watcher.lock() = watcher;
+            if debug_enabled() {
+                println!("[BACKEND][boot] tauri setup complete");
+            }
             Ok(())
         })
         .run(tauri::generate_context!())
         .expect("failed to run codegraph");
+
+    if debug_enabled() {
+        println!(
+            "[BACKEND][boot] run exited after {}ms",
+            boot_start.elapsed().as_millis()
+        );
+    }
 }
