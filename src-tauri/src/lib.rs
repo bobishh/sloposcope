@@ -3,10 +3,11 @@ mod jj;
 mod parser;
 mod vcs;
 
-use graph::Graph;
-use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
+use graph::{Graph, Node};
+use notify::{event::EventKind, Event, RecommendedWatcher, RecursiveMode, Watcher};
 use parking_lot::Mutex;
 use parser::{Parser, PluggableParser};
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
@@ -22,6 +23,9 @@ struct AppState {
     last_include_neighbors: Mutex<bool>,
     last_branch: Mutex<String>,
     last_revision: Mutex<String>,
+    watcher_flush_scheduled: Mutex<bool>,
+    watcher_pending_vcs_meta: Mutex<bool>,
+    watcher_pending_paths: Mutex<Vec<PathBuf>>,
 }
 
 fn debug_enabled() -> bool {
@@ -35,6 +39,44 @@ fn debug_enabled() -> bool {
             Err(_) => cfg!(debug_assertions),
         }
     })
+}
+
+fn vcs_poll_interval() -> Duration {
+    static POLL_INTERVAL: OnceLock<Duration> = OnceLock::new();
+    *POLL_INTERVAL.get_or_init(|| {
+        // Faster than previous 5s default so branch switches propagate quicker.
+        // Override via SLOPOSCOPE_VCS_POLL_MS / EYELOSS_VCS_POLL_MS.
+        let raw = std::env::var("SLOPOSCOPE_VCS_POLL_MS")
+            .or_else(|_| std::env::var("EYELOSS_VCS_POLL_MS"))
+            .ok();
+        let parsed = raw
+            .as_deref()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(1000);
+        Duration::from_millis(parsed.clamp(250, 10_000))
+    })
+}
+
+fn watcher_debounce_interval() -> Duration {
+    static WATCH_DEBOUNCE: OnceLock<Duration> = OnceLock::new();
+    *WATCH_DEBOUNCE.get_or_init(|| {
+        let raw = std::env::var("SLOPOSCOPE_WATCH_DEBOUNCE_MS")
+            .or_else(|_| std::env::var("EYELOSS_WATCH_DEBOUNCE_MS"))
+            .ok();
+        let parsed = raw
+            .as_deref()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(450);
+        Duration::from_millis(parsed.clamp(100, 5_000))
+    })
+}
+
+fn short_rev_label(rev: &str) -> String {
+    if rev.len() > 12 {
+        rev[..12].to_string()
+    } else {
+        rev.to_string()
+    }
 }
 
 fn resolve_graph_edges(g: &mut Graph) {
@@ -252,29 +294,56 @@ async fn get_graph(
             include_neighbors
         );
     }
+    let vcs_probe_started = Instant::now();
     let current_branch = vcs::get_current_branch(&repo);
     let current_revision = vcs::get_current_revision(&repo);
+    let vcs_probe_ms = vcs_probe_started.elapsed().as_millis();
     {
         let last_since = state.last_since.lock();
         let last_include_neighbors = state.last_include_neighbors.lock();
         let last_branch = state.last_branch.lock();
         let last_revision = state.last_revision.lock();
-        if *last_since == since
-            && *last_include_neighbors == include_neighbors
-            && *last_branch == current_branch
-            && *last_revision == current_revision
-        {
-            if debug_enabled() {
+        let same_since = *last_since == since;
+        let same_include_neighbors = *last_include_neighbors == include_neighbors;
+        let same_branch = *last_branch == current_branch;
+        let same_revision = *last_revision == current_revision;
+        let cache_hit = same_since && same_include_neighbors && same_branch && same_revision;
+        if debug_enabled() {
+            if cache_hit {
                 println!(
-                    "[BACKEND][cmd] get_graph cache-hit took={}ms",
+                    "[BACKEND][cmd] get_graph cache-hit since={} include_neighbors={} branch={} revision={} vcs_probe={}ms total={}ms",
+                    same_since,
+                    same_include_neighbors,
+                    same_branch,
+                    same_revision,
+                    vcs_probe_ms,
                     started.elapsed().as_millis()
                 );
+            } else {
+                println!(
+                    "[BACKEND][cmd] get_graph cache-miss since={} include_neighbors={} branch={} revision={} req_since={:?} last_since={:?} req_branch='{}' last_branch='{}' req_rev='{}' last_rev='{}' vcs_probe={}ms",
+                    same_since,
+                    same_include_neighbors,
+                    same_branch,
+                    same_revision,
+                    since,
+                    *last_since,
+                    current_branch,
+                    *last_branch,
+                    short_rev_label(&current_revision),
+                    short_rev_label(last_revision.as_str()),
+                    vcs_probe_ms
+                );
             }
+        }
+        if cache_hit {
             return Ok(state.graph.lock().clone());
         }
     }
 
+    let build_started = Instant::now();
     let g = perform_graph_build(&state.parsers, repo, since.clone(), include_neighbors);
+    let build_ms = build_started.elapsed().as_millis();
 
     {
         let mut graph = state.graph.lock();
@@ -291,9 +360,11 @@ async fn get_graph(
 
     if debug_enabled() {
         println!(
-            "[BACKEND][cmd] get_graph done nodes={} edges={} took={}ms",
+            "[BACKEND][cmd] get_graph done nodes={} edges={} build={}ms vcs_probe={}ms total={}ms",
             g.nodes.len(),
             g.edges.len(),
+            build_ms,
+            vcs_probe_ms,
             started.elapsed().as_millis()
         );
     }
@@ -434,45 +505,275 @@ fn get_repo_path(state: tauri::State<AppState>) -> String {
 
 fn refresh_vcs_state(handle: &AppHandle) {
     if let Some(state) = handle.try_state::<AppState>() {
+        let started = Instant::now();
         let repo = state.repo.lock().clone();
+        let vcs_probe_started = Instant::now();
         let current_branch = vcs::get_current_branch(&repo);
         let current_revision = vcs::get_current_revision(&repo);
+        let vcs_probe_ms = vcs_probe_started.elapsed().as_millis();
         let last_branch = state.last_branch.lock().clone();
         let last_revision = state.last_revision.lock().clone();
+        let branch_changed = current_branch != last_branch;
+        let revision_changed = current_revision != last_revision;
 
-        if current_branch == last_branch && current_revision == last_revision {
+        if !branch_changed && !revision_changed {
+            if debug_enabled() && vcs_probe_ms >= 40 {
+                println!(
+                    "[BACKEND][watcher] refresh_vcs_state no-op branch='{}' rev='{}' vcs_probe={}ms total={}ms",
+                    current_branch,
+                    short_rev_label(&current_revision),
+                    vcs_probe_ms,
+                    started.elapsed().as_millis()
+                );
+            }
             return;
         }
 
         if debug_enabled() {
             println!(
-                "[BACKEND] VCS state changed: branch '{}' -> '{}', rev '{}' -> '{}'. Rebuilding graph.",
+                "[BACKEND][watcher] VCS state changed: branch '{}' -> '{}', rev '{}' -> '{}'. Rebuilding graph.",
                 last_branch,
                 current_branch,
-                if last_revision.len() > 12 { &last_revision[..12] } else { &last_revision },
-                if current_revision.len() > 12 { &current_revision[..12] } else { &current_revision },
+                short_rev_label(last_revision.as_str()),
+                short_rev_label(&current_revision),
             );
         }
 
-        let since = state.last_since.lock().clone();
+        let effective_since = if branch_changed {
+            if debug_enabled() {
+                println!(
+                    "[BACKEND][watcher] branch changed, resetting since filter to '@' (was {:?})",
+                    state.last_since.lock().clone()
+                );
+            }
+            Some("@".to_string())
+        } else {
+            state.last_since.lock().clone()
+        };
         let include_neighbors = *state.last_include_neighbors.lock();
-        let rebuilt = perform_graph_build(&state.parsers, repo.clone(), since, include_neighbors);
+        let build_started = Instant::now();
+        let rebuilt = perform_graph_build(
+            &state.parsers,
+            repo.clone(),
+            effective_since.clone(),
+            include_neighbors,
+        );
+        let build_ms = build_started.elapsed().as_millis();
         {
             let mut graph = state.graph.lock();
             *graph = rebuilt.clone();
         }
+        *state.last_since.lock() = effective_since.clone();
         *state.last_branch.lock() = current_branch.clone();
         *state.last_revision.lock() = current_revision;
 
-        let _ = handle.emit(
+        let bookmarks_started = Instant::now();
+        let bookmarks = vcs::get_bookmarks(&repo);
+        let bookmarks_ms = bookmarks_started.elapsed().as_millis();
+        let emit_started = Instant::now();
+        let emit_result = handle.emit(
             "graph-updated",
             serde_json::json!({
                 "graph": rebuilt,
-                "changes": vcs::get_changes(&repo, 20, None),
-                "bookmarks": vcs::get_bookmarks(&repo),
+                "bookmarks": bookmarks,
                 "current_branch": current_branch,
+                "current_revision": state.last_revision.lock().clone(),
+                "since": effective_since.clone().unwrap_or_else(|| "@".to_string()),
+                "since_reset": branch_changed,
             }),
         );
+        let emit_ms = emit_started.elapsed().as_millis();
+        if debug_enabled() {
+            println!(
+                "[BACKEND][watcher] refresh_vcs_state done build={}ms bookmarks={}ms emit={}ms vcs_probe={}ms total={}ms",
+                build_ms,
+                bookmarks_ms,
+                emit_ms,
+                vcs_probe_ms,
+                started.elapsed().as_millis()
+            );
+            if let Err(err) = &emit_result {
+                println!("[BACKEND][watcher] graph-updated emit failed: {}", err);
+            }
+        }
+    }
+}
+
+fn queue_watcher_batch(handle: &AppHandle, vcs_meta_changed: bool, interesting_paths: Vec<PathBuf>) {
+    if !vcs_meta_changed && interesting_paths.is_empty() {
+        return;
+    }
+
+    let should_schedule = if let Some(state) = handle.try_state::<AppState>() {
+        if vcs_meta_changed {
+            *state.watcher_pending_vcs_meta.lock() = true;
+        }
+        if !interesting_paths.is_empty() {
+            state.watcher_pending_paths.lock().extend(interesting_paths);
+        }
+
+        let mut scheduled = state.watcher_flush_scheduled.lock();
+        if *scheduled {
+            false
+        } else {
+            *scheduled = true;
+            true
+        }
+    } else {
+        false
+    };
+
+    if should_schedule {
+        let handle_clone = handle.clone();
+        let wait = watcher_debounce_interval();
+        std::thread::spawn(move || {
+            std::thread::sleep(wait);
+            flush_watcher_batch(&handle_clone);
+        });
+    }
+}
+
+fn flush_watcher_batch(handle: &AppHandle) {
+    let (pending_vcs_meta, pending_paths) = if let Some(state) = handle.try_state::<AppState>() {
+        let pending_vcs_meta = *state.watcher_pending_vcs_meta.lock();
+        *state.watcher_pending_vcs_meta.lock() = false;
+
+        let mut unique = HashSet::new();
+        let mut pending_paths = Vec::new();
+        for path in state.watcher_pending_paths.lock().drain(..) {
+            let key = path.display().to_string();
+            if unique.insert(key) {
+                pending_paths.push(path);
+            }
+        }
+
+        *state.watcher_flush_scheduled.lock() = false;
+        (pending_vcs_meta, pending_paths)
+    } else {
+        return;
+    };
+
+    // During branch/checkout operations, prioritize single state refresh over noisy incremental events.
+    if pending_vcs_meta {
+        refresh_vcs_state(handle);
+        return;
+    }
+
+    if pending_paths.is_empty() {
+        return;
+    }
+
+    if let Some(state) = handle.try_state::<AppState>() {
+        let repo = state.repo.lock().clone();
+        let since_filter = state
+            .last_since
+            .lock()
+            .clone()
+            .unwrap_or_else(|| "@".to_string());
+        let changed_statuses = vcs::get_changed_files(&repo, &since_filter);
+
+        if debug_enabled() {
+            println!(
+                "[BACKEND][watcher] flush batch paths={} changed_set={} since={}",
+                pending_paths.len(),
+                changed_statuses.len(),
+                since_filter
+            );
+        }
+
+        let mut graph = state.graph.lock();
+        let mut changed = false;
+        let mut touched_count = 0usize;
+
+        for path in &pending_paths {
+            let Ok(rel_path_buf) = path.strip_prefix(&repo) else {
+                continue;
+            };
+            let rel_path = rel_path_buf.display().to_string().replace('\\', "/");
+
+            // If file dropped from current changed set, remove stale node and ignore this event.
+            let before_nodes = graph.nodes.len();
+            graph.nodes.retain(|n| n.file != rel_path);
+            if graph.nodes.len() != before_nodes {
+                changed = true;
+            }
+
+            let Some(change_status) = changed_statuses.get(&rel_path).cloned() else {
+                continue;
+            };
+
+            if change_status == "deleted" || !path.exists() || !path.is_file() {
+                continue;
+            }
+
+            let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+            let mut added_node = false;
+            if let Some(parser) = state.parsers.iter().find(|p| p.extensions().contains(&ext)) {
+                if let Ok(source) = std::fs::read_to_string(path) {
+                    let (mut new_nodes, new_edges) = parser.parse_file(&repo, &rel_path, &source);
+                    for node in &mut new_nodes {
+                        node.change_status = change_status.clone();
+                    }
+                    if !new_nodes.is_empty() {
+                        added_node = true;
+                    }
+                    graph.add_nodes(new_nodes);
+                    graph.add_edges(new_edges);
+                    changed = true;
+                }
+            }
+
+            if !added_node {
+                let line_count = std::fs::read_to_string(path)
+                    .map(|s| s.lines().count())
+                    .unwrap_or(0);
+                graph.add_nodes(vec![Node {
+                    id: rel_path.clone(),
+                    label: rel_path.clone(),
+                    kind: "file".into(),
+                    file: rel_path.clone(),
+                    line_count,
+                    change_status: change_status.clone(),
+                    functions: vec![],
+                }]);
+                changed = true;
+            }
+
+            let _ = handle.emit("file-touched", rel_path);
+            touched_count += 1;
+        }
+
+        if changed {
+            resolve_graph_edges(&mut graph);
+            graph.finalize();
+            let graph_snapshot = graph.clone();
+            drop(graph);
+
+            let current_branch = vcs::get_current_branch(&repo);
+            let current_revision = vcs::get_current_revision(&repo);
+            *state.last_branch.lock() = current_branch.clone();
+            *state.last_revision.lock() = current_revision;
+
+            let _ = handle.emit(
+                "graph-updated",
+                serde_json::json!({
+                    "graph": graph_snapshot,
+                    "current_branch": current_branch,
+                    "current_revision": state.last_revision.lock().clone(),
+                    "since": since_filter,
+                    "since_reset": false,
+                }),
+            );
+        }
+
+        if debug_enabled() {
+            println!(
+                "[BACKEND][watcher] flush done touched={} changed={} pending_paths={}",
+                touched_count,
+                changed,
+                pending_paths.len()
+            );
+        }
     }
 }
 
@@ -486,6 +787,11 @@ fn setup_watcher(app: &AppHandle) -> Option<RecommendedWatcher> {
         if let Ok(event) = res {
             if let Some(state) = handle.try_state::<AppState>() {
                 let repo = state.repo.lock().clone();
+                let active_since = state
+                    .last_since
+                    .lock()
+                    .clone()
+                    .unwrap_or_else(|| "@".to_string());
 
                 let is_vcs_meta_path = |p: &PathBuf| {
                     let s = p.display().to_string();
@@ -505,87 +811,54 @@ fn setup_watcher(app: &AppHandle) -> Option<RecommendedWatcher> {
                         || s.contains("/target/")
                         || s.contains("/src-tauri/gen/")
                 };
+                let is_file_content_event = matches!(
+                    event.kind,
+                    EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
+                );
 
                 let vcs_meta_changed = event.paths.iter().any(|p| is_vcs_meta_path(p));
+                if vcs_meta_changed {
+                    queue_watcher_batch(&handle, true, Vec::new());
+                    return;
+                }
+                if !is_file_content_event {
+                    return;
+                }
+                if active_since != "@" {
+                    // Ignore live watcher noise when user is viewing historical revsets.
+                    return;
+                }
+
                 let interesting_paths: Vec<PathBuf> = event
                     .paths
                     .iter()
                     .filter(|p| !is_vcs_meta_path(p) && !is_ignored_runtime_path(p))
                     .cloned()
                     .collect();
-
-                // Branch/bookmark/HEAD updates may only touch .git/.jj metadata.
-                // Rebuild from current filters so UI follows VCS changes immediately.
-                if vcs_meta_changed {
-                    refresh_vcs_state(&handle);
+                if interesting_paths.is_empty() {
                     return;
                 }
 
-                if !interesting_paths.is_empty() {
-                    if debug_enabled() {
-                        println!(
-                            "[BACKEND] Watch event {:?}, {} interesting path(s)",
-                            event.kind,
-                            interesting_paths.len()
-                        );
-                    }
-                    // 1. Emit heat events immediately
-                    for path in &interesting_paths {
-                        if let Ok(rel) = path.strip_prefix(&repo) {
-                            let _ = handle.emit("file-touched", rel.display().to_string());
-                        }
-                    }
-
-                    // 2. Perform incremental graph update
-                    let mut graph = state.graph.lock();
-                    let mut changed = false;
-
-                    for path in &interesting_paths {
-                        if let Ok(rel_path_buf) = path.strip_prefix(&repo) {
-                            let rel_path = rel_path_buf.display().to_string();
-
-                            // Always remove old version of this file's nodes
-                            graph.nodes.retain(|n| n.file != rel_path);
-                            changed = true;
-
-                            let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-                            if let Some(parser) =
-                                state.parsers.iter().find(|p| p.extensions().contains(&ext))
-                            {
-                                if let Ok(source) = std::fs::read_to_string(path) {
-                                    // Parse and add new version if file still exists
-                                    let (new_nodes, new_edges) =
-                                        parser.parse_file(&repo, &rel_path, &source);
-                                    graph.add_nodes(new_nodes);
-                                    graph.add_edges(new_edges);
-                                }
-                            }
-                        }
-                    }
-
-                    if changed {
-                        if debug_enabled() {
-                            println!("[BACKEND] Incremental graph update emitted");
-                        }
-                        resolve_graph_edges(&mut graph);
-                        graph.finalize();
-                        let graph_snapshot = graph.clone();
-                        drop(graph);
-                        let current_branch = vcs::get_current_branch(&repo);
-                        let current_revision = vcs::get_current_revision(&repo);
-                        *state.last_branch.lock() = current_branch.clone();
-                        *state.last_revision.lock() = current_revision;
-                        let _ = handle.emit(
-                            "graph-updated",
-                            serde_json::json!({
-                                "graph": graph_snapshot,
-                                "changes": vcs::get_changes(&repo, 20, None),
-                                "bookmarks": vcs::get_bookmarks(&repo),
-                                "current_branch": current_branch,
-                            }),
-                        );
-                    }
+                // Early filter: queue only files from current working-set changes.
+                let changed_statuses = vcs::get_changed_files(&repo, "@");
+                if changed_statuses.is_empty() {
+                    return;
                 }
+                let filtered_paths: Vec<PathBuf> = interesting_paths
+                    .into_iter()
+                    .filter(|p| {
+                        let Ok(rel_path_buf) = p.strip_prefix(&repo) else {
+                            return false;
+                        };
+                        let rel_path = rel_path_buf.display().to_string().replace('\\', "/");
+                        changed_statuses.contains_key(&rel_path)
+                    })
+                    .collect();
+                if filtered_paths.is_empty() {
+                    return;
+                }
+
+                queue_watcher_batch(&handle, false, filtered_paths);
             }
         }
     }) {
@@ -802,6 +1075,9 @@ pub fn run() {
             last_include_neighbors: Mutex::new(false),
             last_branch: Mutex::new(branch),
             last_revision: Mutex::new(revision),
+            watcher_flush_scheduled: Mutex::new(false),
+            watcher_pending_vcs_meta: Mutex::new(false),
+            watcher_pending_paths: Mutex::new(Vec::new()),
         })
         .invoke_handler(tauri::generate_handler![
             get_graph,
@@ -819,8 +1095,15 @@ pub fn run() {
                 println!("[BACKEND][boot] tauri setup start");
             }
             let handle = app.handle().clone();
+            let poll_interval = vcs_poll_interval();
+            if debug_enabled() {
+                println!(
+                    "[BACKEND][boot] polling refresh_vcs_state every {}ms",
+                    poll_interval.as_millis()
+                );
+            }
             std::thread::spawn(move || loop {
-                std::thread::sleep(Duration::from_secs(5));
+                std::thread::sleep(poll_interval);
                 refresh_vcs_state(&handle);
             });
 

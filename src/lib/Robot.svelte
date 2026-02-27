@@ -71,7 +71,7 @@
   <rect x="-10" y="22" width="7" height="12" rx="2" fill="#2f5f4a"/>
   <rect x="3" y="22" width="7" height="12" rx="2" fill="#2f5f4a"/>
 
-  <g transform="translate(24, 6) rotate({hammerRotation})">
+  <g transform="translate(21, 10) rotate({hammerRotation})">
     <rect x="-1.5" y="-2" width="3" height="20" rx="1.5" fill="#8b5a2b"/>
     <rect x="-8" y="-7" width="16" height="8" rx="2" fill="url(#hammer-metal)" stroke="#5c5c5c" stroke-width="1"/>
   </g>

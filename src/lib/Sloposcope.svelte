@@ -2,6 +2,7 @@
   import { onMount } from 'svelte';
   import Window from './Window.svelte';
   import Editor from './Editor.svelte';
+  import NodeDetailsWindow from './NodeDetailsWindow.svelte';
   import Robot from './Robot.svelte';
   import { setupShortcuts } from './shortcuts.js';
 
@@ -28,6 +29,14 @@
       .replaceAll('\\', '/')
       .replace(/^\.\/+/, '')
       .replace(/^\/+/, '');
+  }
+
+  function areSetsEqual(left, right) {
+    if (left.size !== right.size) return false;
+    for (const value of left) {
+      if (!right.has(value)) return false;
+    }
+    return true;
   }
 
   function findNodeByFilePath(file) {
@@ -342,36 +351,17 @@
   let simNodes = $state([]);
   let simEdges = $state([]);
   let animating = $state(true);
-  let selectedNode = $state(null);
+  let selectedNodeIds = $state(new Set());
+  let activeNodeId = $state(null);
+  let nodeWindows = $state([]);
   let hoveredNode = $state(null);
 
-  let fileDiff = $state(null);
-  let fileSource = $state(null);
-  let viewMode = $state('diff'); // 'diff' | 'source'
-  let diffFile = $state(null);
-  let diffLoading = $state(false);
-  let sourceLoading = $state(false);
-  let isSaving = $state(false);
-  let diffExpanded = $state(false);
-  let sidePanelOpen = $state(false);
+  const diffCache = new Map();
+  const sourceCache = new Map();
   let sourceWindows = $state([]);
-
-  async function handleSave() {
-    if (!selectedNode || !selectedNode.file || !fileSource) return;
-    isSaving = true;
-    try {
-      await saveFile(selectedNode.file, fileSource);
-      console.log('File saved successfully');
-    } catch (e) {
-      console.error('Failed to save file', e);
-    } finally {
-      isSaving = false;
-    }
-  }
 
   let panelCollapsed = $state(false);
   let searchQuery = $state('');
-  let showSignatures = $state(false);
 
   let dragging = $state(false);
   let dragStart = $state({ x: 0, y: 0 });
@@ -386,128 +376,6 @@
   const SETTLING_ITERATIONS = 50;
   const MIN_ZOOM = 0.05;
   const MAX_ZOOM = 10;
-
-  let diffLines = $derived.by(() => {
-    if (!fileDiff) return [];
-    return fileDiff.split('\n').filter(line =>
-      !line.startsWith('diff --git') &&
-      !line.startsWith('index ') &&
-      !line.startsWith('--- ') &&
-      !line.startsWith('+++ ')
-    );
-  });
-
-  let visibleDiffLines = $derived(diffExpanded ? diffLines : diffLines.slice(0, 60));
-
-  let splitDiffLines = $derived.by(() => {
-    if (!fileDiff) return [];
-    
-    let leftNum = 0;
-    let rightNum = 0;
-    let pairs = [];
-    
-    for (let i = 0; i < diffLines.length; i++) {
-      const line = diffLines[i];
-      if (line.startsWith('@@')) {
-        const match = line.match(/@@ -(\d+),?\d* \+(\d+),?\d* @@/);
-        if (match) {
-          leftNum = parseInt(match[1], 10);
-          rightNum = parseInt(match[2], 10);
-        }
-        pairs.push({ type: 'meta', leftNum: '', rightNum: '', text: line });
-      } else if (line.startsWith('-')) {
-        pairs.push({ type: 'del', leftNum: leftNum++, rightNum: '', text: line.substring(1) });
-      } else if (line.startsWith('+')) {
-        pairs.push({ type: 'add', leftNum: '', rightNum: rightNum++, text: line.substring(1) });
-      } else {
-        pairs.push({ type: 'context', leftNum: leftNum++, rightNum: rightNum++, text: line.substring(1) });
-      }
-    }
-    
-    let aligned = [];
-    for (let i = 0; i < pairs.length; i++) {
-      if (pairs[i].type === 'del') {
-        let delLines = [pairs[i]];
-        let j = i + 1;
-        while (j < pairs.length && pairs[j].type === 'del') {
-          delLines.push(pairs[j]);
-          j++;
-        }
-        
-        let addLines = [];
-        while (j < pairs.length && pairs[j].type === 'add') {
-          addLines.push(pairs[j]);
-          j++;
-        }
-        
-        const maxLen = Math.max(delLines.length, addLines.length);
-        for (let k = 0; k < maxLen; k++) {
-          aligned.push({
-            left: delLines[k] || null,
-            right: addLines[k] || null
-          });
-        }
-        i = j - 1;
-      } else if (pairs[i].type === 'add') {
-        let addLines = [pairs[i]];
-        let j = i + 1;
-        while (j < pairs.length && pairs[j].type === 'add') {
-          addLines.push(pairs[j]);
-          j++;
-        }
-        for (let k = 0; k < addLines.length; k++) {
-          aligned.push({ left: null, right: addLines[k] });
-        }
-        i = j - 1;
-      } else {
-        aligned.push({ left: pairs[i], right: pairs[i] });
-      }
-    }
-    return aligned;
-  });
-
-  let diffChunks = $derived.by(() => {
-    let chunks = [];
-    let currentChunk = null;
-    
-    for (const line of splitDiffLines) {
-      const metaText = line.left?.type === 'meta' ? line.left.text : (line.right?.type === 'meta' ? line.right.text : null);
-      
-      if (metaText) {
-        if (currentChunk) chunks.push(currentChunk);
-        
-        const contextMatch = metaText.match(/@@[^{]*@@(.*)/);
-        let context = contextMatch && contextMatch[1] ? contextMatch[1].trim() : "";
-        if (!context) context = metaText.trim();
-        
-        currentChunk = { context, lines: [] };
-      } else {
-        if (!currentChunk) {
-          currentChunk = { context: "Header", lines: [] };
-        }
-        currentChunk.lines.push(line);
-      }
-    }
-    if (currentChunk) chunks.push(currentChunk);
-    return chunks;
-  });
-
-  let expandedChunks = $state(new Set());
-  
-  $effect(() => {
-    if (fileDiff) {
-      const newSet = new Set();
-      diffChunks.forEach((_, i) => newSet.add(i));
-      expandedChunks = newSet;
-    }
-  });
-
-  function toggleChunk(index) {
-    const newSet = new Set(expandedChunks);
-    if (newSet.has(index)) newSet.delete(index);
-    else newSet.add(index);
-    expandedChunks = newSet;
-  }
 
   let canvasColors = $state({
     primary: '#4a8c5c',
@@ -807,24 +675,99 @@
     camera.zoom = Math.max(0.25, Math.min(1.4, fitZoom));
   }
 
+  function findNodeById(nodeId) {
+    return simNodes.find((n) => n.id === nodeId) || null;
+  }
+
+  function ensureNodeWindow(node) {
+    const existing = nodeWindows.find((w) => w.nodeId === node.id);
+    if (existing) {
+      nodeWindows = [
+        ...nodeWindows.filter((w) => w.nodeId !== node.id),
+        existing,
+      ];
+      return;
+    }
+
+    const slot = (nodeWindows.length + sourceWindows.length) % 6;
+    const detailWidth = Math.min(900, Math.max(420, width * 0.62));
+    const detailHeight = Math.min(800, Math.max(320, height * 0.84));
+    const nextWindow = {
+      id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      nodeId: node.id,
+      x: Math.max(16, 24 + slot * 28),
+      y: Math.max(16, 20 + slot * 22),
+      width: detailWidth,
+      height: detailHeight,
+    };
+    nodeWindows = [...nodeWindows, nextWindow];
+  }
+
   function focusNode(node) {
+    if (!node) return;
     camera.x = node.x;
     camera.y = node.y;
     camera.zoom = Math.max(camera.zoom, 1.5);
-    selectedNode = node;
-    diffExpanded = false;
+
+    const next = new Set(selectedNodeIds);
+    next.add(node.id);
+    selectedNodeIds = next;
+    activeNodeId = node.id;
+    ensureNodeWindow(node);
   }
 
-  let sourceReferenceLinks = $derived.by(() => {
-    if (!selectedNode) return [];
+  function closeNodeWindow(nodeId) {
+    const remaining = nodeWindows.filter((w) => w.nodeId !== nodeId);
+    nodeWindows = remaining;
+
+    const next = new Set(selectedNodeIds);
+    next.delete(nodeId);
+    selectedNodeIds = next;
+
+    if (activeNodeId === nodeId) {
+      activeNodeId = remaining.length > 0 ? remaining[remaining.length - 1].nodeId : null;
+    }
+  }
+
+  function moveNodeWindow(nodeId, detail) {
+    nodeWindows = nodeWindows.map((w) =>
+      w.nodeId === nodeId ? { ...w, x: detail.x, y: detail.y } : w
+    );
+  }
+
+  function resizeNodeWindow(nodeId, detail) {
+    nodeWindows = nodeWindows.map((w) =>
+      w.nodeId === nodeId ? { ...w, width: detail.width, height: detail.height } : w
+    );
+  }
+
+  function focusNodeWindow(nodeId) {
+    const node = findNodeById(nodeId);
+    if (node) {
+      const next = new Set(selectedNodeIds);
+      next.add(nodeId);
+      selectedNodeIds = next;
+    }
+    activeNodeId = nodeId;
+    const existing = nodeWindows.find((w) => w.nodeId === nodeId);
+    if (!existing) return;
+    nodeWindows = [
+      ...nodeWindows.filter((w) => w.nodeId !== nodeId),
+      existing,
+    ];
+  }
+
+  function getSourceReferenceLinksForNode(nodeId) {
+    const sourceNode = findNodeById(nodeId);
+    if (!sourceNode) return [];
 
     const refs = [];
     const seenTokens = new Set();
 
     for (const edge of simEdges) {
-      if (edge.source !== selectedNode.id) continue;
-      const targetNode = simNodes.find((n) => n.id === edge.target);
-      if (!targetNode || !targetNode.file || targetNode.file === selectedNode.file) continue;
+      if (edge.source !== sourceNode.id) continue;
+      const targetNode = findNodeById(edge.target);
+      if (!targetNode || !targetNode.file || targetNode.file === sourceNode.file) continue;
 
       const candidates = [
         edge.target,
@@ -845,13 +788,6 @@
     }
 
     return refs;
-  });
-
-  function findReferenceByToken(token) {
-    if (!token) return null;
-    const exact = sourceReferenceLinks.find((ref) => ref.token === token);
-    if (exact) return exact;
-    return sourceReferenceLinks.find((ref) => ref.token.toLowerCase() === token.toLowerCase()) || null;
   }
 
   async function openSourceWindow(file, title) {
@@ -860,7 +796,13 @@
     if (!normalized) return;
 
     const existing = sourceWindows.find((w) => normalizeFilePath(w.file) === normalized);
-    if (existing) return;
+    if (existing) {
+      sourceWindows = [
+        ...sourceWindows.filter((w) => w.id !== existing.id),
+        existing,
+      ];
+      return;
+    }
 
     const slot = sourceWindows.length % 4;
     const sourceWindow = {
@@ -878,7 +820,9 @@
     sourceWindows = [...sourceWindows, sourceWindow];
 
     try {
-      const source = await getFileSource(normalized);
+      const cached = sourceCache.get(normalized);
+      const source = cached !== undefined ? cached : await getFileSource(normalized);
+      sourceCache.set(normalized, source || '');
       sourceWindows = sourceWindows.map((w) =>
         w.id === sourceWindow.id ? { ...w, content: source || '', loading: false } : w
       );
@@ -896,17 +840,6 @@
     await openSourceWindow(ref.file, ref.title || getShortName(ref.file));
   }
 
-  async function openSelectedSourceWindow() {
-    if (!selectedNode?.file) return;
-    await openSourceWindow(selectedNode.file, getShortName(selectedNode.id));
-  }
-
-  function handleEditorTokenClick(token) {
-    const ref = findReferenceByToken(token);
-    if (!ref) return;
-    openSourceWindowForReference(ref);
-  }
-
   function closeSourceWindow(windowId) {
     sourceWindows = sourceWindows.filter((w) => w.id !== windowId);
   }
@@ -921,6 +854,57 @@
     sourceWindows = sourceWindows.map((w) =>
       w.id === windowId ? { ...w, width: detail.width, height: detail.height } : w
     );
+  }
+
+  function focusSourceWindow(windowId) {
+    const existing = sourceWindows.find((w) => w.id === windowId);
+    if (!existing) return;
+    sourceWindows = [
+      ...sourceWindows.filter((w) => w.id !== windowId),
+      existing,
+    ];
+  }
+
+  function tileFloatingWindows() {
+    const total = nodeWindows.length + sourceWindows.length;
+    if (total === 0 || width <= 0 || height <= 0) return;
+
+    const margin = 16;
+    const gap = 10;
+    const timelineReserve = 120;
+    const usableWidth = Math.max(220, width - margin * 2);
+    const usableHeight = Math.max(220, height - margin * 2 - timelineReserve);
+    const cols = Math.max(1, Math.ceil(Math.sqrt(total)));
+    const rows = Math.max(1, Math.ceil(total / cols));
+    const cellWidth = Math.max(260, Math.floor((usableWidth - gap * (cols - 1)) / cols));
+    const cellHeight = Math.max(220, Math.floor((usableHeight - gap * (rows - 1)) / rows));
+
+    let cursor = 0;
+    nodeWindows = nodeWindows.map((w) => {
+      const col = cursor % cols;
+      const row = Math.floor(cursor / cols);
+      cursor += 1;
+      return {
+        ...w,
+        x: margin + col * (cellWidth + gap),
+        y: margin + row * (cellHeight + gap),
+        width: cellWidth,
+        height: cellHeight,
+      };
+    });
+
+    sourceWindows = sourceWindows.map((w) => {
+      const col = cursor % cols;
+      const row = Math.floor(cursor / cols);
+      cursor += 1;
+      return {
+        ...w,
+        x: margin + col * (cellWidth + gap),
+        y: margin + row * (cellHeight + gap),
+        width: cellWidth,
+        height: cellHeight,
+      };
+    });
   }
 
 
@@ -1142,18 +1126,11 @@
       const cc = clusterCenters[key];
       const cf = clusterForces[key];
       const invMass = 1 / (node.mass || 1);
-      const heatInfo = node.file ? heatIndex.get(node.file) : null;
-      const oldness = heatInfo ? heatInfo.oldness : 0.85;
 
       node.vx -= (node.x - cc.x) * clusterGravity * invMass;
       node.vy -= (node.y - cc.y) * clusterGravity * invMass;
 
-      // Sedimentation: older files settle lower inside each cluster.
-      const sedimentDepth = 95;
-      const sedimentPull = 0.0024;
-      const targetY = cc.y + oldness * sedimentDepth;
-      node.vy -= (node.y - targetY) * sedimentPull * invMass;
-      node.vy += 0.0013 * oldness;
+      // Keep clusters vertically neutral; no artificial downward drift.
 
       node.vx += cf.x * invMass;
       node.vy += cf.y * invMass;
@@ -1358,9 +1335,18 @@
     }
 
     const hoveredId = hoveredNode ? hoveredNode.id : null;
-    const selectedId = selectedNode ? selectedNode.id : null;
-    const highlightId = hoveredId || selectedId;
-    const connectedIds = highlightId ? getConnectedNodeIds(highlightId) : new Set();
+    const selectedIds = selectedNodeIds;
+    const focusContext = hoveredId ? new Set([hoveredId]) : selectedIds;
+    const hasFocusContext = focusContext.size > 0;
+    const connectedIds = new Set();
+    if (hoveredId) {
+      for (const id of getConnectedNodeIds(hoveredId)) connectedIds.add(id);
+    } else {
+      for (const id of selectedIds) {
+        connectedIds.add(id);
+        for (const neighborId of getConnectedNodeIds(id)) connectedIds.add(neighborId);
+      }
+    }
     const pulseSeconds = performance.now() * 0.001;
     const heatRuntime = buildHeatRuntimeIndex(Date.now());
 
@@ -1382,16 +1368,13 @@
         Math.max(s.y, t.y) < 0 || Math.min(s.y, t.y) > height
       ) continue;
 
-      let edgeHighlighted = false;
-      if (highlightId) {
-        edgeHighlighted = edge.source === highlightId || edge.target === highlightId;
-      }
+      const edgeHighlighted = focusContext.has(edge.source) || focusContext.has(edge.target);
 
       ctx.beginPath();
       ctx.moveTo(s.x, s.y);
       ctx.lineTo(t.x, t.y);
 
-      if (highlightId && !edgeHighlighted) {
+      if (hasFocusContext && !edgeHighlighted) {
         ctx.strokeStyle = 'rgba(80, 80, 80, 0.15)';
         ctx.lineWidth = 1;
       } else {
@@ -1414,9 +1397,9 @@
       const x0 = screen.x - w / 2;
       const y0 = screen.y - h / 2;
 
-      const isHighlighted = node.id === highlightId;
+      const isHighlighted = focusContext.has(node.id);
       const isConnected = connectedIds.has(node.id);
-      const isDimmed = highlightId && !isHighlighted && !isConnected;
+      const isDimmed = hasFocusContext && !isHighlighted && !isConnected;
 
       const cs = node.change_status;
       const isNeighbor = cs === 'neighbor';
@@ -1555,6 +1538,12 @@
       return;
     }
 
+    if (event.key.toLowerCase() === 't') {
+      event.preventDefault();
+      tileFloatingWindows();
+      return;
+    }
+
     if (event.key === '=' || event.key === '+' || event.key === 'NumpadAdd') {
       event.preventDefault();
       zoomAtCenter(1.14);
@@ -1626,11 +1615,10 @@
 
       draggedNode.pinned = false;
       if (moved < 5) {
-        if (!selectedNode || draggedNode.id !== selectedNode.id) {
-          showSignatures = false;
-          diffExpanded = false;
+        focusNode(draggedNode);
+        if (event.detail >= 2 && draggedNode.file) {
+          openSourceWindow(draggedNode.file, getShortName(draggedNode.id));
         }
-        selectedNode = draggedNode;
       }
       draggedNode = null;
       return;
@@ -1640,13 +1628,7 @@
       const dy = event.clientY - dragStart.y;
       const moved = Math.sqrt(dx * dx + dy * dy);
       if (moved < 5) {
-        selectedNode = null;
-        showSignatures = false;
-        fileDiff = null;
-        diffFile = null;
-        diffLoading = false;
-        diffExpanded = false;
-        sidePanelOpen = false;
+        activeNodeId = null;
       }
     }
     dragging = false;
@@ -1663,40 +1645,19 @@
   }
 
   $effect(() => {
-    if (selectedNode && selectedNode.file) {
-      if (viewMode === 'diff' && !fileDiff) {
-        diffLoading = true;
-        diffFile = selectedNode.file;
-        getFileDiff(selectedNode.file).then(diff => {
-          if (selectedNode && diffFile === selectedNode.file) {
-            fileDiff = diff;
-            diffLoading = false;
-          }
-        });
-      } else if (viewMode === 'source' && !fileSource) {
-        sourceLoading = true;
-        diffFile = selectedNode.file;
-        getFileSource(selectedNode.file).then(source => {
-          if (selectedNode && diffFile === selectedNode.file) {
-            fileSource = source;
-            sourceLoading = false;
-          }
-        });
-      }
-    } else {
-      fileDiff = null;
-      fileSource = null;
-      diffFile = null;
-      diffLoading = false;
-      sourceLoading = false;
+    const nodeIdSet = new Set(simNodes.map((node) => node.id));
+    const filteredSelected = new Set([...selectedNodeIds].filter((id) => nodeIdSet.has(id)));
+    if (!areSetsEqual(filteredSelected, selectedNodeIds)) {
+      selectedNodeIds = filteredSelected;
     }
-  });
 
-  // Reset when selectedNode changes
-  $effect(() => {
-    if (selectedNode) {
-      fileDiff = null;
-      fileSource = null;
+    const filteredWindows = nodeWindows.filter((w) => nodeIdSet.has(w.nodeId));
+    if (filteredWindows.length !== nodeWindows.length) {
+      nodeWindows = filteredWindows;
+    }
+
+    if (activeNodeId && !nodeIdSet.has(activeNodeId)) {
+      activeNodeId = filteredWindows.length > 0 ? filteredWindows[filteredWindows.length - 1].nodeId : null;
     }
   });
 
@@ -1722,11 +1683,11 @@
     const _h = height;
     const _cam = camera;
     const _hov = hoveredNode;
-    const _sel = selectedNode;
+    const _sel = selectedNodeIds;
+    const _active = activeNodeId;
     const _anim = animating;
     const _drag = draggedNode;
-    const _diff = fileDiff;
-    const _sigs = showSignatures;
+    const _windows = nodeWindows;
     const _heat = heatmapData;
 
     if (!canvas || _w === 0 || _h === 0) return;
@@ -1779,9 +1740,27 @@
   ></canvas>
 
   <div class="eyeloss-nav-panel" class:eyeloss-nav-panel--collapsed={panelCollapsed}>
-    <button class="eyeloss-nav-panel__toggle" type="button" onclick={() => panelCollapsed = !panelCollapsed}>
-      {panelCollapsed ? '>' : '<'} Nodes ({simNodes.length})
-    </button>
+    <div style="display: flex;">
+      <button
+        class="eyeloss-nav-panel__toggle"
+        type="button"
+        onclick={() => panelCollapsed = !panelCollapsed}
+        style="flex: 1;"
+      >
+        {panelCollapsed ? '>' : '<'} Nodes ({simNodes.length})
+      </button>
+      {#if !panelCollapsed}
+        <button
+          class="eyeloss-nav-panel__toggle"
+          type="button"
+          onclick={tileFloatingWindows}
+          title="Tile floating windows (Cmd/Ctrl+T)"
+          style="border-left: 1px solid var(--bg-300); width: 74px; text-align: center;"
+        >
+          Tile
+        </button>
+      {/if}
+    </div>
     {#if !panelCollapsed}
       <div class="eyeloss-nav-panel__search">
         <input
@@ -1797,9 +1776,10 @@
           <li>
             <button
               class="eyeloss-nav-panel__item"
-              class:eyeloss-nav-panel__item--active={(selectedNode && selectedNode.id === node.id) || highlightedSearchIndex === i}
+              class:eyeloss-nav-panel__item--active={selectedNodeIds.has(node.id) || highlightedSearchIndex === i}
               type="button"
               onclick={() => { focusNode(node); highlightedSearchIndex = i; }}
+              ondblclick={() => openSourceWindow(node.file, getShortName(node.id))}
             >
               <span class="eyeloss-nav-panel__dot" data-ns={getNamespace(node.id)}></span>
               <span class="eyeloss-nav-panel__name">{getShortName(node.id)}</span>
@@ -1873,141 +1853,34 @@
     </div>
   {/if}
 
-  {#if selectedNode}
-    <Window
-      title={getShortName(selectedNode.id)}
-      width={Math.min(900, width * 0.8)}
-      height={Math.min(800, height * 0.9)}
-      x={Math.max(16, width - Math.min(900, width * 0.8) - 16)}
-      y={16}
-      containerWidth={width}
-      containerHeight={height}
-      onclose={() => { selectedNode = null; diffExpanded = false; }}
-    >
-      <div class="eyeloss-node-details__body eyeloss-node-details__body--window" onwheel={(e) => e.stopPropagation()}>
-        <div class="eyeloss-node-details__meta" style="margin-bottom: 8px; font-size: 11px; display: flex; justify-content: space-between; align-items: center;">
-          <span>{selectedNode.file || 'unknown'}  |  {selectedNode.line_count || '--'} lines</span>
-          <div class="tabs" style="display: flex; gap: 4px;">
-            <button class="btn {viewMode === 'diff' ? 'btn-primary' : ''}" style="font-size: 0.6rem; padding: 2px 6px;" onclick={() => viewMode = 'diff'}>Diff</button>
-            <button class="btn {viewMode === 'source' ? 'btn-primary' : ''}" style="font-size: 0.6rem; padding: 2px 6px;" onclick={() => viewMode = 'source'}>Source</button>
-            <button
-              class="btn btn-ghost"
-              style="font-size: 0.6rem; padding: 2px 6px;"
-              onclick={openSelectedSourceWindow}
-              title="Open this file in a floating source window"
-            >
-              Open Window
-            </button>
-          </div>
-        </div>
-        
-        {#if selectedNode.functions && selectedNode.functions.length > 0}
-          <button
-            class="eyeloss-node-details__section-title eyeloss-node-details__section-title--toggle"
-            type="button"
-            onclick={(e) => { e.stopPropagation(); showSignatures = !showSignatures; }}
-            style="background: rgba(255,255,255,0.05);"
-          >
-            <span>{showSignatures ? 'v' : '>'} Signatures ({selectedNode.functions.length})</span>
-          </button>
-          {#if showSignatures}
-            <ul class="eyeloss-node-details__sigs" style="padding: 8px;">
-              {#each selectedNode.functions as fn}
-                <li class="eyeloss-node-details__sig">
-                  <span class="eyeloss-node-details__sig-type">{fn.kind}</span>
-                  <span class="eyeloss-node-details__sig-name">{fn.name}/{fn.arity}</span>
-                </li>
-              {/each}
-            </ul>
-          {/if}
-        {/if}
-
-        {#if viewMode === 'diff'}
-          {#if diffLoading}
-            <div class="eyeloss-node-details__meta" style="margin-top: 16px;">Loading diff...</div>
-          {:else if fileDiff}
-            <div class="eyeloss-node-details__section-title" style="margin-top: 16px; padding-bottom: 4px; border-bottom: 1px solid rgba(255,255,255,0.1);">
-              <span>Diff Changes</span>
-            </div>
-            
-            <div class="eyeloss-split-diff" style:filter={`brightness(${1 + getNodeHeat(selectedNode.file) * 0.5})`}>
-              {#each diffChunks as chunk, i}
-                <div class="diff-chunk-wrapper">
-                  <button 
-                    class="diff-chunk-header" 
-                    type="button" 
-                    onclick={() => toggleChunk(i)}
-                  >
-                    <span class="diff-chunk-icon">{expandedChunks.has(i) ? 'v' : '>'}</span>
-                    <span class="diff-chunk-context">{chunk.context}</span>
-                  </button>
-                  
-                  {#if expandedChunks.has(i)}
-                    <div class="diff-chunk-content">
-                      <div class="split-diff-half">
-                        {#each chunk.lines as line}
-                          <div class="split-diff-line {line.left ? 'type-' + line.left.type : 'type-empty'}">
-                            <span class="split-diff-num">{line.left ? line.left.leftNum : ''}</span>
-                            <span class="split-diff-text">{line.left ? line.left.text : ' '}</span>
-                          </div>
-                        {/each}
-                      </div>
-                      <div class="split-diff-half">
-                        {#each chunk.lines as line}
-                          <div class="split-diff-line {line.right ? 'type-' + line.right.type : 'type-empty'}">
-                            <span class="split-diff-num">{line.right ? line.right.rightNum : ''}</span>
-                            <span class="split-diff-text">{line.right ? line.right.text : ' '}</span>
-                          </div>
-                        {/each}
-                      </div>
-                    </div>
-                  {/if}
-                </div>
-              {/each}
-            </div>
-          {/if}
-        {:else}
-          {#if sourceLoading}
-            <div class="eyeloss-node-details__meta" style="margin-top: 16px;">Loading source...</div>
-          {:else if fileSource !== null}
-            <div class="eyeloss-node-details__section-title" style="margin-top: 16px; padding-bottom: 4px; display: flex; justify-content: space-between; align-items: center;">
-              <span>Full Source Code</span>
-              <button 
-                class="btn {isSaving ? 'btn-ghost' : 'btn-primary'}" 
-                style="font-size: 0.6rem; padding: 2px 8px;"
-                onclick={handleSave}
-                disabled={isSaving}
-              >
-                {isSaving ? 'Saving...' : 'Save Changes'}
-              </button>
-            </div>
-            {#if sourceReferenceLinks.length > 0}
-              <div class="eyeloss-source-links">
-                <span class="eyeloss-source-links__label">References</span>
-                {#each sourceReferenceLinks as ref}
-                  <button
-                    type="button"
-                    class="eyeloss-source-links__item"
-                    title={`Open source: ${ref.file}`}
-                    onclick={() => openSourceWindowForReference(ref)}
-                  >
-                    {ref.token}
-                  </button>
-                {/each}
-              </div>
-            {/if}
-            <Editor
-              bind:value={fileSource}
-              file={selectedNode.file}
-              {theme}
-              clickableTokens={sourceReferenceLinks.map((ref) => ref.token)}
-              onTokenClick={handleEditorTokenClick}
-            />
-          {/if}
-        {/if}
-      </div>
-    </Window>
-  {/if}
+  {#each nodeWindows as nodeWindow (nodeWindow.id)}
+    {@const nodeData = findNodeById(nodeWindow.nodeId)}
+    {#if nodeData}
+      <NodeDetailsWindow
+        node={nodeData}
+        {width}
+        {height}
+        x={nodeWindow.x}
+        y={nodeWindow.y}
+        windowWidth={nodeWindow.width}
+        windowHeight={nodeWindow.height}
+        active={activeNodeId === nodeWindow.nodeId}
+        {theme}
+        {getNodeHeat}
+        {getFileDiff}
+        {getFileSource}
+        {saveFile}
+        {diffCache}
+        {sourceCache}
+        sourceReferences={getSourceReferenceLinksForNode(nodeWindow.nodeId)}
+        onOpenReference={openSourceWindowForReference}
+        onclose={() => closeNodeWindow(nodeWindow.nodeId)}
+        onfocus={() => focusNodeWindow(nodeWindow.nodeId)}
+        ondragEnd={(e) => moveNodeWindow(nodeWindow.nodeId, e.detail)}
+        onresizeEnd={(e) => resizeNodeWindow(nodeWindow.nodeId, e.detail)}
+      />
+    {/if}
+  {/each}
 
   {#each sourceWindows as sourceWindow (sourceWindow.id)}
     <Window
@@ -2019,6 +1892,7 @@
       containerWidth={width}
       containerHeight={height}
       onclose={() => closeSourceWindow(sourceWindow.id)}
+      onfocus={() => focusSourceWindow(sourceWindow.id)}
       ondragEnd={(e) => moveSourceWindow(sourceWindow.id, e.detail)}
       onresizeEnd={(e) => resizeSourceWindow(sourceWindow.id, e.detail)}
     >
@@ -2040,7 +1914,7 @@
     </Window>
   {/each}
 
-  <svg style="position: absolute; top: 0; left: 0; width: 100%; height: 100%; pointer-events: none; z-index: 25000;">
+  <svg style="position: absolute; top: 0; left: 0; width: 100%; height: 100%; pointer-events: none; z-index: 95;">
     <Robot
       targetX={robotTarget.x}
       targetY={robotTarget.y}

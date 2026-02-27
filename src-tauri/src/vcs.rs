@@ -88,9 +88,6 @@ pub fn get_current_branch(repo: &Path) -> String {
     let engine = detect_engine(repo);
     let branch = match engine {
         VCSEngine::JJ => {
-            if crate::debug_enabled() {
-                println!("[BACKEND][vcs] running jj current-branch command");
-            }
             let output = std::process::Command::new("jj")
                 .args([
                     "--no-pager",
@@ -115,9 +112,6 @@ pub fn get_current_branch(repo: &Path) -> String {
             }
         }
         VCSEngine::Git => {
-            if crate::debug_enabled() {
-                println!("[BACKEND][vcs] running git current-branch command");
-            }
             let output = std::process::Command::new("git")
                 .args(["--no-pager", "rev-parse", "--abbrev-ref", "HEAD"])
                 .current_dir(repo)
@@ -130,7 +124,8 @@ pub fn get_current_branch(repo: &Path) -> String {
         }
         VCSEngine::None => "".into(),
     };
-    if crate::debug_enabled() {
+    let took_ms = started.elapsed().as_millis();
+    if crate::debug_enabled() && took_ms >= 20 {
         let engine_label = match engine {
             VCSEngine::JJ => "jj",
             VCSEngine::Git => "git",
@@ -140,7 +135,7 @@ pub fn get_current_branch(repo: &Path) -> String {
             "[BACKEND][vcs] get_current_branch engine={} value='{}' took={}ms",
             engine_label,
             branch,
-            started.elapsed().as_millis()
+            took_ms
         );
     }
     branch
@@ -151,9 +146,6 @@ pub fn get_current_revision(repo: &Path) -> String {
     let engine = detect_engine(repo);
     let revision = match engine {
         VCSEngine::JJ => {
-            if crate::debug_enabled() {
-                println!("[BACKEND][vcs] running jj current-revision command");
-            }
             let output = std::process::Command::new("jj")
                 .args([
                     "--no-pager",
@@ -173,9 +165,6 @@ pub fn get_current_revision(repo: &Path) -> String {
             }
         }
         VCSEngine::Git => {
-            if crate::debug_enabled() {
-                println!("[BACKEND][vcs] running git current-revision command");
-            }
             let output = std::process::Command::new("git")
                 .args(["--no-pager", "rev-parse", "--verify", "HEAD"])
                 .current_dir(repo)
@@ -188,7 +177,8 @@ pub fn get_current_revision(repo: &Path) -> String {
         }
         VCSEngine::None => String::new(),
     };
-    if crate::debug_enabled() {
+    let took_ms = started.elapsed().as_millis();
+    if crate::debug_enabled() && took_ms >= 20 {
         let engine_label = match engine {
             VCSEngine::JJ => "jj",
             VCSEngine::Git => "git",
@@ -202,7 +192,7 @@ pub fn get_current_revision(repo: &Path) -> String {
             } else {
                 &revision
             },
-            started.elapsed().as_millis()
+            took_ms
         );
     }
     revision

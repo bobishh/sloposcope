@@ -159,6 +159,7 @@
   let hasMoreChanges = $state(true);
   let bookmarks = $state([]);
   let currentBranch = $state('');
+  let currentRevision = $state('');
   let since = $state('@'); 
   let loading = $state(true); // Initial load
   let refreshing = $state(false); // Update state
@@ -166,6 +167,8 @@
   let repoPath = $state('');
   let showDropdown = $state(false);
   let highlightedIndex = $state(-1);
+  let loadGraphRequestSeq = 0;
+  let inFlightLoadGraph = 0;
 
   // Heatmap state
   let heatmapData = $state(new Map());
@@ -234,6 +237,14 @@
   }
 
   async function loadGraph(isInitial = false) {
+    const requestId = ++loadGraphRequestSeq;
+    const requestStartedAt = performance.now();
+    const previousBranch = currentBranch;
+    const sinceArg = since && since !== '' ? since : null;
+    inFlightLoadGraph += 1;
+    debugLog(
+      `[FRONTEND][BRANCH][req:${requestId}] loadGraph start initial=${isInitial} since=${sinceArg} branch='${previousBranch}' inFlight=${inFlightLoadGraph}`
+    );
     refreshFortune();
 
     if (isInitial) loading = true;
@@ -245,26 +256,29 @@
       refreshing = false;
     }, 10000);
 
-    const sinceArg = since && since !== '' ? since : null;
     try {
-      debugLog(`[FRONTEND] Starting loadGraph (initial: ${isInitial}) since: ${sinceArg}`);
       const [g, b, curr] = await Promise.all([
         invokeTraced('get_graph', { since: sinceArg }, { warnAfterMs: 8000 }),
         invokeTraced('get_bookmarks', {}, { warnAfterMs: 8000 }),
         invokeTraced('get_current_branch', {}, { warnAfterMs: 8000 }),
       ]);
 
-      debugLog(`[FRONTEND] Received data. Nodes: ${g.nodes.length}`);
+      const elapsedMs = Math.round(performance.now() - requestStartedAt);
+      debugLog(
+        `[FRONTEND][BRANCH][req:${requestId}] loadGraph done in ${elapsedMs}ms nodes=${g.nodes.length} edges=${g.edges.length} bookmarks=${b.length} branch='${previousBranch}'->'${curr}'`
+      );
       graph = g;
       seedHeatmapFromGraph(g);
       bookmarks = b;
       currentBranch = curr;
     } catch (e) {
-      console.error('[FRONTEND] Error loading graph:', e);
+      console.error(`[FRONTEND][BRANCH][req:${requestId}] loadGraph failed`, e);
     } finally {
       clearTimeout(safetyTimeout);
       loading = false;
       refreshing = false;
+      inFlightLoadGraph = Math.max(0, inFlightLoadGraph - 1);
+      debugLog(`[FRONTEND][BRANCH][req:${requestId}] loadGraph finish inFlight=${inFlightLoadGraph}`);
     }
   }
 
@@ -299,6 +313,13 @@
   }
 
   function setSince(revset, event) {
+    const previousSince = since;
+    const previousBranch = currentBranch;
+    const isMultiToggle = Boolean(event && (event.shiftKey || event.metaKey || event.ctrlKey));
+    const isBookmark = bookmarks.some((b) => b.name === revset || b.id === revset);
+    debugLog(
+      `[FRONTEND][BRANCH] setSince input='${revset}' prev='${previousSince}' branch='${previousBranch}' multi=${isMultiToggle} bookmarkMatch=${isBookmark}`
+    );
     if (event && (event.shiftKey || event.metaKey || event.ctrlKey)) {
       // Toggle logic for multi-select
       const current = (since || '').split(' | ').filter(s => s && s !== '');
@@ -312,7 +333,7 @@
     }
     
     if (!since || since === '') since = '@';
-    debugLog(`[FRONTEND] Setting since to: ${since}`);
+    debugLog(`[FRONTEND][BRANCH] setSince resolved='${since}' (from '${previousSince}') -> triggering loadGraph`);
     loadGraph(false);
   }
 
@@ -365,16 +386,47 @@
     debugLog(`[FRONTEND][TRACE] ${traceNow()} initial data loaded in ${Math.round(performance.now() - mountStart)}ms`);
 
     listen('graph-updated', (event) => {
-      debugLog('[FRONTEND] Graph updated event received');
+      const startedAt = performance.now();
+      const previousBranch = currentBranch;
+      const previousRevision = currentRevision;
+      const payload = event?.payload || {};
+      const payloadBranch = payload.current_branch || '';
+      const payloadRevision = payload.current_revision || '';
+      const payloadSince = typeof payload.since === 'string' ? payload.since : '';
+      const payloadSinceReset = Boolean(payload.since_reset);
+      const payloadNodes = payload.graph?.nodes?.length || 0;
+      const payloadEdges = payload.graph?.edges?.length || 0;
+      const payloadBookmarks = Array.isArray(payload.bookmarks) ? payload.bookmarks.length : 0;
+      debugLog(
+        `[FRONTEND][BRANCH][event] graph-updated recv branch='${previousBranch}'->'${payloadBranch || previousBranch}' rev='${previousRevision || '-'}'->'${payloadRevision || previousRevision || '-'}' since='${since}'->'${payloadSince || since}' reset=${payloadSinceReset} nodes=${payloadNodes} edges=${payloadEdges} bookmarks=${payloadBookmarks}`
+      );
       graph = event.payload.graph;
       seedHeatmapFromGraph(event.payload.graph);
       if (event.payload.current_branch) {
         currentBranch = event.payload.current_branch;
       }
+      if (event.payload.current_revision) {
+        currentRevision = event.payload.current_revision;
+      }
       if (Array.isArray(event.payload.bookmarks)) {
         bookmarks = event.payload.bookmarks;
       }
-      loadTimelineChanges().catch((e) => console.error('[FRONTEND] Failed to refresh timeline changes:', e));
+      const branchChanged = Boolean(payloadBranch) && payloadBranch !== previousBranch;
+      const revisionChanged = Boolean(payloadRevision) && payloadRevision !== previousRevision;
+      if ((payloadSinceReset || branchChanged) && payloadSince && since !== payloadSince) {
+        since = payloadSince;
+      }
+      if (branchChanged || revisionChanged) {
+        loadTimelineChanges()
+          .then(() => {
+            debugLog(
+              `[FRONTEND][BRANCH][event] timeline refreshed in ${Math.round(performance.now() - startedAt)}ms (branchChanged=${branchChanged} revisionChanged=${revisionChanged})`
+            );
+          })
+          .catch((e) => console.error('[FRONTEND] Failed to refresh timeline changes:', e));
+      } else {
+        debugLog('[FRONTEND][BRANCH][event] timeline refresh skipped (no branch/revision change)');
+      }
     }).catch((e) => {
       console.error('[FRONTEND] Failed to register graph-updated listener:', e);
     });
