@@ -25,6 +25,7 @@ struct AppState {
     last_revision: Mutex<String>,
     watcher_flush_scheduled: Mutex<bool>,
     watcher_pending_vcs_meta: Mutex<bool>,
+    watcher_last_vcs_meta_at: Mutex<Option<Instant>>,
     watcher_pending_paths: Mutex<Vec<PathBuf>>,
 }
 
@@ -71,6 +72,34 @@ fn watcher_debounce_interval() -> Duration {
     })
 }
 
+fn watcher_vcs_quiet_period() -> Duration {
+    static WATCH_VCS_QUIET: OnceLock<Duration> = OnceLock::new();
+    *WATCH_VCS_QUIET.get_or_init(|| {
+        let raw = std::env::var("SLOPOSCOPE_WATCH_VCS_QUIET_MS")
+            .or_else(|_| std::env::var("EYELOSS_WATCH_VCS_QUIET_MS"))
+            .ok();
+        let parsed = raw
+            .as_deref()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(1200);
+        Duration::from_millis(parsed.clamp(200, 10_000))
+    })
+}
+
+fn should_defer_vcs_refresh(
+    pending_vcs_meta: bool,
+    last_vcs_meta_at: Option<Instant>,
+    quiet_period: Duration,
+) -> bool {
+    if pending_vcs_meta {
+        return true;
+    }
+    match last_vcs_meta_at {
+        Some(last) => last.elapsed() < quiet_period,
+        None => false,
+    }
+}
+
 fn short_rev_label(rev: &str) -> String {
     if rev.len() > 12 {
         rev[..12].to_string()
@@ -79,36 +108,51 @@ fn short_rev_label(rev: &str) -> String {
     }
 }
 
-fn resolve_graph_edges(g: &mut Graph) {
+fn resolve_single_edge_target(target: &str, all_node_ids: &[String]) -> Option<String> {
+    if all_node_ids.iter().any(|id| id == target) {
+        return Some(target.to_string());
+    }
+
+    let normalized = target
+        .replace("::", "/")
+        .replace("crate/", "")
+        .trim_start_matches("./")
+        .to_string();
+    if let Some(found) = all_node_ids.iter().find(|id| {
+        id.as_str() == normalized.as_str()
+            || id.ends_with(&normalized)
+            || id.replace("/", ".").contains(target)
+    }) {
+        return Some(found.clone());
+    }
+
+    if let Some(found) = all_node_ids.iter().find(|id| {
+        let id_no_ext = id.split('.').next().unwrap_or(id);
+        id_no_ext.contains(target) || target.contains(id_no_ext)
+    }) {
+        return Some(found.clone());
+    }
+
+    None
+}
+
+fn resolve_graph_edges_for_sources(g: &mut Graph, sources: &HashSet<String>) {
     let all_node_ids: Vec<String> = g.nodes.iter().map(|n| n.id.clone()).collect();
 
     for edge in &mut g.edges {
-        let target = &edge.target;
-        if all_node_ids.contains(target) {
+        if !sources.is_empty() && !sources.contains(&edge.source) {
             continue;
         }
 
-        let normalized = target
-            .replace("::", "/")
-            .replace("crate/", "")
-            .trim_start_matches("./")
-            .to_string();
-        if let Some(found) = all_node_ids.iter().find(|id| {
-            id.as_str() == normalized.as_str()
-                || id.ends_with(&normalized)
-                || id.replace("/", ".").contains(target)
-        }) {
-            edge.target = found.clone();
-            continue;
-        }
-
-        if let Some(found) = all_node_ids.iter().find(|id| {
-            let id_no_ext = id.split('.').next().unwrap_or(id);
-            id_no_ext.contains(target) || target.contains(id_no_ext)
-        }) {
+        if let Some(found) = resolve_single_edge_target(&edge.target, &all_node_ids) {
             edge.target = found.clone();
         }
     }
+}
+
+fn resolve_graph_edges(g: &mut Graph) {
+    let empty = HashSet::new();
+    resolve_graph_edges_for_sources(g, &empty);
 }
 
 fn perform_graph_build(
@@ -506,6 +550,24 @@ fn get_repo_path(state: tauri::State<AppState>) -> String {
 fn refresh_vcs_state(handle: &AppHandle) {
     if let Some(state) = handle.try_state::<AppState>() {
         let started = Instant::now();
+        let quiet_period = watcher_vcs_quiet_period();
+        let pending_vcs_meta = *state.watcher_pending_vcs_meta.lock();
+        let last_vcs_meta_at = *state.watcher_last_vcs_meta_at.lock();
+        if should_defer_vcs_refresh(pending_vcs_meta, last_vcs_meta_at, quiet_period) {
+            if debug_enabled() {
+                let elapsed = last_vcs_meta_at
+                    .map(|t| t.elapsed().as_millis().to_string())
+                    .unwrap_or_else(|| "-".to_string());
+                println!(
+                    "[BACKEND][watcher] refresh_vcs_state deferred pending_meta={} last_meta_event_age_ms={} quiet_ms={}",
+                    pending_vcs_meta,
+                    elapsed,
+                    quiet_period.as_millis()
+                );
+            }
+            return;
+        }
+
         let repo = state.repo.lock().clone();
         let vcs_probe_started = Instant::now();
         let current_branch = vcs::get_current_branch(&repo);
@@ -604,28 +666,33 @@ fn queue_watcher_batch(handle: &AppHandle, vcs_meta_changed: bool, interesting_p
         return;
     }
 
-    let should_schedule = if let Some(state) = handle.try_state::<AppState>() {
+    if let Some(state) = handle.try_state::<AppState>() {
         if vcs_meta_changed {
             *state.watcher_pending_vcs_meta.lock() = true;
+            *state.watcher_last_vcs_meta_at.lock() = Some(Instant::now());
         }
         if !interesting_paths.is_empty() {
             state.watcher_pending_paths.lock().extend(interesting_paths);
         }
+    }
 
+    schedule_watcher_flush(handle, watcher_debounce_interval());
+}
+
+fn schedule_watcher_flush(handle: &AppHandle, wait: Duration) {
+    let should_schedule = if let Some(state) = handle.try_state::<AppState>() {
         let mut scheduled = state.watcher_flush_scheduled.lock();
         if *scheduled {
-            false
-        } else {
-            *scheduled = true;
-            true
+            return;
         }
+        *scheduled = true;
+        true
     } else {
         false
     };
 
     if should_schedule {
         let handle_clone = handle.clone();
-        let wait = watcher_debounce_interval();
         std::thread::spawn(move || {
             std::thread::sleep(wait);
             flush_watcher_batch(&handle_clone);
@@ -655,6 +722,33 @@ fn flush_watcher_batch(handle: &AppHandle) {
 
     // During branch/checkout operations, prioritize single state refresh over noisy incremental events.
     if pending_vcs_meta {
+        let quiet_period = watcher_vcs_quiet_period();
+        let last_vcs_meta_at = if let Some(state) = handle.try_state::<AppState>() {
+            *state.watcher_last_vcs_meta_at.lock()
+        } else {
+            None
+        };
+
+        if should_defer_vcs_refresh(false, last_vcs_meta_at, quiet_period) {
+            let remaining = last_vcs_meta_at
+                .map(|last| quiet_period.saturating_sub(last.elapsed()))
+                .unwrap_or(quiet_period);
+            if let Some(state) = handle.try_state::<AppState>() {
+                *state.watcher_pending_vcs_meta.lock() = true;
+            }
+            if debug_enabled() {
+                println!(
+                    "[BACKEND][watcher] checkout still noisy; deferring VCS refresh by {}ms",
+                    remaining.as_millis()
+                );
+            }
+            schedule_watcher_flush(handle, remaining.max(Duration::from_millis(60)));
+            return;
+        }
+
+        if let Some(state) = handle.try_state::<AppState>() {
+            *state.watcher_last_vcs_meta_at.lock() = None;
+        }
         refresh_vcs_state(handle);
         return;
     }
@@ -685,23 +779,33 @@ fn flush_watcher_batch(handle: &AppHandle) {
         let mut changed = false;
         let mut touched_count = 0usize;
 
+        let mut actionable = Vec::new();
+        let mut touched_source_ids = HashSet::new();
+        let mut purge_paths = HashSet::new();
+
         for path in &pending_paths {
             let Ok(rel_path_buf) = path.strip_prefix(&repo) else {
                 continue;
             };
             let rel_path = rel_path_buf.display().to_string().replace('\\', "/");
+            if let Some(change_status) = changed_statuses.get(&rel_path).cloned() {
+                actionable.push((path.clone(), rel_path.clone(), change_status));
+                purge_paths.insert(rel_path);
+            } else {
+                // File is no longer part of active changed set; drop stale node if present.
+                purge_paths.insert(rel_path);
+            }
+        }
 
-            // If file dropped from current changed set, remove stale node and ignore this event.
+        if !purge_paths.is_empty() {
             let before_nodes = graph.nodes.len();
-            graph.nodes.retain(|n| n.file != rel_path);
+            graph.nodes.retain(|n| !purge_paths.contains(&n.file));
             if graph.nodes.len() != before_nodes {
                 changed = true;
             }
+        }
 
-            let Some(change_status) = changed_statuses.get(&rel_path).cloned() else {
-                continue;
-            };
-
+        for (path, rel_path, change_status) in actionable {
             if change_status == "deleted" || !path.exists() || !path.is_file() {
                 continue;
             }
@@ -709,8 +813,11 @@ fn flush_watcher_batch(handle: &AppHandle) {
             let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
             let mut added_node = false;
             if let Some(parser) = state.parsers.iter().find(|p| p.extensions().contains(&ext)) {
-                if let Ok(source) = std::fs::read_to_string(path) {
+                if let Ok(source) = std::fs::read_to_string(&path) {
                     let (mut new_nodes, new_edges) = parser.parse_file(&repo, &rel_path, &source);
+                    for node in &new_nodes {
+                        touched_source_ids.insert(node.id.clone());
+                    }
                     for node in &mut new_nodes {
                         node.change_status = change_status.clone();
                     }
@@ -724,9 +831,10 @@ fn flush_watcher_batch(handle: &AppHandle) {
             }
 
             if !added_node {
-                let line_count = std::fs::read_to_string(path)
+                let line_count = std::fs::read_to_string(&path)
                     .map(|s| s.lines().count())
                     .unwrap_or(0);
+                touched_source_ids.insert(rel_path.clone());
                 graph.add_nodes(vec![Node {
                     id: rel_path.clone(),
                     label: rel_path.clone(),
@@ -744,7 +852,7 @@ fn flush_watcher_batch(handle: &AppHandle) {
         }
 
         if changed {
-            resolve_graph_edges(&mut graph);
+            resolve_graph_edges_for_sources(&mut graph, &touched_source_ids);
             graph.finalize();
             let graph_snapshot = graph.clone();
             drop(graph);
@@ -786,7 +894,6 @@ fn setup_watcher(app: &AppHandle) -> Option<RecommendedWatcher> {
     let mut watcher = match notify::recommended_watcher(move |res: Result<Event, _>| {
         if let Ok(event) = res {
             if let Some(state) = handle.try_state::<AppState>() {
-                let repo = state.repo.lock().clone();
                 let active_since = state
                     .last_since
                     .lock()
@@ -839,26 +946,8 @@ fn setup_watcher(app: &AppHandle) -> Option<RecommendedWatcher> {
                     return;
                 }
 
-                // Early filter: queue only files from current working-set changes.
-                let changed_statuses = vcs::get_changed_files(&repo, "@");
-                if changed_statuses.is_empty() {
-                    return;
-                }
-                let filtered_paths: Vec<PathBuf> = interesting_paths
-                    .into_iter()
-                    .filter(|p| {
-                        let Ok(rel_path_buf) = p.strip_prefix(&repo) else {
-                            return false;
-                        };
-                        let rel_path = rel_path_buf.display().to_string().replace('\\', "/");
-                        changed_statuses.contains_key(&rel_path)
-                    })
-                    .collect();
-                if filtered_paths.is_empty() {
-                    return;
-                }
-
-                queue_watcher_batch(&handle, false, filtered_paths);
+                // Defer changed-set filtering to flush (batched) to avoid expensive VCS calls per raw event.
+                queue_watcher_batch(&handle, false, interesting_paths);
             }
         }
     }) {
@@ -881,6 +970,86 @@ fn setup_watcher(app: &AppHandle) -> Option<RecommendedWatcher> {
         println!("[BACKEND][watcher] setup complete");
     }
     Some(watcher)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mk_node(id: &str, file: &str) -> Node {
+        Node {
+            id: id.to_string(),
+            label: id.to_string(),
+            kind: "file".to_string(),
+            file: file.to_string(),
+            line_count: 1,
+            change_status: "modified".to_string(),
+            functions: vec![],
+        }
+    }
+
+    #[test]
+    fn resolve_graph_edges_for_sources_only_updates_selected_sources() {
+        let mut g = Graph::new();
+        g.add_nodes(vec![
+            mk_node("src/a.rs", "src/a.rs"),
+            mk_node("src/b.rs", "src/b.rs"),
+            mk_node("src/c.rs", "src/c.rs"),
+        ]);
+        g.add_edges(vec![
+            graph::Edge {
+                source: "src/a.rs".into(),
+                target: "b".into(),
+                kind: "use".into(),
+            },
+            graph::Edge {
+                source: "src/c.rs".into(),
+                target: "b".into(),
+                kind: "use".into(),
+            },
+        ]);
+
+        let mut changed_sources = HashSet::new();
+        changed_sources.insert("src/a.rs".to_string());
+        resolve_graph_edges_for_sources(&mut g, &changed_sources);
+
+        assert_eq!(g.edges[0].target, "src/b.rs");
+        assert_eq!(g.edges[1].target, "b");
+    }
+
+    #[test]
+    fn resolve_graph_edges_empty_source_set_updates_all() {
+        let mut g = Graph::new();
+        g.add_nodes(vec![
+            mk_node("src/a.rs", "src/a.rs"),
+            mk_node("src/b.rs", "src/b.rs"),
+        ]);
+        g.add_edges(vec![graph::Edge {
+            source: "src/a.rs".into(),
+            target: "b".into(),
+            kind: "use".into(),
+        }]);
+
+        let all_sources = HashSet::new();
+        resolve_graph_edges_for_sources(&mut g, &all_sources);
+        assert_eq!(g.edges[0].target, "src/b.rs");
+    }
+
+    #[test]
+    fn vcs_refresh_deferred_when_meta_pending_or_recent() {
+        let quiet = Duration::from_millis(500);
+        assert!(should_defer_vcs_refresh(true, None, quiet));
+        assert!(should_defer_vcs_refresh(
+            false,
+            Some(Instant::now()),
+            quiet
+        ));
+
+        let stale = Instant::now()
+            .checked_sub(Duration::from_millis(700))
+            .expect("instant subtraction must succeed");
+        assert!(!should_defer_vcs_refresh(false, Some(stale), quiet));
+    }
 }
 
 // --- Entry point ---
@@ -1077,6 +1246,7 @@ pub fn run() {
             last_revision: Mutex::new(revision),
             watcher_flush_scheduled: Mutex::new(false),
             watcher_pending_vcs_meta: Mutex::new(false),
+            watcher_last_vcs_meta_at: Mutex::new(None),
             watcher_pending_paths: Mutex::new(Vec::new()),
         })
         .invoke_handler(tauri::generate_handler![

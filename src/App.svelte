@@ -126,7 +126,15 @@
       return tauriInvoke(cmd, args);
     }
     debugLog('[MOCK] invoke', cmd, args);
-    if (cmd === 'get_graph') return { nodes: [{ id: 'MockModule', type: 'module', file: 'mock.ex', line_count: 42, change_status: 'unchanged', functions: [] }], edges: [] };
+    if (cmd === 'get_graph') {
+      return {
+        nodes: [
+          { id: 'MockModule', type: 'module', file: 'mock.ex', line_count: 42, change_status: 'unchanged', functions: [] },
+          { id: 'MockHelper', type: 'module', file: 'mock_helper.ex', line_count: 12, change_status: 'modified', functions: [] },
+        ],
+        edges: [{ source: 'MockHelper', target: 'MockModule', type: 'call' }],
+      };
+    }
     if (cmd === 'get_changes') {
       const limit = Math.max(1, Number(args?.limit || 20));
       const beforeId = args?.before_id;

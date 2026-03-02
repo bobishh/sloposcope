@@ -520,7 +520,23 @@ fn get_git_file_diff(repo: &Path, file: &str, since: Option<&str>) -> String {
 mod tests {
     use super::*;
     use std::fs;
+    use std::path::Path;
+    use std::process::Command;
     use tempfile::tempdir;
+
+    fn run_git(repo: &Path, args: &[&str]) {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(repo)
+            .output()
+            .expect("failed to execute git");
+        assert!(
+            output.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 
     #[test]
     fn test_detect_jj() {
@@ -540,5 +556,37 @@ mod tests {
     fn test_detect_none() {
         let dir = tempdir().unwrap();
         assert!(matches!(detect_engine(dir.path()), VCSEngine::None));
+    }
+
+    #[test]
+    fn test_get_changed_files_git_working_tree_with_filtering() {
+        let dir = tempdir().unwrap();
+        let repo = dir.path();
+
+        run_git(repo, &["init"]);
+        run_git(repo, &["config", "user.email", "test@example.com"]);
+        run_git(repo, &["config", "user.name", "Test User"]);
+
+        fs::create_dir_all(repo.join("src")).unwrap();
+        fs::write(repo.join("src/existing.txt"), "one\n").unwrap();
+        fs::write(repo.join("src/deleted.txt"), "gone\n").unwrap();
+        run_git(repo, &["add", "."]);
+        run_git(repo, &["commit", "-m", "initial"]);
+
+        fs::write(repo.join("src/existing.txt"), "one\nchanged\n").unwrap();
+        fs::remove_file(repo.join("src/deleted.txt")).unwrap();
+        fs::write(repo.join("src/new.txt"), "new\n").unwrap();
+        fs::create_dir_all(repo.join("dist")).unwrap();
+        fs::write(repo.join("dist/bundle.js"), "ignored\n").unwrap();
+
+        let changed = get_changed_files(repo, "@");
+
+        assert_eq!(changed.get("src/existing.txt"), Some(&"modified".to_string()));
+        assert_eq!(changed.get("src/deleted.txt"), Some(&"deleted".to_string()));
+        assert_eq!(changed.get("src/new.txt"), Some(&"added".to_string()));
+        assert!(
+            !changed.contains_key("dist/bundle.js"),
+            "dist artifacts must be ignored by graph filter"
+        );
     }
 }

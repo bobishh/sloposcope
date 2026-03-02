@@ -35,7 +35,7 @@ test.describe('CodeGraph E2E', () => {
   test('should toggle the nav panel', async ({ page }) => {
     await page.goto('/');
     
-    const toggleBtn = page.locator('.eyeloss-nav-panel__toggle');
+    const toggleBtn = page.locator('.eyeloss-nav-panel__toggle').first();
     await expect(page.locator('.eyeloss-nav-panel__search')).toBeVisible();
     
     await toggleBtn.click();
@@ -95,5 +95,52 @@ test.describe('CodeGraph E2E', () => {
     // Verify aggregate revset in input
     const sinceInput = page.locator('#since-input');
     await expect(sinceInput).toHaveValue('deadbeef | c0ffee11');
+  });
+
+  test('should switch revision repeatedly via timeline clicks', async ({ page }) => {
+    await page.goto('/');
+
+    const deadbeefTick = page.locator('.eyeloss-timeline__tick', {
+      has: page.locator('.eyeloss-timeline__tick-id', { hasText: 'deadbeef' }),
+    });
+    const coffeeTick = page.locator('.eyeloss-timeline__tick', {
+      has: page.locator('.eyeloss-timeline__tick-id', { hasText: 'c0ffee11' }),
+    });
+    const sinceInput = page.locator('#since-input');
+
+    await expect(deadbeefTick).toHaveCount(1);
+    await expect(coffeeTick).toHaveCount(1);
+
+    await deadbeefTick.click();
+    await expect(sinceInput).toHaveValue('deadbeef');
+
+    await coffeeTick.click();
+    await expect(sinceInput).toHaveValue('c0ffee11');
+
+    await deadbeefTick.click();
+    await expect(sinceInput).toHaveValue('deadbeef');
+  });
+
+  test('should open multiple windows and tile them with hotkey', async ({ page }) => {
+    await page.goto('/');
+
+    const moduleItem = page.locator('.eyeloss-nav-panel__item', { hasText: 'MockModule' });
+    const helperItem = page.locator('.eyeloss-nav-panel__item', { hasText: 'MockHelper' });
+    await moduleItem.click();
+    await helperItem.click();
+
+    const windows = page.locator('.window');
+    await expect(windows).toHaveCount(2);
+
+    const firstWindow = windows.first();
+    const beforeStyle = await firstWindow.getAttribute('style');
+    expect(beforeStyle || '').not.toContain('left: 16px;');
+
+    await page.keyboard.down(process.platform === 'darwin' ? 'Meta' : 'Control');
+    await page.keyboard.press('t');
+    await page.keyboard.up(process.platform === 'darwin' ? 'Meta' : 'Control');
+
+    const afterStyle = await firstWindow.getAttribute('style');
+    expect(afterStyle || '').toContain('left: 16px;');
   });
 });

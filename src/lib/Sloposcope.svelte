@@ -1,5 +1,5 @@
 <script>
-  import { onMount } from 'svelte';
+  import { onMount, untrack } from 'svelte';
   import Window from './Window.svelte';
   import Editor from './Editor.svelte';
   import NodeDetailsWindow from './NodeDetailsWindow.svelte';
@@ -355,6 +355,7 @@
   let activeNodeId = $state(null);
   let nodeWindows = $state([]);
   let hoveredNode = $state(null);
+  let graphNodesById = $derived.by(() => new Map((graph.nodes || []).map((node) => [node.id, node])));
 
   const diffCache = new Map();
   const sourceCache = new Map();
@@ -676,7 +677,7 @@
   }
 
   function findNodeById(nodeId) {
-    return simNodes.find((n) => n.id === nodeId) || null;
+    return graphNodesById.get(nodeId) || null;
   }
 
   function ensureNodeWindow(node) {
@@ -757,17 +758,28 @@
     ];
   }
 
-  function getSourceReferenceLinksForNode(nodeId) {
-    const sourceNode = findNodeById(nodeId);
-    if (!sourceNode) return [];
+  let sourceReferencesBySourceId = $derived.by(() => {
+    const index = new Map();
+    const seenBySource = new Map();
+    const edges = graph.edges || [];
+    const nodesById = graphNodesById;
 
-    const refs = [];
-    const seenTokens = new Set();
+    for (const edge of edges) {
+      const sourceNode = nodesById.get(edge.source);
+      const targetNode = nodesById.get(edge.target);
+      if (!sourceNode || !targetNode || !targetNode.file || targetNode.file === sourceNode.file) continue;
 
-    for (const edge of simEdges) {
-      if (edge.source !== sourceNode.id) continue;
-      const targetNode = findNodeById(edge.target);
-      if (!targetNode || !targetNode.file || targetNode.file === sourceNode.file) continue;
+      let refs = index.get(sourceNode.id);
+      if (!refs) {
+        refs = [];
+        index.set(sourceNode.id, refs);
+      }
+
+      let seen = seenBySource.get(sourceNode.id);
+      if (!seen) {
+        seen = new Set();
+        seenBySource.set(sourceNode.id, seen);
+      }
 
       const candidates = [
         edge.target,
@@ -776,8 +788,8 @@
       ];
 
       for (const candidate of candidates) {
-        if (!candidate || seenTokens.has(candidate)) continue;
-        seenTokens.add(candidate);
+        if (!candidate || seen.has(candidate)) continue;
+        seen.add(candidate);
         refs.push({
           token: candidate,
           nodeId: targetNode.id,
@@ -787,7 +799,11 @@
       }
     }
 
-    return refs;
+    return index;
+  });
+
+  function getSourceReferenceLinksForNode(nodeId) {
+    return sourceReferencesBySourceId.get(nodeId) || [];
   }
 
   async function openSourceWindow(file, title) {
@@ -965,8 +981,8 @@
       };
     });
 
-    const prevNodes = simNodes;
-    const prevEdges = simEdges;
+    const prevNodes = untrack(() => simNodes);
+    const prevEdges = untrack(() => simEdges);
     const prevNodesById = new Map(prevNodes.map((node) => [node.id, node]));
     const prevIdSet = new Set(prevNodesById.keys());
     const nextIdSet = new Set(graph.nodes.map((node) => node.id));
