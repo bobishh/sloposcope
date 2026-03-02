@@ -915,6 +915,19 @@
     return nodes.filter(n => n.id.toLowerCase().includes(q));
   });
 
+  function buildEdgeKey(edge) {
+    return `${edge.source}::${edge.target}::${edge.type || ''}`;
+  }
+
+  function countSetIntersection(left, right) {
+    let count = 0;
+    const [small, big] = left.size <= right.size ? [left, right] : [right, left];
+    for (const value of small) {
+      if (big.has(value)) count++;
+    }
+    return count;
+  }
+
   function initSimulation() {
     if (!graph.nodes || graph.nodes.length === 0) {
       simNodes = [];
@@ -952,27 +965,67 @@
       };
     });
 
+    const prevNodes = simNodes;
+    const prevEdges = simEdges;
+    const prevNodesById = new Map(prevNodes.map((node) => [node.id, node]));
+    const prevIdSet = new Set(prevNodesById.keys());
+    const nextIdSet = new Set(graph.nodes.map((node) => node.id));
+    const overlapCount = countSetIntersection(prevIdSet, nextIdSet);
+    const overlapRatio = overlapCount / Math.max(1, nextIdSet.size);
+    const sameNodeSet = areSetsEqual(prevIdSet, nextIdSet);
+    const prevEdgeSet = new Set(prevEdges.map(buildEdgeKey));
+    const nextEdgeSet = new Set((graph.edges || []).map(buildEdgeKey));
+    const sameEdgeSet = areSetsEqual(prevEdgeSet, nextEdgeSet);
+    const structureChanged = !sameNodeSet || !sameEdgeSet;
+
     simNodes = graph.nodes.map((node) => {
       const clusterKey = getNodeClusterKey(node, degreeById);
       const center = clusterCenters[clusterKey];
+      const prev = prevNodesById.get(node.id);
+      let x = center.x + (Math.random() - 0.5) * nodeJitter;
+      let y = center.y + (Math.random() - 0.5) * nodeJitter;
+      let vx = 0;
+      let vy = 0;
+      let pinned = false;
+
+      if (prev) {
+        const clusterSwitched = prev.cluster_key && prev.cluster_key !== clusterKey;
+        if (clusterSwitched) {
+          // Keep continuity but gently steer to new cluster if grouping changed.
+          x = prev.x * 0.84 + center.x * 0.16;
+          y = prev.y * 0.84 + center.y * 0.16;
+        } else {
+          x = prev.x;
+          y = prev.y;
+        }
+        vx = prev.vx || 0;
+        vy = prev.vy || 0;
+        pinned = Boolean(prev.pinned);
+      }
+
       return {
         ...node,
         cluster_key: clusterKey,
         file_ext: getNodeExtension(node),
         figure_variant: hashString(`${node.id}|${node.file || ''}`) % FIGURINE_VARIANTS.length,
         mass: getNodeMass(node),
-        x: center.x + (Math.random() - 0.5) * nodeJitter,
-        y: center.y + (Math.random() - 0.5) * nodeJitter,
-        vx: 0,
-        vy: 0,
-        pinned: false,
+        x,
+        y,
+        vx,
+        vy,
+        pinned,
       };
     });
 
     simEdges = (graph.edges || []).map(e => ({ ...e }));
-    simulationIterations = 0;
-    pendingAutoCenter = true;
-    animating = true;
+    if (structureChanged) {
+      simulationIterations = 0;
+      animating = true;
+    }
+
+    const firstInit = prevNodes.length === 0;
+    const majorReset = prevNodes.length > 0 && overlapRatio < 0.35;
+    pendingAutoCenter = firstInit || majorReset;
   }
 
   function stepSimulation() {
