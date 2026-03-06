@@ -153,6 +153,7 @@
     if (cmd === 'select_repo') return '/new/path/to/despair';
     if (cmd === 'set_repo_path') return args?.path || '/path/to/despair';
     if (cmd === 'get_file_source') return 'defmodule MockModule do\n  def hello, do: :world\nend';
+    if (cmd === 'get_file_diff') return '@@ -1,2 +1,3 @@\n defmodule MockModule do\n+  def goodbye, do: :moon\n   def hello, do: :world\n end';
     if (cmd === 'save_file') { debugLog('[MOCK] saving file', args); return null; }
     return null;
   };
@@ -188,6 +189,13 @@
   // Heatmap state
   let heatmapData = $state(new Map());
   let heatCounter = 0;
+  let fileContentVersions = $state(new Map());
+  let contentVersion = $derived.by(() => {
+    const repo = repoPath || '';
+    const revision = currentRevision || '';
+    const sinceValue = since || '';
+    return `${repo}|${revision}|${sinceValue}`;
+  });
 
   // Multi-project tabs (one active project; inactive projects sleep).
   let projectTabs = $state([]);
@@ -234,6 +242,7 @@
       since: '@',
       heatmapData: new Map(),
       heatCounter: 0,
+      fileContentVersions: new Map(),
       loadingMore: false,
     };
   }
@@ -274,6 +283,7 @@
     since = project.since;
     heatCounter = project.heatCounter || 0;
     heatmapData = new Map(project.heatmapData || new Map());
+    fileContentVersions = new Map(project.fileContentVersions || new Map());
     loadingMore = Boolean(project.loadingMore);
     refreshFortune();
   }
@@ -293,6 +303,7 @@
     project.since = since || '@';
     project.heatCounter = heatCounter;
     project.heatmapData = new Map(heatmapData);
+    project.fileContentVersions = new Map(fileContentVersions);
     project.loadingMore = loadingMore;
   }
 
@@ -813,6 +824,10 @@
         seq: activeProject.heatCounter,
         touchedAt: Date.now(),
       });
+      activeProject.fileContentVersions.set(
+        path,
+        Number(activeProject.fileContentVersions.get(path) || 0) + 1
+      );
       if (activeProject.heatmapData.size > 100) {
         let oldestKey = null;
         let oldestSeq = Infinity;
@@ -830,6 +845,7 @@
         heatCounter = activeProject.heatCounter;
         // Force reactivity in Svelte 5 for Map
         heatmapData = new Map(activeProject.heatmapData);
+        fileContentVersions = new Map(activeProject.fileContentVersions);
       }
     }).catch((e) => {
       console.error('[FRONTEND] Failed to register file-touched listener:', e);
@@ -978,6 +994,8 @@
     {since} 
     {changes} 
     {bookmarks} 
+    {contentVersion}
+    {fileContentVersions}
     {getFileDiff} 
     {getFileSource} 
     {saveFile} 

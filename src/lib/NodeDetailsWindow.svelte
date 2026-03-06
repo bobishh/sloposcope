@@ -13,11 +13,11 @@
     active = false,
     theme = 'midnight',
     getNodeHeat = () => 0,
+    contentVersion = '',
+    fileContentVersions = new Map(),
     getFileDiff,
     getFileSource,
     saveFile,
-    diffCache,
-    sourceCache,
     initialViewMode = 'diff',
     sourceReferences = [],
     onOpenReference = null,
@@ -33,8 +33,10 @@
   let initialModeAppliedForNodeId = $state(null);
   let diffLoading = $state(false);
   let sourceLoading = $state(false);
-  let diffRequestFile = $state(null);
-  let sourceRequestFile = $state(null);
+  let diffPendingKey = $state(null);
+  let sourcePendingKey = $state(null);
+  let diffLoadedKey = $state(null);
+  let sourceLoadedKey = $state(null);
   let isSaving = $state(false);
   let showSignatures = $state(false);
   let expandedChunks = $state(new Set());
@@ -194,6 +196,11 @@
     return sourceReferences.find((ref) => ref.token?.toLowerCase() === token.toLowerCase()) || null;
   }
 
+  function getFileContentVersion(file) {
+    if (!file) return 0;
+    return Number(fileContentVersions?.get(file) || 0);
+  }
+
   function handleEditorTokenClick(token) {
     const ref = findReferenceByToken(token);
     if (!ref || !onOpenReference) return;
@@ -205,7 +212,6 @@
     isSaving = true;
     try {
       await saveFile(node.file, fileSource);
-      sourceCache?.set(node.file, fileSource || '');
     } catch (e) {
       console.error('Failed to save file', e);
     } finally {
@@ -226,50 +232,72 @@
 
   $effect(() => {
     const file = node?.file;
+    const version = contentVersion;
     if (!file) {
       fileDiff = null;
       fileSource = null;
       diffLoading = false;
       sourceLoading = false;
-      diffRequestFile = null;
-      sourceRequestFile = null;
+      diffPendingKey = null;
+      sourcePendingKey = null;
+      diffLoadedKey = null;
+      sourceLoadedKey = null;
       autoFallbackAppliedForFile = null;
       return;
     }
 
-    fileDiff = diffCache?.has(file) ? diffCache.get(file) : null;
-    fileSource = sourceCache?.has(file) ? sourceCache.get(file) : null;
+    const fileVersion = getFileContentVersion(file);
+    const diffKey = `${file}|${version}|${fileVersion}|diff`;
+    const sourceKey = `${file}|${version}|${fileVersion}|source`;
 
-    if (!diffCache?.has(file) && diffRequestFile !== file && getFileDiff) {
+    if (diffLoadedKey !== diffKey && diffPendingKey !== diffKey && getFileDiff) {
+      fileDiff = null;
       diffLoading = true;
-      diffRequestFile = file;
+      diffPendingKey = diffKey;
       getFileDiff(file)
         .then((diff) => {
-          diffCache?.set(file, diff);
-          if (node?.file === file) fileDiff = diff;
+          if (node?.file === file && diffPendingKey === diffKey) {
+            fileDiff = diff;
+            diffLoadedKey = diffKey;
+          }
+        })
+        .catch((error) => {
+          console.error('[FRONTEND] Failed to load diff', { file, error });
+          if (node?.file === file && diffPendingKey === diffKey) {
+            fileDiff = '';
+          }
         })
         .finally(() => {
-          if (diffRequestFile === file) diffRequestFile = null;
-          if (node?.file === file) diffLoading = false;
+          if (diffPendingKey === diffKey) {
+            diffPendingKey = null;
+            diffLoading = false;
+          }
         });
-    } else if (diffRequestFile !== file) {
-      diffLoading = false;
     }
 
-    if (!sourceCache?.has(file) && sourceRequestFile !== file && getFileSource) {
+    if (sourceLoadedKey !== sourceKey && sourcePendingKey !== sourceKey && getFileSource) {
+      fileSource = null;
       sourceLoading = true;
-      sourceRequestFile = file;
+      sourcePendingKey = sourceKey;
       getFileSource(file)
         .then((source) => {
-          sourceCache?.set(file, source);
-          if (node?.file === file) fileSource = source;
+          if (node?.file === file && sourcePendingKey === sourceKey) {
+            fileSource = source;
+            sourceLoadedKey = sourceKey;
+          }
+        })
+        .catch((error) => {
+          console.error('[FRONTEND] Failed to load source', { file, error });
+          if (node?.file === file && sourcePendingKey === sourceKey) {
+            fileSource = '--- FILE DELETED OR INACCESSIBLE ---';
+          }
         })
         .finally(() => {
-          if (sourceRequestFile === file) sourceRequestFile = null;
-          if (node?.file === file) sourceLoading = false;
+          if (sourcePendingKey === sourceKey) {
+            sourcePendingKey = null;
+            sourceLoading = false;
+          }
         });
-    } else if (sourceRequestFile !== file) {
-      sourceLoading = false;
     }
   });
 

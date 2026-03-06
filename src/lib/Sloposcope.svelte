@@ -11,6 +11,8 @@
     since = null, 
     changes = [], 
     bookmarks = [], 
+    contentVersion = '',
+    fileContentVersions = new Map(),
     getFileDiff, 
     getFileSource, 
     saveFile, 
@@ -29,6 +31,12 @@
       .replaceAll('\\', '/')
       .replace(/^\.\/+/, '')
       .replace(/^\/+/, '');
+  }
+
+  function getFileContentVersion(file) {
+    const normalized = normalizeFilePath(file);
+    if (!normalized) return 0;
+    return Number(fileContentVersions?.get(normalized) || 0);
   }
 
   function areSetsEqual(left, right) {
@@ -356,9 +364,6 @@
   let nodeWindows = $state([]);
   let hoveredNode = $state(null);
   let graphNodesById = $derived.by(() => new Map((graph.nodes || []).map((node) => [node.id, node])));
-
-  const diffCache = new Map();
-  const sourceCache = new Map();
   let sourceWindows = $state([]);
 
   let panelCollapsed = $state(false);
@@ -482,6 +487,32 @@
     }
     
     return id;
+  }
+
+  const NAV_PANEL_WIDTH_PX = 260;
+  const NAV_ITEM_HORIZONTAL_PADDING_PX = 24;
+  const NAV_DOT_AND_GAP_PX = 16;
+  const NAV_ITEM_SAFE_GUTTER_PX = 12;
+  const NAV_MONO_CHAR_WIDTH_PX = 9;
+  const NAV_LABEL_MAX_CHARS = Math.max(
+    12,
+    Math.floor(
+      (NAV_PANEL_WIDTH_PX - NAV_ITEM_HORIZONTAL_PADDING_PX - NAV_DOT_AND_GAP_PX - NAV_ITEM_SAFE_GUTTER_PX) /
+        NAV_MONO_CHAR_WIDTH_PX
+    )
+  );
+
+  function middleEllipsis(text, startChars = 9, endChars = 9, maxChars = NAV_LABEL_MAX_CHARS) {
+    if (!text) return '';
+    const value = String(text);
+    if (value.length <= maxChars) return value;
+    const minVisible = startChars + endChars + 1;
+    if (maxChars <= minVisible) return `${value.slice(0, startChars)}…${value.slice(-endChars)}`;
+    return `${value.slice(0, startChars)}…${value.slice(-endChars)}`;
+  }
+
+  function getNavNodeLabel(node) {
+    return middleEllipsis(getShortName(node?.id || ''), 9, 9);
   }
 
   function getNodeColor(moduleId) {
@@ -827,12 +858,16 @@
     }
 
     const slot = sourceWindows.length % 4;
+    const fileVersion = getFileContentVersion(normalized);
+    const requestId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}|${contentVersion}|${fileVersion}`;
     const sourceWindow = {
       id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
       file: normalized,
       title: title || getShortName(normalized),
       content: '',
       loading: true,
+      requestId,
+      versionToken: `${contentVersion}|${fileVersion}`,
       x: Math.max(20, 28 + slot * 34),
       y: Math.max(20, 28 + slot * 26),
       width: Math.min(780, Math.max(420, width * 0.62)),
@@ -842,15 +877,15 @@
     sourceWindows = [...sourceWindows, sourceWindow];
 
     try {
-      const cached = sourceCache.get(normalized);
-      const source = cached !== undefined ? cached : await getFileSource(normalized);
-      sourceCache.set(normalized, source || '');
+      const source = await getFileSource(normalized);
       sourceWindows = sourceWindows.map((w) =>
-        w.id === sourceWindow.id ? { ...w, content: source || '', loading: false } : w
+        w.id === sourceWindow.id && w.requestId === requestId
+          ? { ...w, content: source || '', loading: false }
+          : w
       );
     } catch (e) {
       sourceWindows = sourceWindows.map((w) =>
-        w.id === sourceWindow.id
+        w.id === sourceWindow.id && w.requestId === requestId
           ? { ...w, content: `Failed to load source for ${normalized}`, loading: false }
           : w
       );
@@ -886,6 +921,39 @@
       existing,
     ];
   }
+
+  $effect(() => {
+    const version = contentVersion;
+    const openWindows = sourceWindows;
+    if (!version || openWindows.length === 0 || !getFileSource) return;
+
+    for (const sourceWindow of openWindows) {
+      const fileVersion = getFileContentVersion(sourceWindow.file);
+      const versionToken = `${version}|${fileVersion}`;
+      if (sourceWindow.versionToken === versionToken) continue;
+      const requestId = `${sourceWindow.id}|${versionToken}`;
+
+      sourceWindows = sourceWindows.map((w) =>
+        w.id === sourceWindow.id ? { ...w, loading: true, requestId, versionToken } : w
+      );
+
+      getFileSource(sourceWindow.file)
+        .then((source) => {
+          sourceWindows = sourceWindows.map((w) =>
+            w.id === sourceWindow.id && w.requestId === requestId
+              ? { ...w, content: source || '', loading: false }
+              : w
+          );
+        })
+        .catch(() => {
+          sourceWindows = sourceWindows.map((w) =>
+            w.id === sourceWindow.id && w.requestId === requestId
+              ? { ...w, content: `Failed to load source for ${sourceWindow.file}`, loading: false }
+              : w
+          );
+        });
+    }
+  });
 
   function tileFloatingWindows() {
     const total = nodeWindows.length + sourceWindows.length;
@@ -1882,11 +1950,12 @@
               class="eyeloss-nav-panel__item"
               class:eyeloss-nav-panel__item--active={selectedNodeIds.has(node.id) || highlightedSearchIndex === i}
               type="button"
+              title={getShortName(node.id)}
               onclick={() => { focusNode(node); highlightedSearchIndex = i; }}
               ondblclick={() => openSourceWindow(node.file, getShortName(node.id))}
             >
               <span class="eyeloss-nav-panel__dot" data-ns={getNamespace(node.id)}></span>
-              <span class="eyeloss-nav-panel__name">{getShortName(node.id)}</span>
+              <span class="eyeloss-nav-panel__name">{getNavNodeLabel(node)}</span>
             </button>
           </li>
         {/each}
@@ -1970,12 +2039,12 @@
         windowHeight={nodeWindow.height}
         active={activeNodeId === nodeWindow.nodeId}
         {theme}
+        {contentVersion}
+        {fileContentVersions}
         {getNodeHeat}
         {getFileDiff}
         {getFileSource}
         {saveFile}
-        {diffCache}
-        {sourceCache}
         initialViewMode={nodeWindow.initialViewMode || 'diff'}
         sourceReferences={getSourceReferenceLinksForNode(nodeWindow.nodeId)}
         onOpenReference={openSourceWindowForReference}
