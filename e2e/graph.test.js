@@ -24,7 +24,7 @@ test.describe('CodeGraph E2E', () => {
     await page.goto('/');
 
     // Click "Change" button (the mock returns /new/path/to/despair)
-    const changeBtn = page.locator('button', { hasText: 'Change' });
+    const changeBtn = page.getByRole('button', { name: 'Change', exact: true });
     await changeBtn.click();
 
     // Verify path changed
@@ -142,5 +142,174 @@ test.describe('CodeGraph E2E', () => {
 
     const afterStyle = await firstWindow.getAttribute('style');
     expect(afterStyle || '').toContain('left: 16px;');
+  });
+
+  test('should drive the mission flow across tabs', async ({ page }) => {
+    await page.goto('/');
+
+    await page.locator('.eyeloss-controls__view-btn').click();
+
+    const missionTabs = page.locator('.eyeloss-primary-tabs');
+    await expect(missionTabs.getByRole('button', { name: 'Mission', exact: true })).toBeVisible();
+    await expect(missionTabs.getByRole('button', { name: 'Runs', exact: true })).toBeVisible();
+    await expect(missionTabs.getByRole('button', { name: 'Debug', exact: true })).toBeVisible();
+
+    await expect(page.getByText('Mission Brief')).toBeVisible();
+    await page.getByLabel('Title').fill('M8A mission flow');
+    await page.getByLabel('Brief').fill('Normalize mission state and keep form state across tabs.');
+    await page.getByLabel('Validation command').fill('npm run test:e2e');
+    await page.getByLabel('Issue key').fill('M8A-1');
+    await page.getByLabel('Issue URL').fill('https://linear.app/example/M8A-1');
+
+    await page.locator('.eyeloss-mission-panel').getByRole('button', { name: 'Save', exact: true }).click();
+    await page.locator('.eyeloss-mission-panel').getByRole('button', { name: 'Plan', exact: true }).click();
+
+    await expect(page.locator('.eyeloss-mission-panel')).toContainText('M8A mission flow');
+    await expect(page.locator('.eyeloss-mission-panel')).toContainText('Normalize mission state and keep form state across tabs.');
+
+    await missionTabs.getByRole('button', { name: 'Runs', exact: true }).click();
+    await expect(page.getByRole('heading', { name: 'Mission Runs' })).toBeVisible();
+    await expect(page.locator('.eyeloss-mission-runs-panel')).toContainText('objective-1');
+    await expect(page.locator('.eyeloss-mission-runs-panel')).toContainText('M8A mission flow');
+    await page.locator('.eyeloss-mission-runs-panel').getByRole('button', { name: 'Run code worker', exact: true }).click();
+
+    await expect(page.locator('.eyeloss-mission-runs-panel')).toContainText('code-session-1');
+    await expect(page.locator('.eyeloss-mission-runs-panel')).toContainText('completed');
+    await expect(page.locator('.eyeloss-mission-runs-panel')).toContainText('verification-1');
+    await expect(page.locator('.eyeloss-mission-runs-panel')).toContainText('passed');
+    await expect(page.locator('.eyeloss-mission-runs-panel')).toContainText('Patch artifact');
+    await expect(page.locator('.eyeloss-mission-runs-panel')).toContainText('.sloposcope/worktrees/');
+    await expect(page.locator('.eyeloss-mission-runs-panel')).toContainText('Validation: npm run test:e2e');
+    await expect(page.locator('.eyeloss-mission-runs-panel')).toContainText('Code worker completed objective-1.');
+
+    await missionTabs.getByRole('button', { name: 'Debug', exact: true }).click();
+    await expect(page.getByRole('heading', { name: 'Enterprise Controls' })).toBeVisible();
+    await expect(page.locator('.eyeloss-settings-tabs--debug')).toContainText('Issue');
+    await expect(page.locator('.eyeloss-settings-tabs--debug')).toContainText('Config');
+    await expect(page.locator('.eyeloss-settings-tabs--debug')).toContainText('Runs');
+
+    await page.reload();
+    await expect(page.locator('.eyeloss-spinner')).not.toBeVisible();
+    await page.locator('.eyeloss-controls__view-btn').click();
+    await expect(page.getByRole('heading', { name: 'Mission Brief' })).toBeVisible();
+    await expect(page.locator('.eyeloss-mission-panel')).toContainText('M8A mission flow');
+    await expect(page.locator('.eyeloss-mission-panel')).toContainText('Normalize mission state and keep form state across tabs.');
+    await page.getByRole('tablist', { name: 'Mission sections' }).getByRole('button', { name: 'Runs', exact: true }).click();
+    await expect(page.locator('.eyeloss-mission-runs-panel')).toContainText('code-session-1');
+    await expect(page.locator('.eyeloss-mission-runs-panel')).toContainText('verification-1');
+
+    await missionTabs.getByRole('button', { name: 'Mission', exact: true }).click();
+    await expect(page.getByLabel('Title')).toHaveValue('M8A mission flow');
+    await expect(page.getByLabel('Brief')).toHaveValue('Normalize mission state and keep form state across tabs.');
+    await expect(page.getByLabel('Validation command')).toHaveValue('npm run test:e2e');
+    await expect(page.getByLabel('Issue key')).toHaveValue('M8A-1');
+    await expect(page.getByLabel('Issue URL')).toHaveValue('https://linear.app/example/M8A-1');
+  });
+
+  test('should gate mission runs with viewer-first review actions', async ({ page }) => {
+    await page.goto('/');
+
+    await page.locator('.eyeloss-controls__view-btn').click();
+
+    await page.getByLabel('Title').fill('M9 viewer-first gating');
+    await page.getByLabel('Brief').fill('Keep the viewer on the active session and mirror review state.');
+    await page.getByLabel('Validation command').fill('npm run test:e2e');
+    await page.getByLabel('Issue key').fill('M9-1');
+    await page.getByLabel('Issue URL').fill('https://linear.app/example/M9-1');
+
+    await page.locator('.eyeloss-mission-panel').getByRole('button', { name: 'Save', exact: true }).click();
+    await page.locator('.eyeloss-mission-panel').getByRole('button', { name: 'Plan', exact: true }).click();
+
+    await page.getByRole('tablist', { name: 'Mission sections' }).getByRole('button', { name: 'Runs', exact: true }).click();
+
+    const panel = page.locator('.eyeloss-mission-runs-panel');
+    await page.locator('.eyeloss-mission-runs-panel').getByRole('button', { name: 'Run code worker', exact: true }).click();
+
+    await expect(panel).toContainText('viewer profile: local-code-worker');
+    await expect(panel).toContainText('session: code-session-1');
+    await expect(panel).toContainText('review: pending');
+    await expect(panel).toContainText('gate: open');
+    await expect(panel.getByRole('button', { name: 'Apply', exact: true })).toBeDisabled();
+
+    await panel.getByRole('button', { name: 'Accept', exact: true }).click();
+    await expect(panel).toContainText('review: accepted');
+    await expect(panel).toContainText('gate: ready');
+    await expect(panel.getByRole('button', { name: 'Apply', exact: true })).toBeEnabled();
+
+    await panel.getByRole('button', { name: 'Gate', exact: true }).click();
+    await expect(panel).toContainText('gate: ready');
+
+    await panel.getByRole('button', { name: 'Apply', exact: true }).click();
+    await expect(panel).toContainText('apply: applied');
+
+    await page.reload();
+    await expect(page.locator('.eyeloss-spinner')).not.toBeVisible();
+    await page.locator('.eyeloss-controls__view-btn').click();
+    await page.getByRole('tablist', { name: 'Mission sections' }).getByRole('button', { name: 'Runs', exact: true }).click();
+    await expect(page.locator('.eyeloss-mission-runs-panel')).toContainText('viewer profile: local-code-worker');
+    await expect(page.locator('.eyeloss-mission-runs-panel')).toContainText('review: accepted');
+    await expect(page.locator('.eyeloss-mission-runs-panel')).toContainText('apply: applied');
+    await expect(page.locator('.eyeloss-mission-runs-panel')).toContainText('gate: ready');
+  });
+
+  test('should plan scoped multi-objective missions and expose scheduler controls', async ({ page }) => {
+    await page.goto('/');
+
+    await page.locator('.eyeloss-controls__view-btn').click();
+    await page.getByRole('tablist', { name: 'Mission sections' }).getByRole('button', { name: 'Mission', exact: true }).click();
+
+    await page.getByLabel('Title').fill('M10 scheduler mission');
+    await page.getByLabel('Brief').fill([
+      '[scope:src/] UI shell cleanup',
+      '[scope:src/] UI second pass',
+      '[scope:src-tauri/] Rust runtime sweep',
+    ].join('\n'));
+    await page.getByLabel('Validation command').fill('npm run test:e2e');
+    await page.locator('.eyeloss-mission-panel').getByRole('button', { name: 'Save', exact: true }).click();
+    await page.locator('.eyeloss-mission-panel').getByRole('button', { name: 'Plan', exact: true }).click();
+
+    await page.getByRole('tablist', { name: 'Mission sections' }).getByRole('button', { name: 'Runs', exact: true }).click();
+    const runs = page.locator('.eyeloss-mission-runs-panel');
+    await expect(runs).toContainText('scheduler');
+    await expect(runs.locator('.eyeloss-mission__item-id')).toHaveCount(3);
+    await expect(runs.getByRole('button', { name: 'Run next code worker', exact: true })).toBeVisible();
+    await expect(runs.getByRole('button', { name: 'Sweep stale', exact: true })).toBeVisible();
+  });
+
+  test('should save and use an active agent profile from debug', async ({ page }) => {
+    await page.goto('/');
+    await page.locator('.eyeloss-controls__view-btn').click();
+
+    await page.getByLabel('Title').fill('M9 profile flow');
+    await page.getByLabel('Brief').fill('Run code worker through saved active profile.');
+    await page.getByLabel('Validation command').fill('npm run test:e2e');
+    await page.locator('.eyeloss-mission-panel').getByRole('button', { name: 'Save', exact: true }).click();
+    await page.locator('.eyeloss-mission-panel').getByRole('button', { name: 'Plan', exact: true }).click();
+
+    const missionTabs = page.getByRole('tablist', { name: 'Mission sections' });
+    await missionTabs.getByRole('button', { name: 'Debug', exact: true }).click();
+    const debugTabs = page.getByRole('tablist', { name: 'Debug sections' });
+    await debugTabs.getByRole('button', { name: 'Profiles', exact: true }).click();
+
+    const profilePanel = page.locator('.eyeloss-agent-profiles-panel');
+    await expect(profilePanel.getByRole('button', { name: 'Save profile', exact: true })).toBeDisabled();
+
+    await profilePanel.getByLabel('Label').fill('Gemini Horse');
+    await profilePanel.getByLabel('Provider').fill('gemini_cli');
+    await profilePanel.getByLabel('Command').fill('/bin/sh');
+    await profilePanel.getByLabel('Args').fill('-lc\nprintf "export const answer = 2;\\n" > app.js');
+    await profilePanel.getByLabel('Capabilities').fill('can_edit, can_run_tools');
+    await profilePanel.getByLabel('Transport').selectOption('pty');
+    await profilePanel.getByLabel('Active profile').check();
+    await profilePanel.getByRole('button', { name: 'Save profile', exact: true }).click();
+
+    await expect(profilePanel).toContainText('Gemini Horse');
+    await expect(profilePanel).toContainText('gemini_cli');
+
+    await missionTabs.getByRole('button', { name: 'Runs', exact: true }).click();
+    const runs = page.locator('.eyeloss-mission-runs-panel');
+    await runs.getByRole('button', { name: 'Run code worker', exact: true }).click();
+    await expect(runs).toContainText('viewer profile: gemini-horse');
+    await expect(runs).toContainText('profile: gemini-horse');
   });
 });

@@ -1,0 +1,45 @@
+{
+  "name": "cost_risk_large_batch",
+  "snapshot": {
+    "schemaVersion": 1,
+    "createdAt": "unix:102",
+    "branch": "feature/big",
+    "revision": "abc125",
+    "since": "@",
+    "issueContext": null,
+    "agentsRulesCount": 1,
+    "changedFilesTotal": 25,
+    "changedFiles": [
+      {
+        "path": "src/bulk/importer.rs",
+        "status": "modified",
+        "diffExcerpt": [
+          "+fn import_all() {}"
+        ],
+        "diffLineCount": 1
+      }
+    ],
+    "validation": null
+  },
+  "config": {
+    "enabled": true,
+    "triggerMode": "manual_only",
+    "requireActiveIssue": false,
+    "maxFilesInSnapshot": 20,
+    "maxDiffLinesPerFile": 200,
+    "dedupeWindowSeconds": 300,
+    "alertThreshold": "warning",
+    "checks": {
+      "issueAlignment": true,
+      "instructionCompliance": true,
+      "missingValidation": false,
+      "costRisk": true
+    }
+  },
+  "expected": {
+    "status": "drift",
+    "issueKinds": [
+      "cost_risk"
+    ]
+  }
+}

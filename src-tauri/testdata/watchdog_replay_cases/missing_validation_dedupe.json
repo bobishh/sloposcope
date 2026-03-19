@@ -1,0 +1,126 @@
+{
+  "name": "missing_validation_dedupe",
+  "config": {
+    "enabled": true,
+    "triggerMode": "manual_only",
+    "requireActiveIssue": false,
+    "maxFilesInSnapshot": 20,
+    "maxDiffLinesPerFile": 200,
+    "dedupeWindowSeconds": 300,
+    "alertThreshold": "warning",
+    "checks": {
+      "issueAlignment": false,
+      "instructionCompliance": true,
+      "missingValidation": true,
+      "costRisk": false
+    }
+  },
+  "traces": [
+    {
+      "id": "trace-1",
+      "createdAt": "unix:100",
+      "snapshot": {
+        "schemaVersion": 1,
+        "createdAt": "unix:100",
+        "branch": "main",
+        "revision": "abc100",
+        "since": "@",
+        "issueContext": null,
+        "agentsRulesCount": 0,
+        "changedFilesTotal": 1,
+        "changedFiles": [
+          {
+            "path": "src/lib.rs",
+            "status": "modified",
+            "diffExcerpt": [
+              "+fn change() {}"
+            ],
+            "diffLineCount": 1
+          }
+        ],
+        "validation": null
+      },
+      "verdict": {
+        "status": "drift",
+        "confidence": 0.62,
+        "summary": "old verdict",
+        "issues": []
+      }
+    },
+    {
+      "id": "trace-2",
+      "createdAt": "unix:120",
+      "snapshot": {
+        "schemaVersion": 1,
+        "createdAt": "unix:120",
+        "branch": "main",
+        "revision": "abc101",
+        "since": "@",
+        "issueContext": null,
+        "agentsRulesCount": 0,
+        "changedFilesTotal": 1,
+        "changedFiles": [
+          {
+            "path": "src/lib.rs",
+            "status": "modified",
+            "diffExcerpt": [
+              "+fn change_again() {}"
+            ],
+            "diffLineCount": 1
+          }
+        ],
+        "validation": null
+      },
+      "verdict": {
+        "status": "on_track",
+        "confidence": 0.85,
+        "summary": "old verdict",
+        "issues": []
+      }
+    },
+    {
+      "id": "trace-3",
+      "createdAt": "unix:500",
+      "snapshot": {
+        "schemaVersion": 1,
+        "createdAt": "unix:500",
+        "branch": "main",
+        "revision": "abc102",
+        "since": "@",
+        "issueContext": null,
+        "agentsRulesCount": 0,
+        "changedFilesTotal": 1,
+        "changedFiles": [
+          {
+            "path": "src/lib.rs",
+            "status": "modified",
+            "diffExcerpt": [
+              "+fn validated_change() {}"
+            ],
+            "diffLineCount": 1
+          }
+        ],
+        "validation": {
+          "kind": "cargo_test",
+          "success": true,
+          "ranAt": "unix:500",
+          "details": "ok"
+        }
+      },
+      "verdict": {
+        "status": "on_track",
+        "confidence": 0.85,
+        "summary": "old verdict",
+        "issues": []
+      }
+    }
+  ],
+  "expected": {
+    "tracesEvaluated": 3,
+    "runsWithIssues": 2,
+    "tracesWithStatusChange": 1,
+    "issuesTotalRaw": 2,
+    "issuesTotalDeduped": 1,
+    "uniqueIssueFingerprints": 1
+  }
+}

@@ -1,0 +1,61 @@
+{
+  "name": "graph_neighbor_drift_confirmed",
+  "snapshot": {
+    "schemaVersion": 1,
+    "createdAt": "unix:201",
+    "branch": "feature/invoice-reliability",
+    "revision": "abc202",
+    "since": "@",
+    "issueContext": {
+      "issue": {
+        "id": "issue-42",
+        "title": "Invoice parser reliability",
+        "identifier": "LIN-42",
+        "url": null
+      },
+      "summary": "Parser should handle malformed invoices without crashing",
+      "acceptanceCriteria": ["No parser crashes on bad input"],
+      "nonGoals": ["Canvas tuning"],
+      "labels": ["backend"],
+      "priority": "high"
+    },
+    "agentsRulesCount": 0,
+    "changedFilesTotal": 1,
+    "changedFiles": [
+      {
+        "path": "src/render/canvas.rs",
+        "status": "modified",
+        "diffExcerpt": ["+fn simulate_force() {}"],
+        "diffLineCount": 1
+      }
+    ],
+    "validation": {
+      "kind": "cargo_test",
+      "success": true,
+      "ranAt": "unix:201",
+      "details": "ok"
+    },
+    "affectedEntities": ["simulate_force"],
+    "relatedEntities": ["render_frame", "animate_sprite"],
+    "blastRadiusCount": 2
+  },
+  "config": {
+    "enabled": true,
+    "triggerMode": "manual_only",
+    "requireActiveIssue": false,
+    "maxFilesInSnapshot": 20,
+    "maxDiffLinesPerFile": 200,
+    "dedupeWindowSeconds": 300,
+    "alertThreshold": "warning",
+    "checks": {
+      "issueAlignment": true,
+      "instructionCompliance": false,
+      "missingValidation": false,
+      "costRisk": false
+    }
+  },
+  "expected": {
+    "status": "drift",
+    "issueKinds": ["drift"]
+  }
+}

@@ -1,0 +1,58 @@
+name: Watchdog Evals
+
+on:
+  push:
+    paths:
+      - "src-tauri/src/watchdog.rs"
+      - "src-tauri/src/watchdog_types.rs"
+      - "src-tauri/src/watchdog_config.rs"
+      - "src-tauri/src/lib.rs"
+      - "src-tauri/src/conductor.rs"
+      - "src-tauri/testdata/watchdog_eval_cases/**"
+      - "src-tauri/testdata/watchdog_replay_cases/**"
+      - "scripts/run_watchdog_eval_suite.sh"
+      - "scripts/generate_watchdog_threshold_report.py"
+      - ".github/workflows/watchdog-evals.yml"
+  pull_request:
+    paths:
+      - "src-tauri/src/watchdog.rs"
+      - "src-tauri/src/watchdog_types.rs"
+      - "src-tauri/src/watchdog_config.rs"
+      - "src-tauri/src/lib.rs"
+      - "src-tauri/src/conductor.rs"
+      - "src-tauri/testdata/watchdog_eval_cases/**"
+      - "src-tauri/testdata/watchdog_replay_cases/**"
+      - "scripts/run_watchdog_eval_suite.sh"
+      - "scripts/generate_watchdog_threshold_report.py"
+      - ".github/workflows/watchdog-evals.yml"
+
+jobs:
+  watchdog-evals:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Linux system deps (Tauri build/test)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libgtk-3-dev \
+            libwebkit2gtk-4.1-dev \
+            librsvg2-dev \
+            patchelf
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run watchdog eval suite
+        run: |
+          chmod +x scripts/run_watchdog_eval_suite.sh
+          ./scripts/run_watchdog_eval_suite.sh
+
+      - name: Upload watchdog threshold report artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: watchdog-threshold-report
+          path: artifacts/watchdog-threshold-report.md

@@ -1,0 +1,64 @@
+{
+  "name": "aligned_issue_with_validation_on_track",
+  "snapshot": {
+    "schemaVersion": 1,
+    "createdAt": "unix:103",
+    "branch": "feature/generator-layout",
+    "revision": "abc126",
+    "since": "@",
+    "issueContext": {
+      "issue": {
+        "id": "issue-42",
+        "title": "Improve generator output layout",
+        "identifier": "LIN-42",
+        "url": null
+      },
+      "summary": "Generator layout should be stable",
+      "acceptanceCriteria": [
+        "No visual overlap"
+      ],
+      "nonGoals": [],
+      "labels": [
+        "layout"
+      ],
+      "priority": "high"
+    },
+    "agentsRulesCount": 4,
+    "changedFilesTotal": 1,
+    "changedFiles": [
+      {
+        "path": "app/services/generator_layout.rb",
+        "status": "modified",
+        "diffExcerpt": [
+          "+# generator layout tuning"
+        ],
+        "diffLineCount": 1
+      }
+    ],
+    "validation": {
+      "kind": "cargo_test",
+      "success": true,
+      "ranAt": "unix:103",
+      "details": "ok"
+    }
+  },
+  "config": {
+    "enabled": true,
+    "triggerMode": "manual_only",
+    "requireActiveIssue": true,
+    "maxFilesInSnapshot": 20,
+    "maxDiffLinesPerFile": 200,
+    "dedupeWindowSeconds": 300,
+    "alertThreshold": "warning",
+    "checks": {
+      "issueAlignment": true,
+      "instructionCompliance": true,
+      "missingValidation": true,
+      "costRisk": true
+    }
+  },
+  "expected": {
+    "status": "on_track",
+    "issueKinds": []
+  }
+}

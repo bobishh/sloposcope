@@ -1,0 +1,91 @@
+{
+  "name": "strict_mode_provider_blocked_regression",
+  "config": {
+    "enabled": true,
+    "triggerMode": "on_branch_switch_after_quiet_period",
+    "requireActiveIssue": true,
+    "maxFilesInSnapshot": 20,
+    "maxDiffLinesPerFile": 200,
+    "dedupeWindowSeconds": 300,
+    "alertThreshold": "warning",
+    "checks": {
+      "issueAlignment": true,
+      "semanticAlignment": false,
+      "instructionCompliance": false,
+      "missingValidation": true,
+      "costRisk": false
+    }
+  },
+  "traces": [
+    {
+      "id": "strict-1",
+      "createdAt": "unix:200",
+      "snapshot": {
+        "schemaVersion": 1,
+        "createdAt": "unix:200",
+        "branch": "main",
+        "revision": "abc210",
+        "since": "@",
+        "issueContext": null,
+        "agentsRulesCount": 0,
+        "changedFilesTotal": 1,
+        "changedFiles": [
+          {
+            "path": "src/service.rs",
+            "status": "modified",
+            "diffExcerpt": [
+              "+fn strict_mode_case() {}"
+            ],
+            "diffLineCount": 1
+          }
+        ],
+        "validation": null
+      },
+      "verdict": {
+        "status": "blocked",
+        "confidence": 0.95,
+        "summary": "provider failed in strict mode",
+        "issues": []
+      }
+    },
+    {
+      "id": "strict-2",
+      "createdAt": "unix:205",
+      "snapshot": {
+        "schemaVersion": 1,
+        "createdAt": "unix:205",
+        "branch": "main",
+        "revision": "abc210",
+        "since": "@",
+        "issueContext": null,
+        "agentsRulesCount": 0,
+        "changedFilesTotal": 1,
+        "changedFiles": [
+          {
+            "path": "src/service.rs",
+            "status": "modified",
+            "diffExcerpt": [
+              "+fn strict_mode_case_retry() {}"
+            ],
+            "diffLineCount": 1
+          }
+        ],
+        "validation": null
+      },
+      "verdict": {
+        "status": "blocked",
+        "confidence": 0.95,
+        "summary": "provider failed in strict mode",
+        "issues": []
+      }
+    }
+  ],
+  "expected": {
+    "tracesEvaluated": 2,
+    "runsWithIssues": 2,
+    "tracesWithStatusChange": 2,
+    "issuesTotalRaw": 4,
+    "issuesTotalDeduped": 2,
+    "uniqueIssueFingerprints": 2
+  }
+}

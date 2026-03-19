@@ -1,0 +1,122 @@
+{
+  "name": "branch_switch_noise_repeated_missing_validation",
+  "config": {
+    "enabled": true,
+    "triggerMode": "on_branch_switch_after_quiet_period",
+    "requireActiveIssue": false,
+    "maxFilesInSnapshot": 20,
+    "maxDiffLinesPerFile": 200,
+    "dedupeWindowSeconds": 300,
+    "alertThreshold": "warning",
+    "checks": {
+      "issueAlignment": false,
+      "semanticAlignment": false,
+      "instructionCompliance": false,
+      "missingValidation": true,
+      "costRisk": false
+    }
+  },
+  "traces": [
+    {
+      "id": "noise-1",
+      "createdAt": "unix:100",
+      "snapshot": {
+        "schemaVersion": 1,
+        "createdAt": "unix:100",
+        "branch": "main",
+        "revision": "abc101",
+        "since": "@",
+        "issueContext": null,
+        "agentsRulesCount": 0,
+        "changedFilesTotal": 1,
+        "changedFiles": [
+          {
+            "path": "src/lib.rs",
+            "status": "modified",
+            "diffExcerpt": [
+              "+fn noisy_one() {}"
+            ],
+            "diffLineCount": 1
+          }
+        ],
+        "validation": null
+      },
+      "verdict": {
+        "status": "drift",
+        "confidence": 0.62,
+        "summary": "old verdict",
+        "issues": []
+      }
+    },
+    {
+      "id": "noise-2",
+      "createdAt": "unix:120",
+      "snapshot": {
+        "schemaVersion": 1,
+        "createdAt": "unix:120",
+        "branch": "main",
+        "revision": "abc101",
+        "since": "@",
+        "issueContext": null,
+        "agentsRulesCount": 0,
+        "changedFilesTotal": 1,
+        "changedFiles": [
+          {
+            "path": "src/lib.rs",
+            "status": "modified",
+            "diffExcerpt": [
+              "+fn noisy_two() {}"
+            ],
+            "diffLineCount": 1
+          }
+        ],
+        "validation": null
+      },
+      "verdict": {
+        "status": "drift",
+        "confidence": 0.62,
+        "summary": "old verdict",
+        "issues": []
+      }
+    },
+    {
+      "id": "noise-3",
+      "createdAt": "unix:150",
+      "snapshot": {
+        "schemaVersion": 1,
+        "createdAt": "unix:150",
+        "branch": "main",
+        "revision": "abc101",
+        "since": "@",
+        "issueContext": null,
+        "agentsRulesCount": 0,
+        "changedFilesTotal": 1,
+        "changedFiles": [
+          {
+            "path": "src/lib.rs",
+            "status": "modified",
+            "diffExcerpt": [
+              "+fn noisy_three() {}"
+            ],
+            "diffLineCount": 1
+          }
+        ],
+        "validation": null
+      },
+      "verdict": {
+        "status": "drift",
+        "confidence": 0.62,
+        "summary": "old verdict",
+        "issues": []
+      }
+    }
+  ],
+  "expected": {
+    "tracesEvaluated": 3,
+    "runsWithIssues": 3,
+    "tracesWithStatusChange": 0,
+    "issuesTotalRaw": 3,
+    "issuesTotalDeduped": 1,
+    "uniqueIssueFingerprints": 1
+  }
+}

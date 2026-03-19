@@ -8,6 +8,7 @@
 
   let { 
     graph = { nodes: [], edges: [] }, 
+    graphMeta = null,
     since = null, 
     changes = [], 
     bookmarks = [], 
@@ -22,7 +23,9 @@
     onLoadMoreChanges,
     onProjectChange,
     loadingMore = false,
-    hasMoreChanges = true
+    hasMoreChanges = true,
+    missionState = null,
+    missionRobotTargets = [],
   } = $props();
 
   function normalizeFilePath(path) {
@@ -60,6 +63,56 @@
     );
   }
 
+  function clampRobotScreenTarget(desiredX, desiredY) {
+    if (width <= 0 || height <= 0) {
+      return { x: desiredX, y: desiredY };
+    }
+
+    const marginX = 56;
+    const marginY = 56;
+    return {
+      x: Math.max(marginX, Math.min(width - marginX, desiredX)),
+      y: Math.max(marginY, Math.min(height - marginY, desiredY)),
+    };
+  }
+
+  function missionRobotState(session) {
+    const runtimeState = String(session?.runtimeStatus || session?.liveliness || session?.state || 'idle').toLowerCase();
+    const applyState = String(session?.applyState || '').toLowerCase();
+    const gateState = String(session?.gateState || '').toLowerCase();
+    const reviewState = String(session?.reviewState || '').toLowerCase();
+
+    if (applyState === 'applied') return 'applied';
+    if (runtimeState === 'failed' || runtimeState === 'error') return 'failed';
+    if (runtimeState === 'stuck') return 'stuck';
+    if (gateState === 'blocked') return 'stuck';
+    if (gateState === 'ready' || reviewState === 'accepted') return 'gated';
+    if (runtimeState === 'completed' || runtimeState === 'done') return 'completed';
+    if (runtimeState === 'running' || runtimeState === 'claimed') return 'running';
+    return 'idle';
+  }
+
+  function robotAnchorNodeForSession(session, index) {
+    const touchedPaths = Array.isArray(session?.touchedPaths) ? session.touchedPaths : [];
+    for (const path of touchedPaths) {
+      const matched = findNodeByFilePath(path);
+      if (matched) return matched;
+    }
+
+    const scopedPaths = Array.isArray(session?.scopePaths) ? session.scopePaths : [];
+    for (const path of scopedPaths) {
+      const matched = findNodeByFilePath(path);
+      if (matched) return matched;
+    }
+
+    return (
+      simNodes.find((n) => n.change_status === 'modified' || n.change_status === 'added') ||
+      simNodes[index] ||
+      simNodes[0] ||
+      null
+    );
+  }
+
   let lastEditedNode = $derived.by(() => {
     if (!heatmapData || heatmapData.size === 0) return null;
 
@@ -92,17 +145,49 @@
     // Keep robot on the edited document (upper-right area), not floating far away.
     const desiredX = screen.x + size.w * 0.22;
     const desiredY = screen.y - size.h * 0.28;
-    if (width <= 0 || height <= 0) {
-      return { x: desiredX, y: desiredY, active: true };
-    }
-
-    const marginX = 56;
-    const marginY = 56;
     return {
-      x: Math.max(marginX, Math.min(width - marginX, desiredX)),
-      y: Math.max(marginY, Math.min(height - marginY, desiredY)),
+      ...clampRobotScreenTarget(desiredX, desiredY),
       active: true,
     };
+  });
+
+  let normalizedMissionRobotTargets = $derived.by(() => {
+    const explicitTargets = Array.isArray(missionRobotTargets) ? missionRobotTargets : [];
+    const stateTargets = Array.isArray(missionState?.robotTargets) ? missionState.robotTargets : [];
+    const sourceTargets = explicitTargets.length > 0 ? explicitTargets : stateTargets;
+    if (sourceTargets.length > 0) {
+      return sourceTargets
+      .map((target, index) => ({
+        x: Number(target?.x ?? 0),
+        y: Number(target?.y ?? 0),
+        active: Boolean(target?.active ?? true),
+        state: String(target?.state || 'running'),
+        instanceId: String(target?.instanceId || `mission-${index}`),
+      }))
+      .filter((target) => Number.isFinite(target.x) && Number.isFinite(target.y));
+    }
+
+    if (!missionState || String(missionState.status || 'idle') === 'idle') return [];
+    const sessions = Array.isArray(missionState.sessions) ? missionState.sessions : [];
+    const recentSessions = sessions.slice(-4).reverse();
+    if (recentSessions.length === 0) return [];
+    return recentSessions
+      .map((session, index) => {
+        const anchorNode = robotAnchorNodeForSession(session, index);
+        if (!anchorNode) return null;
+        const screen = worldToScreen(anchorNode.x, anchorNode.y);
+        const size = getNodeSize(anchorNode);
+        const dx = size.w * (0.18 + index * 0.1);
+        const dy = size.h * (0.4 + (index % 2) * 0.22);
+        const clamped = clampRobotScreenTarget(screen.x + dx, screen.y - dy);
+        return {
+          ...clamped,
+          active: true,
+          state: missionRobotState(session),
+          instanceId: String(session?.sessionId || `mission-${anchorNode.id || index}`),
+        };
+      })
+      .filter(Boolean);
   });
 
   let searchInput = $state(null);
@@ -532,6 +617,10 @@
   }
 
   function getNodeClusterKey(node, degreeById) {
+    const persisted = clusterAssignmentByNodeId.get(node.id);
+    if (graphMeta?.clusteringMode === 'persisted' && persisted?.clusterId) {
+      return `persisted:${persisted.clusterId}`;
+    }
     const degree = degreeById[node.id] || 0;
     if (degree === 0) {
       return `ext:${getNodeExtension(node)}`;
@@ -1003,6 +1092,16 @@
     const nodes = simNodes.slice().sort((a, b) => a.id.localeCompare(b.id));
     if (!q) return nodes;
     return nodes.filter(n => n.id.toLowerCase().includes(q));
+  });
+
+  let nodeProvenanceById = $derived.by(() => {
+    const entries = graphMeta?.nodeProvenance || [];
+    return new Map(entries.map((entry) => [entry.nodeId, entry.reason]));
+  });
+
+  let clusterAssignmentByNodeId = $derived.by(() => {
+    const entries = graphMeta?.clusterAssignments || [];
+    return new Map(entries.map((entry) => [entry.nodeId, entry]));
   });
 
   function buildEdgeKey(edge) {
@@ -1950,12 +2049,17 @@
               class="eyeloss-nav-panel__item"
               class:eyeloss-nav-panel__item--active={selectedNodeIds.has(node.id) || highlightedSearchIndex === i}
               type="button"
-              title={getShortName(node.id)}
+              title={nodeProvenanceById.get(node.id) ? `${getShortName(node.id)} — ${nodeProvenanceById.get(node.id)}` : getShortName(node.id)}
               onclick={() => { focusNode(node); highlightedSearchIndex = i; }}
               ondblclick={() => openSourceWindow(node.file, getShortName(node.id))}
             >
               <span class="eyeloss-nav-panel__dot" data-ns={getNamespace(node.id)}></span>
-              <span class="eyeloss-nav-panel__name">{getNavNodeLabel(node)}</span>
+              <span class="eyeloss-nav-panel__body">
+                <span class="eyeloss-nav-panel__name">{getNavNodeLabel(node)}</span>
+                {#if nodeProvenanceById.get(node.id)}
+                  <span class="eyeloss-nav-panel__meta">{nodeProvenanceById.get(node.id)}</span>
+                {/if}
+              </span>
             </button>
           </li>
         {/each}
@@ -2093,6 +2197,16 @@
       targetX={robotTarget.x}
       targetY={robotTarget.y}
       active={robotTarget.active}
+      instanceId="file-touch"
     />
+    {#each normalizedMissionRobotTargets as target}
+      <Robot
+        targetX={target.x}
+        targetY={target.y}
+        active={target.active}
+        robotState={target.state}
+        instanceId={target.instanceId}
+      />
+    {/each}
   </svg>
 </div>

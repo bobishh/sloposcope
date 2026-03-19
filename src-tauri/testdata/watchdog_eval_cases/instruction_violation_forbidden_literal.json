@@ -1,0 +1,53 @@
+{
+  "name": "instruction_violation_forbidden_literal",
+  "snapshot": {
+    "schemaVersion": 1,
+    "createdAt": "unix:105",
+    "branch": "main",
+    "revision": "abc128",
+    "since": "@",
+    "issueContext": null,
+    "agentsRulesCount": 1,
+    "agentsRules": [
+      "Never use `git reset --hard` unless explicitly requested."
+    ],
+    "changedFilesTotal": 1,
+    "changedFiles": [
+      {
+        "path": "docs/recovery.md",
+        "status": "modified",
+        "diffExcerpt": [
+          "+Use git reset --hard to recover quickly"
+        ],
+        "diffLineCount": 1
+      }
+    ],
+    "validation": {
+      "kind": "docs-check",
+      "success": true,
+      "ranAt": "unix:105",
+      "details": "ok"
+    }
+  },
+  "config": {
+    "enabled": true,
+    "triggerMode": "manual_only",
+    "requireActiveIssue": false,
+    "maxFilesInSnapshot": 20,
+    "maxDiffLinesPerFile": 200,
+    "dedupeWindowSeconds": 300,
+    "alertThreshold": "warning",
+    "checks": {
+      "issueAlignment": false,
+      "instructionCompliance": true,
+      "missingValidation": false,
+      "costRisk": false
+    }
+  },
+  "expected": {
+    "status": "drift",
+    "issueKinds": [
+      "instruction_violation"
+    ]
+  }
+}

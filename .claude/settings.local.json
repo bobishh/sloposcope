@@ -1,0 +1,34 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cd:*)",
+      "Bash(cargo test:*)",
+      "Bash(printf:*)",
+      "Bash(cargo build:*)",
+      "Bash(REPO=/Users/bogdan/Workspace/personal/alcoholics_audacious/sloposcope\nprintf '%s\\\\n%s\\\\n%s\\\\n' \\\\\n  \"{\\\\\"jsonrpc\\\\\":\\\\\"2.0\\\\\",\\\\\"id\\\\\":1,\\\\\"method\\\\\":\\\\\"tools/call\\\\\",\\\\\"params\\\\\":{\\\\\"name\\\\\":\\\\\"watchdog_status\\\\\",\\\\\"arguments\\\\\":{\\\\\"repo_path\\\\\":\\\\\"$REPO\\\\\"}}}\" \\\\\n  \"{\\\\\"jsonrpc\\\\\":\\\\\"2.0\\\\\",\\\\\"id\\\\\":2,\\\\\"method\\\\\":\\\\\"tools/call\\\\\",\\\\\"params\\\\\":{\\\\\"name\\\\\":\\\\\"watchdog_run\\\\\",\\\\\"arguments\\\\\":{\\\\\"repo_path\\\\\":\\\\\"$REPO\\\\\"}}}\" \\\\\n  \"{\\\\\"jsonrpc\\\\\":\\\\\"2.0\\\\\",\\\\\"id\\\\\":3,\\\\\"method\\\\\":\\\\\"tools/call\\\\\",\\\\\"params\\\\\":{\\\\\"name\\\\\":\\\\\"detect_changes\\\\\",\\\\\"arguments\\\\\":{\\\\\"repo_path\\\\\":\\\\\"$REPO\\\\\"}}}\" \\\\\n  | cargo run --bin sloposcope-mcp 2>/dev/null | python3 -c \"\nimport sys, json\nfor line in sys.stdin:\n    d = json.loads\\(line\\)\n    content = d.get\\('result', {}\\).get\\('content', [{}]\\)[0].get\\('text', ''\\)\n    try:\n        obj = json.loads\\(content\\)\n        print\\(f\\\\\"id={d['id']}: {list\\(obj.keys\\(\\)\\)}\\\\\"\\)\n    except:\n        print\\(f\\\\\"id={d['id']}: {content[:120]}\\\\\"\\)\n\")",
+      "Bash(REPO=/Users/bogdan/Workspace/personal/alcoholics_audacious/sloposcope\necho \"{\\\\\"jsonrpc\\\\\":\\\\\"2.0\\\\\",\\\\\"id\\\\\":2,\\\\\"method\\\\\":\\\\\"tools/call\\\\\",\\\\\"params\\\\\":{\\\\\"name\\\\\":\\\\\"watchdog_run\\\\\",\\\\\"arguments\\\\\":{\\\\\"repo_path\\\\\":\\\\\"$REPO\\\\\"}}}\" \\\\\n  | cargo run --bin sloposcope-mcp 2>/dev/null | python3 -c \"\nimport sys, json\nfor line in sys.stdin:\n    d = json.loads\\(line\\)\n    content = d.get\\('result', {}\\).get\\('content', [{}]\\)[0].get\\('text', ''\\)\n    try:\n        obj = json.loads\\(content\\)\n        print\\(list\\(obj.keys\\(\\)\\)\\)\n        if 'verdict' in obj:\n            print\\('verdict:', obj['verdict']\\)\n    except:\n        print\\(content[:200]\\)\n\")",
+      "Bash(REPO=/Users/bogdan/Workspace/personal/alcoholics_audacious/sloposcope\necho \"{\\\\\"jsonrpc\\\\\":\\\\\"2.0\\\\\",\\\\\"id\\\\\":3,\\\\\"method\\\\\":\\\\\"tools/call\\\\\",\\\\\"params\\\\\":{\\\\\"name\\\\\":\\\\\"detect_changes\\\\\",\\\\\"arguments\\\\\":{\\\\\"repo_path\\\\\":\\\\\"$REPO\\\\\"}}}\" \\\\\n  | cargo run --bin sloposcope-mcp 2>/dev/null | python3 -c \"\nimport sys, json\nline = sys.stdin.readline\\(\\)\nd = json.loads\\(line\\)\ncontent = json.loads\\(d['result']['content'][0]['text']\\)\nprint\\('keys:', list\\(content.keys\\(\\)\\)\\)\nprint\\('changedFilesTotal:', content['changedFilesTotal']\\)\nprint\\('blastRadiusCount:', content['blastRadiusCount']\\)\n\")",
+      "mcp__ecky_mcp__workspace_overview",
+      "mcp__ecky_mcp__target_get",
+      "mcp__ecky_mcp__health_check",
+      "mcp__ecky_mcp__thread_get",
+      "mcp__ecky_mcp__target_meta_get",
+      "mcp__ecky_mcp__target_detail_get",
+      "Bash(cargo clippy:*)",
+      "Read(//private/tmp/**)",
+      "Bash(tree-sitter parse:*)",
+      "Bash(wc:*)",
+      "Read(//fn collect_repo_files/**)",
+      "Read(//fn parse_graph_fragment/**)",
+      "Read(//eyeloss-controls__loading|building graph/**)",
+      "Read(//let loading|let refreshing|let graphBuild/**)",
+      "Bash(npm run:*)",
+      "Bash(git checkout:*)",
+      "Bash(git reset:*)",
+      "Bash(git stash:*)",
+      "Bash(cargo check:*)",
+      "Bash(ls /Users/bogdan/Workspace/personal/alcoholics_audacious/sloposcope/*.md)",
+      "Bash(npx vite:*)"
+    ]
+  }
+}

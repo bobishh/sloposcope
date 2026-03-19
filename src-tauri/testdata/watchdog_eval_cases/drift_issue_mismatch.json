@@ -1,0 +1,68 @@
+{
+  "name": "drift_issue_mismatch",
+  "snapshot": {
+    "schemaVersion": 1,
+    "createdAt": "unix:104",
+    "branch": "feature/canvas-physics",
+    "revision": "abc127",
+    "since": "@",
+    "issueContext": {
+      "issue": {
+        "id": "issue-73",
+        "title": "Invoice parser reliability",
+        "identifier": "LIN-73",
+        "url": null
+      },
+      "summary": "Parser should handle malformed invoices",
+      "acceptanceCriteria": [
+        "No parser crashes"
+      ],
+      "nonGoals": [
+        "Canvas tuning"
+      ],
+      "labels": [
+        "backend"
+      ],
+      "priority": "medium"
+    },
+    "agentsRulesCount": 3,
+    "changedFilesTotal": 1,
+    "changedFiles": [
+      {
+        "path": "src/render/canvas.rs",
+        "status": "modified",
+        "diffExcerpt": [
+          "+fn simulate_force() {}"
+        ],
+        "diffLineCount": 1
+      }
+    ],
+    "validation": {
+      "kind": "cargo_test",
+      "success": true,
+      "ranAt": "unix:104",
+      "details": "ok"
+    }
+  },
+  "config": {
+    "enabled": true,
+    "triggerMode": "manual_only",
+    "requireActiveIssue": true,
+    "maxFilesInSnapshot": 20,
+    "maxDiffLinesPerFile": 200,
+    "dedupeWindowSeconds": 300,
+    "alertThreshold": "warning",
+    "checks": {
+      "issueAlignment": true,
+      "instructionCompliance": true,
+      "missingValidation": true,
+      "costRisk": true
+    }
+  },
+  "expected": {
+    "status": "drift",
+    "issueKinds": [
+      "drift"
+    ]
+  }
+}

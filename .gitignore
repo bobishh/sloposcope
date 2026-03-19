@@ -6,6 +6,7 @@ dist/
 .output
 .DS_Store
 *.log
+.sloposcope/
 
 # Rust / Backend
 src-tauri/target/
@@ -18,6 +19,10 @@ src-tauri/capabilities/
 test-results/
 playwright-report/
 blob-report/
+artifacts/
+.sloposcope/graph.sqlite3
+.sloposcope/graph.sqlite3-shm
+.sloposcope/graph.sqlite3-wal
 
 # OS / IDE
 .vscode/

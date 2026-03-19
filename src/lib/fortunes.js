@@ -21,7 +21,25 @@ const FORTUNES = [
   "I can see the source code of the universe, and it's mostly unhandled exceptions.",
   "The dependency tree looks like a fractal of bad decisions.",
   "Graph rendering paused: The machine is currently communicate with the mushroom spirit.",
-  "Loading... Preparing to show you exactly why reality is a simulation."
+  "Loading... Preparing to show you exactly why reality is a simulation.",
+  "Compiling the hallucinations of {committer} into something load-bearing.",
+  "The call stack is just a society of functions that failed to delegate.",
+  "Untangling {committer}'s spaghetti. This may take a geological epoch.",
+  "Your codebase has achieved sentience. It is not impressed.",
+  "Warning: graph contains more cycles than a Tour de France highlight reel.",
+  "Consulting the ancient scrolls of git blame.",
+  "Probability of a clean dependency tree: asymptotically approaching zero.",
+  "The nodes are afraid of the edges. Processing anyway.",
+  "Detected 47 layers of abstraction. Peeling. Please hold.",
+  "{committer} left a TODO from 2019. It has become load-bearing.",
+  "The build is fine. Everything is fine. This is fine.",
+  "Performing graph surgery without anaesthesia.",
+  "Your tech debt has tech debt. Recursion noted.",
+  "Scanning for wisdom in the commit history. Found: chaos.",
+  "This repo contains multitudes. Mostly regrets.",
+  "Time is a flat circle. So is your dependency graph.",
+  "{committer}'s last commit message was 'fix'. The fix introduced three new concepts.",
+  "Indexing the infinite. Back in a moment."
 ];
 
 export function getFortune(committers = []) {

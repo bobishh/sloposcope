@@ -1,7 +1,7 @@
+use ignore::WalkBuilder;
 use serde::Serialize;
 use std::collections::HashSet;
 use std::path::Path;
-use walkdir::WalkDir;
 
 /// A node is a named unit of code — a module, a component, a file.
 /// What counts as a "node" is up to the language parser.
@@ -86,30 +86,33 @@ impl Graph {
     }
 }
 
-/// Fingerprint: the newest mtime across all files in the repo (ignoring .git, _build, etc).
+/// Fingerprint: the newest mtime across tracked source files in the repo.
+/// Uses gitignore rules so build artifacts and vendored code are excluded.
 pub fn source_fingerprint(repo: &Path) -> u64 {
     let mut newest: u64 = 0;
-    for entry in WalkDir::new(repo)
-        .into_iter()
-        .filter_entry(|e| {
-            let name = e.file_name().to_str().unwrap_or("");
-            name != ".git"
-                && name != "_build"
-                && name != "deps"
-                && name != "node_modules"
-                && name != "target"
-        })
-        .filter_map(|e| e.ok())
-    {
-        if entry.file_type().is_file() {
-            if let Ok(meta) = entry.metadata() {
-                if let Ok(modified) = meta.modified() {
-                    let secs = modified
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs();
-                    newest = newest.max(secs);
-                }
+    let mut builder = WalkBuilder::new(repo);
+    builder.hidden(false);
+    builder.git_ignore(true);
+    builder.git_exclude(true);
+    builder.git_global(true);
+    for entry in builder.build().filter_map(|e| e.ok()) {
+        if !entry.file_type().is_some_and(|t| t.is_file()) {
+            continue;
+        }
+        let name = entry.file_name().to_str().unwrap_or("");
+        if matches!(
+            name,
+            ".git" | "_build" | "deps" | "node_modules" | "target" | ".sloposcope"
+        ) {
+            continue;
+        }
+        if let Ok(meta) = entry.metadata() {
+            if let Ok(modified) = meta.modified() {
+                let secs = modified
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                newest = newest.max(secs);
             }
         }
     }
@@ -119,100 +122,52 @@ pub fn source_fingerprint(repo: &Path) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
 
     #[test]
-    fn test_filter_to_changes_empty() {
-        let mut g = Graph::new();
-        g.add_nodes(vec![Node {
-            id: "Foo".into(),
-            label: "Foo".into(),
-            kind: "module".into(),
-            file: "lib/foo.ex".into(),
-            line_count: 10,
-            change_status: "unchanged".into(),
-            functions: vec![],
-        }]);
-
-        let changed = HashMap::new();
-        g.filter_to_changes(&changed, false);
-
-        assert_eq!(g.nodes.len(), 0);
-    }
-
-    #[test]
-    fn test_filter_to_changes_fallback() {
-        let mut g = Graph::new();
-        let mut changed = HashMap::new();
-        changed.insert("config/env.exs".into(), "modified".into());
-
-        g.filter_to_changes(&changed, false);
-
-        assert_eq!(g.nodes.len(), 1);
-        assert_eq!(g.nodes[0].id, "config/env.exs");
-        assert_eq!(g.nodes[0].label, "config/env.exs");
-        assert_eq!(g.nodes[0].kind, "file");
-    }
-}
-
-impl Graph {
-    /// Keep nodes whose file appears in the changed set, and optionally their
-    /// immediate neighbors.
-    /// Mark each with its change status (added / modified / deleted).
-    pub fn filter_to_changes(
-        &mut self,
-        changed: &std::collections::HashMap<String, String>,
-        include_neighbors: bool,
-    ) {
-        let mut parsed_files = HashSet::new();
-        let mut changed_node_ids = HashSet::new();
-
-        // 1. Mark status on existing nodes and identify "root" changed nodes
-        for node in &mut self.nodes {
-            if let Some(status) = changed.get(&node.file) {
-                node.change_status = status.clone();
-                changed_node_ids.insert(node.id.clone());
-                parsed_files.insert(node.file.clone());
-            } else {
-                node.change_status = "neighbor".into();
-            }
-        }
-
-        // 2. Identify neighbors (one level deep)
-        let mut neighbor_ids = HashSet::new();
-        if include_neighbors {
-            for edge in &self.edges {
-                if changed_node_ids.contains(&edge.source) {
-                    neighbor_ids.insert(edge.target.clone());
-                } else if changed_node_ids.contains(&edge.target) {
-                    neighbor_ids.insert(edge.source.clone());
-                }
-            }
-        }
-
-        // 3. Keep only changed nodes (+ neighbors if enabled)
-        self.nodes.retain(|n| {
-            changed_node_ids.contains(&n.id) || (include_neighbors && neighbor_ids.contains(&n.id))
-        });
-
-        // 4. For any changed file that was NOT handled by a parser, add a generic node.
-        for (file, status) in changed {
-            if !parsed_files.contains(file) && status != "deleted" {
-                self.nodes.push(Node {
-                    id: file.clone(),
-                    label: file.clone(),
+    fn finalize_removes_unknown_and_duplicate_edges() {
+        let mut graph = Graph {
+            nodes: vec![
+                Node {
+                    id: "src/App.svelte".into(),
+                    label: "App.svelte".into(),
                     kind: "file".into(),
-                    file: file.clone(),
-                    line_count: 0,
-                    change_status: status.clone(),
+                    file: "src/App.svelte".into(),
+                    line_count: 10,
+                    change_status: "unchanged".into(),
                     functions: vec![],
-                });
-            }
-        }
+                },
+                Node {
+                    id: "src/lib/backendBridge.js".into(),
+                    label: "backendBridge.js".into(),
+                    kind: "file".into(),
+                    file: "src/lib/backendBridge.js".into(),
+                    line_count: 10,
+                    change_status: "unchanged".into(),
+                    functions: vec![],
+                },
+            ],
+            edges: vec![
+                Edge {
+                    source: "src/App.svelte".into(),
+                    target: "src/lib/backendBridge.js".into(),
+                    kind: "import".into(),
+                },
+                Edge {
+                    source: "src/App.svelte".into(),
+                    target: "src/lib/backendBridge.js".into(),
+                    kind: "import".into(),
+                },
+                Edge {
+                    source: "src/App.svelte".into(),
+                    target: "missing".into(),
+                    kind: "import".into(),
+                },
+            ],
+        };
 
-        let remaining: HashSet<&str> = self.nodes.iter().map(|n| n.id.as_str()).collect();
-        self.edges.retain(|e| {
-            remaining.contains(e.source.as_str()) && remaining.contains(e.target.as_str())
-        });
+        graph.finalize();
+
+        assert_eq!(graph.edges.len(), 1);
+        assert_eq!(graph.edges[0].target, "src/lib/backendBridge.js");
     }
 }

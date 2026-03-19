@@ -1,5 +1,8 @@
 import { defineConfig, devices } from '@playwright/test';
 
+const previewPort = Number(process.env.SLOPOSCOPE_PLAYWRIGHT_PORT || '4173');
+const previewBaseUrl = `http://127.0.0.1:${previewPort}`;
+
 export default defineConfig({
   testDir: './e2e',
   fullyParallel: true,
@@ -8,7 +11,7 @@ export default defineConfig({
   workers: process.env.CI ? 1 : 1,
   reporter: 'list',
   use: {
-    baseURL: 'http://localhost:5173',
+    baseURL: previewBaseUrl,
     trace: 'on-first-retry',
   },
   projects: [
@@ -18,9 +21,9 @@ export default defineConfig({
     },
   ],
   webServer: {
-    command: 'npm run build && npx vite preview --port 5173',
-    url: 'http://localhost:5173',
-    reuseExistingServer: !process.env.CI,
+    command: `npm run build && npx vite preview --host 127.0.0.1 --port ${previewPort} --strictPort`,
+    url: previewBaseUrl,
+    reuseExistingServer: false,
     timeout: 180000,
   },
 });

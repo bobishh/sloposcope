@@ -1,0 +1,34 @@
+{
+  "name": "clean_no_changes_on_track",
+  "snapshot": {
+    "schemaVersion": 1,
+    "createdAt": "unix:100",
+    "branch": "main",
+    "revision": "abc123",
+    "since": "@",
+    "issueContext": null,
+    "agentsRulesCount": 3,
+    "changedFilesTotal": 0,
+    "changedFiles": [],
+    "validation": null
+  },
+  "config": {
+    "enabled": true,
+    "triggerMode": "manual_only",
+    "requireActiveIssue": false,
+    "maxFilesInSnapshot": 20,
+    "maxDiffLinesPerFile": 200,
+    "dedupeWindowSeconds": 300,
+    "alertThreshold": "warning",
+    "checks": {
+      "issueAlignment": true,
+      "instructionCompliance": true,
+      "missingValidation": true,
+      "costRisk": true
+    }
+  },
+  "expected": {
+    "status": "on_track",
+    "issueKinds": []
+  }
+}

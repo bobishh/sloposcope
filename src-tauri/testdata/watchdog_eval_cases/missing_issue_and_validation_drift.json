@@ -1,0 +1,46 @@
+{
+  "name": "missing_issue_and_validation_drift",
+  "snapshot": {
+    "schemaVersion": 1,
+    "createdAt": "unix:101",
+    "branch": "main",
+    "revision": "abc124",
+    "since": "@",
+    "issueContext": null,
+    "agentsRulesCount": 2,
+    "changedFilesTotal": 1,
+    "changedFiles": [
+      {
+        "path": "src/app.rs",
+        "status": "modified",
+        "diffExcerpt": [
+          "+fn process_order() {}"
+        ],
+        "diffLineCount": 1
+      }
+    ],
+    "validation": null
+  },
+  "config": {
+    "enabled": true,
+    "triggerMode": "manual_only",
+    "requireActiveIssue": true,
+    "maxFilesInSnapshot": 20,
+    "maxDiffLinesPerFile": 200,
+    "dedupeWindowSeconds": 300,
+    "alertThreshold": "warning",
+    "checks": {
+      "issueAlignment": true,
+      "instructionCompliance": true,
+      "missingValidation": true,
+      "costRisk": true
+    }
+  },
+  "expected": {
+    "status": "drift",
+    "issueKinds": [
+      "missing_validation",
+      "unclear_mapping"
+    ]
+  }
+}
