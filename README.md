@@ -4,6 +4,10 @@
 
 Sloposcope is a local desktop codebase visualizer (Tauri + Svelte + Rust) for exploring file/module relationships, commit history, and live file activity.
 
+## Product Specifications
+
+- [Bug visualization](docs/bug-visualization-spec.md): shared metric-driven anatomy, single-snapshot map glyphs, and on-demand Before/After inspection. Defines target behavior and extraction/rendering prerequisites, not implementation completeness.
+
 ## What It Does
 
 - Renders a force-directed map of parsed files/modules and call/import relations.
