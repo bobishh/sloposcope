@@ -1,10 +1,15 @@
 import { test, expect } from '@playwright/test';
 
+async function openAdvancedOperations(page) {
+  await page.locator('.eyeloss-controls__view-btn').click();
+  await page.getByLabel('Developer mode').check();
+  return page.getByRole('tablist', { name: 'Advanced operation sections' });
+}
+
 test('should quick-start PI on NIM and use it as a code-writing horse', async ({ page }) => {
   await page.goto('/');
-  await page.locator('.eyeloss-controls__view-btn').click();
 
-  const missionTabs = page.getByRole('tablist', { name: 'Mission sections' });
+  const missionTabs = await openAdvancedOperations(page);
   await missionTabs.getByRole('button', { name: 'Mission', exact: true }).click();
   const mission = page.locator('.eyeloss-mission-panel');
   await mission.getByLabel('Title').fill('PI horse mission');

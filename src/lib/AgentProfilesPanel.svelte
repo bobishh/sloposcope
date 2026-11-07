@@ -14,6 +14,7 @@
     profileCapabilities = $bindable(''),
     profileTransportKind = $bindable('pty'),
     profileActive = $bindable(false),
+    profileIsReviewer = $bindable(false),
     profileEnvError = '',
     profileProviderHint = {
       title: 'Shell env first',
@@ -39,6 +40,10 @@
 
   function transportLabel(profile) {
     return profile?.transportKind || profile?.transport_kind || 'pty';
+  }
+
+  function isReviewerProfile(profile) {
+    return Boolean(profile?.isReviewer ?? profile?.is_reviewer);
   }
 
   function profileEnv(profile) {
@@ -91,6 +96,7 @@
       <button type="button" class="btn" onclick={() => onApplyTemplate?.('codex')}>Codex</button>
       <button type="button" class="btn" onclick={() => onApplyTemplate?.('claude')}>Claude</button>
       <button type="button" class="btn" onclick={() => onApplyTemplate?.('local')}>Local</button>
+      <button type="button" class="btn" onclick={() => onApplyTemplate?.('local_live')}>Live Local</button>
     </div>
     <div class="eyeloss-control-card__hint">Templates fill sane defaults. Save after edit if needed.</div>
   </div>
@@ -149,6 +155,10 @@
         <span>Active profile</span>
         <input type="checkbox" bind:checked={profileActive} />
       </label>
+      <label class="eyeloss-control-field eyeloss-control-field--checkbox">
+        <span>Reviewer role</span>
+        <input type="checkbox" bind:checked={profileIsReviewer} />
+      </label>
     </div>
 
     <div class="eyeloss-control-actions">
@@ -173,6 +183,9 @@
             <div class="eyeloss-mission__item-title">{profile.label}</div>
             {#if profile.active}
               <div class="eyeloss-mission__item-meta">active</div>
+            {/if}
+            {#if isReviewerProfile(profile)}
+              <div class="eyeloss-mission__item-meta">reviewer</div>
             {/if}
             <div class="eyeloss-control-card__hint">
               provider: {profile.provider}{#if profile.model} | model: {profile.model}{/if}{#if profile.command} | command: {profile.command}{/if}

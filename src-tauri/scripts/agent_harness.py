@@ -88,7 +88,22 @@ class JsonRpcClient:
                 pass
 
 
-def _run_with_pty(argv, cwd, env, prompt_text):
+def _drain_nudges(nudge_path, offset):
+    if not nudge_path:
+      return offset, []
+    path = Path(nudge_path)
+    if not path.is_file():
+      return offset, []
+    try:
+      with path.open("r", encoding="utf-8") as handle:
+        handle.seek(offset)
+        lines = [line.rstrip("\n") for line in handle.readlines()]
+        return handle.tell(), [line for line in lines if line.strip()]
+    except OSError:
+      return offset, []
+
+
+def _run_with_pty(argv, cwd, env, prompt_text, nudge_path):
     master_fd, slave_fd = pty.openpty()
     proc = subprocess.Popen(
         argv,
@@ -109,7 +124,16 @@ def _run_with_pty(argv, cwd, env, prompt_text):
             pass
 
     chunks = []
+    nudge_offset = 0
     while True:
+        nudge_offset, nudges = _drain_nudges(nudge_path, nudge_offset)
+        for nudge in nudges:
+            try:
+                os.write(master_fd, nudge.encode("utf-8"))
+                if not nudge.endswith("\n"):
+                    os.write(master_fd, b"\n")
+            except OSError:
+                pass
         ready, _, _ = select.select([master_fd], [], [], 0.1)
         if master_fd in ready:
             try:
@@ -214,6 +238,7 @@ def main():
     bundle_dir = os.environ.get("SLOPOSCOPE_AGENT_BUNDLE_DIR", "").strip()
     context_path = os.environ.get("SLOPOSCOPE_AGENT_CONTEXT_PATH", "").strip()
     prompt_path = os.environ.get("SLOPOSCOPE_AGENT_PROMPT_PATH", "").strip()
+    nudge_path = os.environ.get("SLOPOSCOPE_AGENT_NUDGE_PATH", "").strip()
     prompt_text = ""
     if prompt_path and Path(prompt_path).is_file():
         prompt_text = Path(prompt_path).read_text(encoding="utf-8")
@@ -296,15 +321,20 @@ def main():
             mcp_error = str(err)
             mcp_client = None
 
-    exit_code = 0
+    exit_code = 1
     stdout_text = ""
     stderr_text = ""
     combined_output = ""
+    execution_error = None
     try:
         if transport_kind == "pty":
-            exit_code, combined_output = _run_with_pty(argv, cwd, target_env, prompt_text)
+            exit_code, combined_output = _run_with_pty(argv, cwd, target_env, prompt_text, nudge_path)
         else:
             exit_code, stdout_text, stderr_text = _run_with_pipes(argv, cwd, target_env, prompt_text)
+    except Exception as err:
+        execution_error = str(err)
+        stderr_text = (stderr_text + ("\n" if stderr_text else "") + execution_error).strip()
+        combined_output = (combined_output + ("\n" if combined_output else "") + execution_error).strip()
     finally:
         touched_paths = _git_touched_paths(cwd)
         patch_text = _git_patch(cwd)
@@ -384,6 +414,7 @@ def main():
         "bundleDir": bundle_dir,
         "contextPath": context_path,
         "promptPath": prompt_path,
+        "nudgePath": nudge_path,
         "exitCode": exit_code,
         "stdout": stdout_text,
         "stderr": stderr_text,
@@ -394,6 +425,7 @@ def main():
         "mcpCommand": mcp_command,
         "mcpError": mcp_error,
         "mcpAvailable": mcp_error is None and bool(mcp_command),
+        "executionError": execution_error,
     }
     if diagnostics_path:
         Path(diagnostics_path).parent.mkdir(parents=True, exist_ok=True)

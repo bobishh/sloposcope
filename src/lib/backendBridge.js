@@ -2,8 +2,31 @@ function cloneJson(value) {
   return value == null ? value : JSON.parse(JSON.stringify(value));
 }
 
+function fallbackMockAnatomy(file) {
+  if (file === 'mock.ex') {
+    return {
+      status: 'partial', file, language: 'ex', evidence: 'tree_sitter',
+      profileId: 'elixir:callable-anatomy-v1',
+      callables: [
+        { id: 'mock:hello', matchKey: 'MockModule::def::hello', owner: 'MockModule', name: 'hello', kind: 'def', visibility: 'public', arity: null, startLine: null, endLine: null, bodyLineSpan: null, decisionCount: null },
+        { id: 'mock:secret', matchKey: 'MockModule::defp::secret', owner: 'MockModule', name: 'secret', kind: 'defp', visibility: 'private', arity: null, startLine: null, endLine: null, bodyLineSpan: null, decisionCount: null },
+      ],
+      stateSlots: null,
+      reason: 'Mock capture lacks measurable body facts',
+    };
+  }
+  return {
+    status: 'unavailable', file, language: file.split('.').pop() || 'unknown',
+    profileId: `${file.split('.').pop() || 'unknown'}:unavailable`,
+    evidence: 'tree_sitter', callables: [], stateSlots: null,
+    reason: 'no Tree-sitter anatomy profile for this extension',
+  };
+}
+
 const MOCK_CURRENT_REPO_PATH_KEY = 'sloposcope.mockCurrentRepoPath';
 const MOCK_MISSION_STATE_BY_REPO_KEY = 'sloposcope.mockMissionStateByRepo';
+const MOCK_COORDINATOR_STATE_BY_REPO_KEY = 'sloposcope.mockCoordinatorStateByRepo';
+const COORDINATOR_NAME = 'Coordinator';
 
 function canUseLocalStorage() {
   return typeof window !== 'undefined' && typeof window.localStorage !== 'undefined';
@@ -29,7 +52,7 @@ function writeMockStorage(key, value) {
   }
 }
 
-function createMockGraph() {
+function createMockGraph(projectedNodes = []) {
   return {
     nodes: [
       {
@@ -48,15 +71,20 @@ function createMockGraph() {
         change_status: 'modified',
         functions: [],
       },
+      ...projectedNodes,
     ],
     edges: [{ source: 'MockHelper', target: 'MockModule', type: 'call' }],
   };
 }
 
-function createMockGraphView(request = {}) {
+function createMockGraphView(request = {}, projectedNodes = []) {
   const mode = String(request?.mode || 'investigation');
   const seed = request?.seed || { kind: 'working_copy' };
-  const graph = createMockGraph();
+  const graph = createMockGraph(projectedNodes);
+  const projectedProvenance = projectedNodes.map((node) => ({
+    nodeId: node.id,
+    reason: `pending graph rebuild · worker ${node.worker_session_id || 'unknown'}`,
+  }));
   return {
     graph,
     mode,
@@ -68,9 +96,10 @@ function createMockGraphView(request = {}) {
         ? [
             { nodeId: 'MockHelper', reason: 'changed file' },
             { nodeId: 'MockModule', reason: '1-hop dependency' },
+            ...projectedProvenance,
           ]
         : [],
-    canonicalEntityCount: 2,
+    canonicalEntityCount: graph.nodes.length,
     canonicalEdgeCount: 1,
     clusteringMode: 'heuristic',
     clusterAssignments: [],
@@ -122,6 +151,57 @@ function createDefaultMissionState() {
   };
 }
 
+function createDefaultCoordinatorState() {
+  return {
+    threadId: '',
+    missionId: '',
+    personaName: COORDINATOR_NAME,
+    title: 'Unscoped mission',
+    state: 'wake',
+    draftMission: {
+      title: '',
+      brief: '',
+      validationCommand: '',
+      issueKey: '',
+      issueUrl: '',
+      plannerProfileId: '',
+      plannerNotes: '',
+      plannerPromptOverride: '',
+    },
+    pendingPlan: [],
+    messages: [],
+    summary: 'Coordinator waiting on mission brief.',
+    latestSessionId: null,
+    latestLiveSessionId: null,
+    threads: [],
+    threadSnapshots: {},
+    canApprovePlan: false,
+    canAskReport: false,
+    canLaunchWorkers: false,
+  };
+}
+
+function createCoordinatorMessage(role, kind, content, payload = null) {
+  return {
+    id: `coord-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    role,
+    kind,
+    content,
+    payload,
+    createdAt: new Date().toISOString(),
+  };
+}
+
+function summarizeCoordinatorThread(state) {
+  return {
+    id: state.threadId || `coordinator-${Date.now()}`,
+    missionId: state.missionId || '',
+    title: state.title || 'Unscoped mission',
+    state: state.state || 'wake',
+    updatedAt: new Date().toISOString(),
+  };
+}
+
 function latestMissionSession(state) {
   const sessions = Array.isArray(state?.sessions) ? state.sessions : [];
   return sessions.length > 0 ? sessions[sessions.length - 1] : null;
@@ -148,6 +228,111 @@ function deriveMissionId(input = {}, fallbackId = '') {
   const title = String(input?.title || '').trim().toLowerCase();
   const slug = title.replaceAll(/[^a-z0-9]+/g, '-').replaceAll(/^-+|-+$/g, '');
   return slug || fallbackId || 'mission';
+}
+
+function deriveProblemTitle(problem = '') {
+  const firstLine = String(problem || '')
+    .split('\n')
+    .map((line) => line.trim())
+    .find(Boolean) || 'Unscoped mission';
+  const compact = firstLine.replace(/[.!?]+$/g, '').trim();
+  const title = compact.split(/\s+/).slice(0, 7).join(' ').trim();
+  return title || 'Unscoped mission';
+}
+
+function extractValidationCommand(input = '') {
+  const trimmed = String(input || '').trim();
+  if (!trimmed) return '';
+  const lower = trimmed.toLowerCase();
+  const prefixes = ['validation command:', 'validation:', 'command:', 'run:'];
+  for (const prefix of prefixes) {
+    const index = lower.indexOf(prefix);
+    if (index >= 0) {
+      return trimmed.slice(index + prefix.length).trim().replace(/^`|`$/g, '');
+    }
+  }
+  for (const marker of ['npm ', 'pnpm ', 'yarn ', 'bun ', 'cargo ', 'mix ', 'pytest ', 'uv ', './']) {
+    const index = lower.indexOf(marker);
+    if (index >= 0) {
+      return trimmed
+        .slice(index)
+        .trim()
+        .replace(/^`|`$/g, '')
+        .replace(/[.!?;]+$/g, '')
+        .trim();
+    }
+  }
+  return trimmed
+    .split('\n')
+    .map((line) => line.trim().replace(/^`|`$/g, ''))
+    .find((line) => /^(npm|pnpm|yarn|bun|cargo|mix|pytest|uv|\.\/*)/i.test(line))
+    || '';
+}
+
+function messageWantsReport(input = '') {
+  const lower = String(input || '').toLowerCase();
+  return lower.includes('report') || lower.includes('status') || lower.includes('progress');
+}
+
+function messageIsValidationOnly(input = '') {
+  const text = String(input || '').trim();
+  const lower = text.toLowerCase();
+  return Boolean(extractValidationCommand(text))
+    && (
+      lower.includes('validation command')
+      || lower.startsWith('validation:')
+      || lower.startsWith('command:')
+      || lower.startsWith('run:')
+      || lower.startsWith('use ')
+    );
+}
+
+function missionSessionLiveliness(session = {}) {
+  const runtime = String(session?.runtimeStatus || session?.state || '').toLowerCase();
+  if (runtime === 'running' || runtime === 'claimed' || runtime === 'idle') return 'live';
+  return 'closed';
+}
+
+function buildCoordinatorPlanMessage(state) {
+  const objectives = Array.isArray(state?.pendingPlan) ? state.pendingPlan : [];
+  const lines = [`Plan proposal. ${objectives.length} objective(s).`];
+  for (const objective of objectives) {
+    const scope = Array.isArray(objective?.scopePaths) && objective.scopePaths.length
+      ? objective.scopePaths.join(', ')
+      : 'inferred';
+    lines.push(`- ${objective?.title || objective?.id} (scope: ${scope})`);
+  }
+  lines.push('Approve plan when ready.');
+  return lines.join('\n');
+}
+
+function buildMissionReport(state = {}) {
+  const total = Array.isArray(state?.objectives) ? state.objectives.length : 0;
+  const done = (state?.objectives || []).filter((entry) => entry?.state === 'done').length;
+  const pending = (state?.objectives || []).filter((entry) => entry?.state !== 'done').length;
+  const liveSessions = (state?.sessions || []).filter((entry) => missionSessionLiveliness(entry) === 'live');
+  const latestVerification = (state?.verifications || []).slice(-1)[0];
+  const latestEvent = (state?.eventLedger || []).slice(-1)[0];
+  const latestLive = liveSessions.slice(-1)[0];
+  const lines = [
+    `Mission report. ${state?.title || 'Untitled mission'}.`,
+    `Objectives: ${total} total, ${pending} pending, ${done} done.`,
+    `Live sessions: ${liveSessions.length}.`,
+  ];
+  if (latestLive?.sessionId) {
+    lines.push(`Latest live session: ${latestLive.sessionId} [${latestLive.runtimeStatus || latestLive.state || 'running'}].`);
+  }
+  if (latestVerification?.summary) lines.push(`Latest verification: ${latestVerification.summary}.`);
+  if (latestEvent?.summary) lines.push(`Latest event: ${latestEvent.summary}.`);
+  return lines.join(' ');
+}
+
+function buildWakeMessage(repoPath, missionState, coordinatorState) {
+  const repoLabel = String(repoPath || '/path/to/despair').split('/').filter(Boolean).at(-1) || 'repo';
+  if (missionState?.missionId && missionState?.status && missionState.status !== 'idle') {
+    return `${COORDINATOR_NAME}. Repo ${repoLabel} warm. Resuming mission '${missionState.title || coordinatorState?.title || 'untitled'}' in state ${missionState.status}. ${(missionState.objectives || []).length} objectives, ${(missionState.sessions || []).length} sessions. What problem or feature now?`;
+  }
+  return `${COORDINATOR_NAME}. Repo ${repoLabel} warm. No active mission locked. What problem or feature now? Validation can come later.`;
 }
 
 function missionSummaryFromInput(input = {}) {
@@ -313,6 +498,246 @@ function createMissionEvent(kind, summary, payload = null) {
   };
 }
 
+function lifecyclePayloadWithBase(payload = {}, objectiveId = null, sessionId = null) {
+  const next = payload && typeof payload === 'object' && !Array.isArray(payload)
+    ? { ...payload }
+    : { value: payload };
+  if (objectiveId && !next.objectiveId) next.objectiveId = objectiveId;
+  if (sessionId && !next.sessionId) next.sessionId = sessionId;
+  return next;
+}
+
+function mockLifecycleSortKey(value = '') {
+  const text = String(value || '');
+  const unixMatch = text.match(/^unix:(\d+)$/);
+  if (unixMatch) return [0, Number(unixMatch[1]), text];
+  const parsed = Date.parse(text);
+  if (Number.isFinite(parsed)) return [1, parsed, text];
+  return [2, 0, text];
+}
+
+function sortMockLifecycleEvents(events = []) {
+  return [...events].sort((left, right) => {
+    const leftKey = mockLifecycleSortKey(left?.occurredAt);
+    const rightKey = mockLifecycleSortKey(right?.occurredAt);
+    for (let index = 0; index < leftKey.length; index += 1) {
+      if (leftKey[index] < rightKey[index]) return -1;
+      if (leftKey[index] > rightKey[index]) return 1;
+    }
+    return String(left?.id || '').localeCompare(String(right?.id || ''));
+  });
+}
+
+function createMockLifecycleEvent({
+  id,
+  taskId,
+  threadId,
+  type,
+  actor,
+  source,
+  correlation,
+  causation = null,
+  occurredAt,
+  payload = {},
+  objectiveId = null,
+  sessionId = null,
+}) {
+  return {
+    id,
+    taskId,
+    threadId,
+    type,
+    actor,
+    source,
+    correlation,
+    causation,
+    occurredAt,
+    payload: lifecyclePayloadWithBase(payload, objectiveId, sessionId),
+  };
+}
+
+function coordinatorMessageLifecycleType(message = {}) {
+  const role = String(message?.role || '');
+  const kind = String(message?.kind || '');
+  const content = String(message?.content || '').toLowerCase();
+  if (role === 'user' && kind === 'prompt') return 'task.created';
+  if (kind === 'plan') return 'plan.proposed';
+  if (kind === 'report') return 'coordinator.reported';
+  if (kind === 'status' && (content.startsWith('plan approved') || message?.payload?.missionId)) return 'plan.approved';
+  if (kind === 'status' && content.startsWith('workers launched')) return 'workers.launched';
+  return null;
+}
+
+function verificationFailed(verification = {}) {
+  const validation = verification?.validation;
+  const validationFailed =
+    validation && typeof validation === 'object' && validation.success === false;
+  return String(verification?.status || '').toLowerCase() === 'failed' || validationFailed;
+}
+
+function projectMockTaskLifecycleEvents({ taskId = '', threadId = '', messages = [], missionState = {} } = {}) {
+  const normalizedTaskId = String(taskId || missionState?.missionId || threadId || 'task');
+  const normalizedThreadId = String(threadId || normalizedTaskId);
+  const events = [];
+
+  for (const message of Array.isArray(messages) ? messages : []) {
+    const type = coordinatorMessageLifecycleType(message);
+    if (!type) continue;
+    events.push(createMockLifecycleEvent({
+      id: `coordinator-message-${message.id}`,
+      taskId: String(message?.payload?.missionId || missionState?.missionId || normalizedTaskId),
+      threadId: normalizedThreadId,
+      type,
+      actor: String(message?.role || 'coordinator'),
+      source: 'coordinator_message',
+      correlation: normalizedThreadId,
+      occurredAt: message?.createdAt || new Date().toISOString(),
+      payload: {
+        messageId: message?.id || '',
+        kind: message?.kind || '',
+        content: message?.content || '',
+        payload: cloneJson(message?.payload || null),
+      },
+      objectiveId: message?.payload?.objectiveId || null,
+      sessionId: message?.payload?.sessionId || null,
+    }));
+  }
+
+  for (const session of Array.isArray(missionState?.sessions) ? missionState.sessions : []) {
+    const sessionId = String(session?.sessionId || '');
+    if (!sessionId) continue;
+    events.push(createMockLifecycleEvent({
+      id: `session-${sessionId}-started`,
+      taskId: String(missionState?.missionId || normalizedTaskId),
+      threadId: normalizedThreadId,
+      type: 'worker.started',
+      actor: String(session?.profileId || 'worker'),
+      source: 'agent_session',
+      correlation: String(missionState?.missionId || normalizedTaskId),
+      occurredAt: session?.startedAt || session?.createdAt || session?.updatedAt || new Date().toISOString(),
+      payload: {
+        profileId: session?.profileId || '',
+        state: session?.state || '',
+        workspacePath: session?.workspacePath || '',
+        touchedPaths: cloneJson(session?.touchedPaths || []),
+      },
+      objectiveId: session?.objectiveId || null,
+      sessionId,
+    }));
+    const runtimeStatus = String(session?.runtimeStatus || session?.state || '').toLowerCase();
+    if (runtimeStatus === 'stuck' || String(session?.lastError || '').toLowerCase().includes('stale')) {
+      events.push(createMockLifecycleEvent({
+        id: `session-${sessionId}-stale`,
+        taskId: String(missionState?.missionId || normalizedTaskId),
+        threadId: normalizedThreadId,
+        type: 'session.stale',
+        actor: 'scheduler',
+        source: 'agent_session',
+        correlation: String(missionState?.missionId || normalizedTaskId),
+        causation: `session-${sessionId}-started`,
+        occurredAt: session?.lastEventAt || session?.updatedAt || new Date().toISOString(),
+        payload: {
+          runtimeStatus,
+          leaseExpired: Boolean(session?.leaseExpired),
+          lastError: session?.lastError || '',
+        },
+        objectiveId: session?.objectiveId || null,
+        sessionId,
+      }));
+    }
+  }
+
+  for (const verification of Array.isArray(missionState?.verifications) ? missionState.verifications : []) {
+    if (!verificationFailed(verification)) continue;
+    const verificationId = String(verification?.verificationId || verification?.id || '');
+    const sessionId = verification?.sessionId || null;
+    events.push(createMockLifecycleEvent({
+      id: verificationId || `verification-${events.length + 1}`,
+      taskId: String(missionState?.missionId || normalizedTaskId),
+      threadId: normalizedThreadId,
+      type: 'verification.failed',
+      actor: 'verifier',
+      source: 'verification',
+      correlation: String(missionState?.missionId || normalizedTaskId),
+      causation: sessionId ? `session-${sessionId}-started` : null,
+      occurredAt: verification?.checkedAt || verification?.createdAt || verification?.updatedAt || new Date().toISOString(),
+      payload: {
+        verificationId,
+        status: verification?.status || '',
+        summary: verification?.summary || '',
+        details: cloneJson(verification?.details || verification?.validation || {}),
+      },
+      objectiveId: verification?.objectiveId || null,
+      sessionId,
+    }));
+    if (verification?.retryScheduled || verification?.retryAt || verification?.details?.retryAt) {
+      events.push(createMockLifecycleEvent({
+        id: `${verificationId || `verification-${events.length + 1}`}-retry`,
+        taskId: String(missionState?.missionId || normalizedTaskId),
+        threadId: normalizedThreadId,
+        type: 'task.retry_scheduled',
+        actor: 'scheduler',
+        source: 'verification',
+        correlation: String(missionState?.missionId || normalizedTaskId),
+        causation: verificationId || null,
+        occurredAt: verification?.updatedAt || verification?.checkedAt || new Date().toISOString(),
+        payload: {
+          verificationId,
+          retryAt: verification?.retryAt || verification?.details?.retryAt || null,
+        },
+        objectiveId: verification?.objectiveId || null,
+        sessionId,
+      }));
+    }
+  }
+
+  const sessionsById = new Map(
+    (Array.isArray(missionState?.sessions) ? missionState.sessions : [])
+      .map((session) => [session?.sessionId, session])
+      .filter(([sessionId]) => sessionId),
+  );
+  const ledger = Array.isArray(missionState?.eventLedger) ? missionState.eventLedger : [];
+  ledger.forEach((entry, index) => {
+    const kind = String(entry?.kind || '');
+    const type =
+      kind === 'accept'
+        ? 'review.accepted'
+        : kind === 'reject'
+          ? 'review.rejected'
+          : kind === 'apply'
+            ? 'patch.applied'
+            : '';
+    if (!type) return;
+    const sessionId = entry?.payload?.sessionId || null;
+    const session = sessionId ? sessionsById.get(sessionId) : null;
+    events.push(createMockLifecycleEvent({
+      id: `event-ledger-${kind}-${index + 1}`,
+      taskId: String(missionState?.missionId || normalizedTaskId),
+      threadId: normalizedThreadId,
+      type,
+      actor: kind === 'apply' ? 'system' : 'reviewer',
+      source: 'event_ledger',
+      correlation: String(missionState?.missionId || normalizedTaskId),
+      causation: sessionId ? `session-${sessionId}-started` : null,
+      occurredAt: entry?.at || new Date().toISOString(),
+      payload: {
+        kind,
+        summary: entry?.summary || '',
+        ...cloneJson(entry?.payload || {}),
+      },
+      objectiveId: session?.objectiveId || entry?.payload?.objectiveId || null,
+      sessionId,
+    }));
+  });
+
+  let previousId = null;
+  return sortMockLifecycleEvents(events).map((event) => {
+    const next = event.causation ? event : { ...event, causation: previousId };
+    previousId = next.id;
+    return next;
+  });
+}
+
 function withComputedMissionState(state = {}) {
   const scheduler = deriveScheduler(state);
   const objectives = (Array.isArray(state?.objectives) ? state.objectives : []).map((objective) => {
@@ -391,6 +816,11 @@ function cloneMissionState(state, { omitLatestEvent = false } = {}) {
     verifications: cloneJson(computed?.verifications || state?.verifications || []),
     events: cloneJson(visibleEvents),
     eventLedger: cloneJson(visibleEvents),
+    lifecycleEvents: projectMockTaskLifecycleEvents({
+      taskId: computed?.missionId || 'mission',
+      threadId: computed?.missionId || 'mission',
+      missionState: computed,
+    }),
     robotTargets: cloneJson(computed?.robotTargets || state?.robotTargets || []),
     scheduler: cloneJson(computed?.scheduler || {}),
   };
@@ -409,12 +839,22 @@ export function createBackendBridge({
   let mockConductorTasks = [];
   let mockConductorTraces = [];
   let mockConductorStatus = createDefaultConductorStatus(20);
+  let mockGraphProjectionsByRepo = new Map();
+  const mockListeners = new Map();
+  const mockJevCache = new Map();
+  let mockJevPlan = null;
   const createMissionState = createDefaultMissionStateFromHost || createDefaultMissionState;
   let mockCurrentRepoPath = readMockStorage(MOCK_CURRENT_REPO_PATH_KEY, '/path/to/despair') || '/path/to/despair';
   const mockMissionStatesByRepo = new Map(
     Object.entries(readMockStorage(MOCK_MISSION_STATE_BY_REPO_KEY, {}) || {}).map(([repoPath, state]) => [
       repoPath,
       cloneJson(state) || createMissionState(),
+    ]),
+  );
+  const mockCoordinatorStatesByRepo = new Map(
+    Object.entries(readMockStorage(MOCK_COORDINATOR_STATE_BY_REPO_KEY, {}) || {}).map(([repoPath, state]) => [
+      repoPath,
+      cloneJson(state) || createDefaultCoordinatorState(),
     ]),
   );
   let mockConductorWorkflowLoad = {
@@ -448,6 +888,14 @@ export function createBackendBridge({
     writeMockStorage(MOCK_MISSION_STATE_BY_REPO_KEY, serialized);
   }
 
+  function persistMockCoordinatorStates() {
+    const serialized = {};
+    for (const [repoPath, state] of mockCoordinatorStatesByRepo.entries()) {
+      serialized[repoPath] = state;
+    }
+    writeMockStorage(MOCK_COORDINATOR_STATE_BY_REPO_KEY, serialized);
+  }
+
   function ensureMissionState(repoPath = mockCurrentRepoPath) {
     const normalizedRepoPath = String(repoPath || '/path/to/despair');
     if (!mockMissionStatesByRepo.has(normalizedRepoPath)) {
@@ -457,9 +905,95 @@ export function createBackendBridge({
     return mockMissionStatesByRepo.get(normalizedRepoPath);
   }
 
+  function normalizeCoordinatorState(repoPath, state) {
+    const missionState = ensureMissionState(repoPath);
+    const schedulerSummary =
+      missionState?.scheduler && typeof missionState.scheduler === 'object'
+        ? missionState.scheduler
+        : deriveScheduler(missionState).summary;
+    const next = cloneJson(state || createDefaultCoordinatorState());
+    const activeThreadMissionId = String(next.missionId || '').trim();
+    const missionMatchesThread = Boolean(activeThreadMissionId) && missionState?.missionId === activeThreadMissionId;
+    next.personaName = next.personaName || COORDINATOR_NAME;
+    next.summary = next.summary || 'Coordinator waiting on mission brief.';
+    next.latestSessionId = next.latestSessionId || (missionMatchesThread ? (missionState.sessions || [])[0]?.sessionId || null : null);
+    next.latestLiveSessionId = next.latestLiveSessionId
+      || (missionMatchesThread ? (missionState.sessions || []).find((entry) => missionSessionLiveliness(entry) === 'live')?.sessionId || null : null);
+    next.threads = Array.isArray(next.threads) ? next.threads : [];
+    next.threadSnapshots = next.threadSnapshots && typeof next.threadSnapshots === 'object' ? next.threadSnapshots : {};
+    next.canApprovePlan = Array.isArray(next.pendingPlan) && next.pendingPlan.length > 0;
+    next.canAskReport = Boolean(activeThreadMissionId);
+    next.canLaunchWorkers = missionMatchesThread && Number(schedulerSummary?.readyCount || 0) > 0;
+    next.lifecycleEvents = projectMockTaskLifecycleEvents({
+      taskId: activeThreadMissionId || next.threadId || '',
+      threadId: next.threadId || activeThreadMissionId || '',
+      messages: next.messages || [],
+      missionState: missionMatchesThread ? missionState : {},
+    });
+    if (next.threadId) {
+      next.threadSnapshots[next.threadId] = {
+        ...cloneJson(next),
+        threads: undefined,
+        threadSnapshots: undefined,
+      };
+      const currentSummary = summarizeCoordinatorThread(next);
+      const rest = next.threads.filter((entry) => entry?.id !== currentSummary.id);
+      next.threads = [currentSummary, ...rest]
+        .sort((left, right) => String(right?.updatedAt || '').localeCompare(String(left?.updatedAt || '')));
+    }
+    return next;
+  }
+
+  function ensureCoordinatorState(repoPath = mockCurrentRepoPath) {
+    const normalizedRepoPath = String(repoPath || '/path/to/despair');
+    if (!mockCoordinatorStatesByRepo.has(normalizedRepoPath)) {
+      const missionState = ensureMissionState(normalizedRepoPath);
+      const initial = normalizeCoordinatorState(normalizedRepoPath, {
+        ...createDefaultCoordinatorState(),
+        threadId: `coordinator-${Date.now()}`,
+        missionId: missionState.missionId || '',
+        title: missionState.title || 'Unscoped mission',
+      });
+      initial.messages = [createCoordinatorMessage('coordinator', 'wake_brief', buildWakeMessage(normalizedRepoPath, missionState, initial), {
+        personaName: COORDINATOR_NAME,
+      })];
+      initial.threadSnapshots = {
+        [initial.threadId]: {
+          ...cloneJson(initial),
+          threads: undefined,
+          threadSnapshots: undefined,
+        },
+      };
+      initial.threads = [summarizeCoordinatorThread(initial)];
+      mockCoordinatorStatesByRepo.set(normalizedRepoPath, initial);
+      persistMockCoordinatorStates();
+    }
+    return mockCoordinatorStatesByRepo.get(normalizedRepoPath);
+  }
+
+  function replaceCoordinatorState(repoPath, nextState) {
+    const normalizedRepoPath = String(repoPath || '/path/to/despair');
+    const cloned = normalizeCoordinatorState(normalizedRepoPath, nextState);
+    mockCoordinatorStatesByRepo.set(normalizedRepoPath, cloned);
+    persistMockCoordinatorStates();
+    return cloned;
+  }
+
+  function mutateCoordinatorState(repoPath, updater) {
+    const normalizedRepoPath = String(repoPath || '/path/to/despair');
+    const current = ensureCoordinatorState(normalizedRepoPath);
+    const next = updater(cloneJson(current) || createDefaultCoordinatorState());
+    return replaceCoordinatorState(normalizedRepoPath, next);
+  }
+
   function replaceMissionState(repoPath, nextState) {
     const normalizedRepoPath = String(repoPath || '/path/to/despair');
     const cloned = cloneJson(nextState || createMissionState());
+    cloned.lifecycleEvents = projectMockTaskLifecycleEvents({
+      taskId: cloned?.missionId || 'mission',
+      threadId: cloned?.missionId || 'mission',
+      missionState: cloned,
+    });
     mockMissionStatesByRepo.set(normalizedRepoPath, cloned);
     persistMockMissionStates();
     return cloned;
@@ -518,28 +1052,164 @@ export function createBackendBridge({
     return status;
   }
 
+  function mockProjectionNodes(repoPath = mockCurrentRepoPath) {
+    return cloneJson(mockGraphProjectionsByRepo.get(repoPath) || []);
+  }
+
+  function mockProjectionNodesForRequest(request = {}, repoPath = mockCurrentRepoPath) {
+    return request?.seed?.kind === 'commit' ? [] : mockProjectionNodes(repoPath);
+  }
+
+  function emitMockEvent(event, payload) {
+    const listeners = mockListeners.get(event);
+    if (!listeners || listeners.size === 0) return;
+    queueMicrotask(() => {
+      for (const callback of listeners) {
+        callback({ event, payload });
+      }
+    });
+  }
+
+  function projectAppliedWorkerSession(session) {
+    if (!session) return;
+    const targetFile = String(session.targetFile || 'src/mock_worker.js').replace(/^\.\/+/, '');
+    const projection = {
+      id: targetFile,
+      type: 'file',
+      file: targetFile,
+      line_count: 3,
+      change_status: 'added',
+      projection_state: 'pending_graph_rebuild',
+      worker_session_id: session.sessionId || '',
+      functions: [],
+    };
+    const current = mockGraphProjectionsByRepo.get(mockCurrentRepoPath) || [];
+    const next = [
+      ...current.filter((node) => node.id !== projection.id),
+      projection,
+    ];
+    mockGraphProjectionsByRepo = new Map(mockGraphProjectionsByRepo).set(mockCurrentRepoPath, next);
+    const graphView = createMockGraphView(
+      { mode: 'investigation', seed: { kind: 'working_copy' }, aggregate: 'file' },
+      next,
+    );
+    emitMockEvent('file-touched', targetFile);
+    emitMockEvent('graph-updated', {
+      graph: graphView.graph,
+      graph_view: graphView,
+      current_branch: 'main',
+      current_revision: `mock-apply-${session.sessionId || Date.now()}`,
+      since: '@',
+    });
+  }
+
   const invoke = async (cmd, args) => {
+    const safeArgs = cmd === 'confirm_jev_analysis' ? '[credentials omitted]' : args;
     if (typeof window !== 'undefined' && window.__TAURI_INTERNALS__) {
       const { invoke: tauriInvoke } = await import('@tauri-apps/api/core');
-      debugLog(`[FRONTEND] Invoking ${cmd}`, args);
+      debugLog(`[FRONTEND] Invoking ${cmd}`, safeArgs);
       return tauriInvoke(cmd, args);
     }
     if (cmd === 'check_watchdog_before_push') cmd = 'check_watchdog_focus';
-    debugLog('[MOCK] invoke', cmd, args);
+    debugLog('[MOCK] invoke', cmd, safeArgs);
+
+    // Browser fixtures only. Native invocation returns above; these never call a model.
+    if (cmd === 'get_jev_index') {
+      mockJevPlan = null;
+      const changed = typeof localStorage !== 'undefined' && localStorage.getItem('sloposcope.mockJevChangeDuringSend') === '1' && mockJevCache.has(`${mockCurrentRepoPath}:demo-main`);
+      const groups = [
+        { id: changed ? 'demo-main-v2' : 'demo-main', paths: ['mock.ex', 'mock_copy.ex'], language: 'elixir', source_bytes: 50, excerpt_bytes: 50, truncated: false },
+        { id: 'demo-helper', paths: ['mock_helper.ex'], language: 'elixir', source_bytes: 40, excerpt_bytes: 40, truncated: false },
+      ].map(g => ({ ...g, source_id: g.id === 'demo-main-v2' ? 'mock-source:changed' : `mock-source:${g.paths[0]}`, cached: mockJevCache.get(`${mockCurrentRepoPath}:${g.id}`) || null }));
+      return { repo: mockCurrentRepoPath, groups, excluded: { generated: 1 }, transport: 'demo' };
+    }
+    if (cmd === 'preview_jev_analysis') {
+      mockJevPlan = null;
+      const inventory = await invoke('get_jev_index');
+      const cap = Number(args?.maxRequests);
+      if (!Number.isInteger(cap) || cap < 1 || cap > 20) throw new Error('Request limit must be 1–20');
+      const selected = inventory.groups.filter(g => args?.selected?.includes(g.id));
+      if (!selected.length) throw new Error('Select source groups first');
+      const groups = selected.filter(g => !g.cached);
+      const payload = { model: 'demo-not-a-model', state: { items: groups.map(g => ({ language: g.language, source: 'defmodule MockModule do\n  def hello, do: :world\nend', truncated: false })) }, questions: { role: { type: 'choice', instructions: 'Synthetic demo only' } } };
+      const bytes = JSON.stringify(payload).length;
+      mockJevPlan = { id: `demo-${Date.now()}`, repo: mockCurrentRepoPath, request_count: groups.length ? 1 : 0, payload_bytes: groups.length ? bytes : 0, cached: selected.filter(g => g.cached).map(g => g.cached), batches: groups.length ? [{ groups, payload, payload_bytes: bytes }] : [], model: 'DEMO', rubric: 'file-traits-v1' };
+      return cloneJson(mockJevPlan);
+    }
+    if (cmd === 'confirm_jev_analysis') {
+      const plan = mockJevPlan;
+      mockJevPlan = null;
+      if (!plan || plan.id !== args?.planId || plan.request_count !== args?.confirmedRequests || plan.repo !== mockCurrentRepoPath) throw new Error('Approval expired or consumed; preview again');
+      await new Promise(resolve => setTimeout(resolve, 150));
+      if (typeof localStorage !== 'undefined' && localStorage.getItem('sloposcope.mockJevFailure') === '1') {
+        return { requests_attempted: 1, requests_completed: 0, input_tokens: 0, output_tokens: 0, assessments: [], error: 'Stopped after request failure; no automatic retry' };
+      }
+      const assessments = plan.batches.flatMap(b => b.groups).map(g => ({ id: g.id, source_id: g.source_id, paths: g.paths, model: 'DEMO', rubric: 'file-traits-v1', truncated: false, answers: {
+        role: { choice: 'transformation', probabilities: { transformation: 0.8, orchestration: 0.1, boundary: 0.05, representation: 0.05, unknown: 0 }, confidence: 0.6 },
+        multiple: { noul: 0.2 }, hiding: { score: 1.1, probabilities: { '0': 0.1, '1': 0.7, '2': 0.2 }, confidence: 0.4, legend: { '0': 'Shallow', '1': 'Mixed', '2': 'Deep' } },
+        context: { choice: 'sufficient', probabilities: { sufficient: 0.8, insufficient: 0.2 }, confidence: 0.3 },
+      } }));
+      for (const item of assessments) mockJevCache.set(`${mockCurrentRepoPath}:${item.id}`, item);
+      return { requests_attempted: plan.request_count, requests_completed: plan.request_count, input_tokens: 100, output_tokens: 30, assessments, error: null };
+    }
 
     if (cmd === 'get_graph_view') {
-      return createMockGraphView(args?.request);
+      return createMockGraphView(args?.request, mockProjectionNodesForRequest(args?.request));
+    }
+
+    if (cmd === 'get_graph_anatomies') {
+      const fixtures = readMockStorage('sloposcope.mockAnatomyComparison', null) || {};
+      const existing = readMockStorage('sloposcope.mockAnatomy', null) || {};
+      const delay = Number(readMockStorage('sloposcope.mockAnatomyDelay', 0));
+      if (delay > 0) await new Promise(resolve => setTimeout(resolve, delay));
+      return (Array.isArray(args?.files) ? args.files : []).map(file => {
+        const fixture = fixtures[file];
+        const hasExplicitAfter = fixture && Object.hasOwn(fixture, 'after');
+        const anatomy = hasExplicitAfter
+          ? fixture.after?.anatomy || null
+          : existing[file] || fallbackMockAnatomy(file);
+        const fixtureStatus = hasExplicitAfter ? fixture.after?.status : null;
+        return {
+          file,
+          label: fixture?.after?.label || (args?.selection?.mode === 'working_copy' ? 'working copy' : 'selected snapshot'),
+          sourceId: fixture?.after?.sourceId || anatomy?.sourceId || `mock-source:${file}`,
+          status: fixtureStatus || (anatomy?.status === 'unavailable' ? 'unavailable' : 'available'),
+          anatomy: anatomy ? cloneJson({ ...anatomy, sourceId: fixture?.after?.sourceId || anatomy.sourceId || `mock-source:${file}` }) : null,
+          reason: fixture?.after?.reason || anatomy?.reason || null,
+        };
+      });
+    }
+
+    if (cmd === 'get_file_anatomy_comparison') {
+      const file = String(args?.file || '');
+      const fixtures = readMockStorage('sloposcope.mockAnatomyComparison', null) || {};
+      const fixture = fixtures[file];
+      const delay = Number(readMockStorage('sloposcope.mockAnatomyDelay', 0));
+      if (delay > 0) await new Promise(resolve => setTimeout(resolve, delay));
+      if (fixture) return cloneJson(fixture);
+        const anatomy = readMockStorage('sloposcope.mockAnatomy', null)?.[file] || fallbackMockAnatomy(file);
+      return {
+        file,
+        comparisonId: 'none',
+        hasBaseline: false,
+        before: { label: null, sourceId: null, status: 'absent', anatomy: null, reason: 'No comparison selected' },
+        after: anatomy
+          ? { label: 'working copy', sourceId: anatomy.sourceId || `mock-source:${file}`, status: anatomy.status === 'unavailable' ? 'unavailable' : 'available', anatomy: cloneJson({ ...anatomy, sourceId: anatomy.sourceId || `mock-source:${file}` }), reason: anatomy.reason || null }
+          : { label: 'working copy', sourceId: null, status: 'unavailable', anatomy: null, reason: 'Anatomy unavailable' },
+      };
     }
 
     if (cmd === 'get_graph') {
-      return createMockGraphView({
+      const request = {
         mode: 'investigation',
         seed: args?.since ? { kind: 'commit', revset: args.since } : { kind: 'working_copy' },
         aggregate: 'file',
-      }).graph;
+      };
+      return createMockGraphView(request, mockProjectionNodesForRequest(request)).graph;
     }
 
     if (cmd === 'get_changes') {
+      if (readMockStorage('sloposcope.mockHistoryFailure', false)) throw new Error('Mock history unavailable');
       const limit = Math.max(1, Number(args?.limit || 20));
       const beforeId = args?.before_id;
       if (!beforeId) return mockChanges.slice(0, limit);
@@ -563,10 +1233,184 @@ export function createBackendBridge({
     }
 
     if (cmd === 'get_watchdog_state') return cloneJson(mockWatchdogState);
+    if (cmd === 'get_coordinator_state') {
+      return cloneJson(normalizeCoordinatorState(mockCurrentRepoPath, ensureCoordinatorState()));
+    }
+    if (cmd === 'resume_mission_thread') {
+      const requestedThreadId = String(args?.threadId || '').trim();
+      if (!requestedThreadId) throw new Error('threadId is required.');
+      const current = ensureCoordinatorState();
+      const snapshot = current.threadSnapshots?.[requestedThreadId];
+      if (!snapshot) throw new Error(`Coordinator thread not found: ${requestedThreadId}`);
+      return cloneJson(replaceCoordinatorState(mockCurrentRepoPath, {
+        ...snapshot,
+        threads: current.threads,
+        threadSnapshots: current.threadSnapshots,
+      }));
+    }
+    if (cmd === 'start_coordinator_thread') {
+      const current = ensureCoordinatorState();
+      return cloneJson(replaceCoordinatorState(mockCurrentRepoPath, {
+        ...createDefaultCoordinatorState(),
+        threadId: `coordinator-${Date.now()}`,
+        missionId: '',
+        title: 'Unscoped mission',
+        state: 'wake',
+        messages: [
+          createCoordinatorMessage(
+            'coordinator',
+            'wake_brief',
+            buildWakeMessage(mockCurrentRepoPath, null, { title: 'Unscoped mission' }),
+            { personaName: COORDINATOR_NAME },
+          ),
+        ],
+        threads: current.threads,
+        threadSnapshots: current.threadSnapshots,
+      }));
+    }
     if (cmd === 'get_mission_state') return cloneJson(cloneMissionState(ensureMissionState()));
     if (cmd === 'list_agent_profiles') {
       const state = ensureMissionState();
       return { profiles: cloneJson(state?.profiles || []) };
+    }
+
+    if (cmd === 'send_coordinator_message') {
+      const content = String(args?.content || '').trim();
+      if (!content) throw new Error('Coordinator message is required.');
+      const missionState = ensureMissionState();
+      const next = mutateCoordinatorState(mockCurrentRepoPath, (state) => {
+        const messages = [...(state.messages || []), createCoordinatorMessage('user', 'prompt', content, { content })];
+        const draftMission = {
+          ...(state.draftMission || createDefaultCoordinatorState().draftMission),
+        };
+        let pendingPlan = Array.isArray(state.pendingPlan) ? [...state.pendingPlan] : [];
+        let coordinatorReply = '';
+        let replyKind = 'status';
+        let nextState = state.state || 'wake';
+        let shouldReplan = pendingPlan.length === 0;
+
+        if (messageWantsReport(content)) {
+          coordinatorReply = buildMissionReport(missionState);
+          replyKind = 'report';
+          return normalizeCoordinatorState(mockCurrentRepoPath, {
+            ...state,
+            messages: [...messages, createCoordinatorMessage('coordinator', replyKind, coordinatorReply, { report: true })],
+          });
+        }
+
+        if (!draftMission.brief) {
+          draftMission.brief = content;
+          draftMission.title = draftMission.title || deriveProblemTitle(content);
+        } else if (!messageIsValidationOnly(content)) {
+          draftMission.brief = `${draftMission.brief}\n${content}`.trim();
+          if (pendingPlan.length > 0) {
+            pendingPlan = [];
+            shouldReplan = true;
+          }
+        }
+
+        if (!draftMission.validationCommand) {
+          draftMission.validationCommand = extractValidationCommand(content);
+        }
+
+        if (shouldReplan) {
+          pendingPlan = planMissionObjectives({
+            title: draftMission.title,
+            brief: draftMission.brief,
+            validationCommand: draftMission.validationCommand,
+          }).map((objective) => ({
+            id: objective.id,
+            title: objective.title,
+            prompt: objective.prompt,
+            scopePaths: Array.isArray(objective?.scope?.paths) ? objective.scope.paths : [],
+          }));
+          coordinatorReply = buildCoordinatorPlanMessage({ pendingPlan });
+          replyKind = 'plan';
+          nextState = 'plan_ready';
+          return normalizeCoordinatorState(mockCurrentRepoPath, {
+            ...state,
+            missionId: missionState.missionId || state.missionId || '',
+            title: draftMission.title || state.title || 'Unscoped mission',
+            state: nextState,
+            draftMission,
+            pendingPlan,
+            messages: [...messages, createCoordinatorMessage('coordinator', replyKind, coordinatorReply, { objectiveCount: pendingPlan.length })],
+          });
+        }
+
+        coordinatorReply = 'Context appended. Approve current plan or add more detail.';
+        return normalizeCoordinatorState(mockCurrentRepoPath, {
+          ...state,
+          title: draftMission.title || state.title || 'Unscoped mission',
+          draftMission,
+          pendingPlan,
+          messages: [...messages, createCoordinatorMessage('coordinator', replyKind, coordinatorReply, { pendingPlan: pendingPlan.length })],
+        });
+      });
+      return cloneJson(next);
+    }
+
+    if (cmd === 'approve_coordinator_plan') {
+      const coordinator = ensureCoordinatorState();
+      const draftMission = coordinator.draftMission || createDefaultCoordinatorState().draftMission;
+      const pendingPlan = Array.isArray(coordinator.pendingPlan) ? coordinator.pendingPlan : [];
+      if (!pendingPlan.length) throw new Error('No coordinator plan ready to approve.');
+      if (!draftMission.title || !draftMission.brief) {
+        throw new Error('Coordinator draft is incomplete.');
+      }
+      const missionId = deriveMissionId(draftMission, coordinator.missionId || '');
+      const now = new Date().toISOString();
+      const plannerProfile = findPlannerProfileById(ensureMissionState(), draftMission.plannerProfileId) || findPlannerProfile(ensureMissionState());
+      const nextMission = mutateMissionState(mockCurrentRepoPath, (state) => ({
+        ...state,
+        missionId,
+        title: draftMission.title,
+        brief: draftMission.brief,
+        validationCommand: draftMission.validationCommand,
+        issueKey: String(draftMission.issueKey || '').trim(),
+        issueUrl: String(draftMission.issueUrl || '').trim(),
+        plannerProfileId: String(draftMission.plannerProfileId || ''),
+        plannerProfileLabel: plannerProfile?.label || '',
+        plannerNotes: String(draftMission.plannerNotes || ''),
+        plannerPromptOverride: String(draftMission.plannerPromptOverride || ''),
+        plannerSummary: plannerProfile ? `Mission planned with ${plannerProfile.label}.` : 'Mission planned with default planner prompt.',
+        plannerStatus: 'planned',
+        plannerMode: plannerProfile ? 'profile' : 'viewer_first',
+        summary: missionSummaryFromInput(draftMission),
+        status: 'awaiting_launch',
+        objectives: pendingPlan.map((objective) => ({
+          id: objective.id,
+          title: objective.title,
+          prompt: objective.prompt,
+          expectedValidation: draftMission.validationCommand,
+          scope: { paths: Array.isArray(objective.scopePaths) ? objective.scopePaths : [] },
+          state: 'pending',
+          latestSessionId: null,
+        })),
+        lastAction: 'approve_coordinator_plan',
+        lastActionAt: now,
+        lastPlannedAt: now,
+      }));
+      nextMission.eventLedger = [...(nextMission.eventLedger || []), createMissionEvent('plan', `Planned ${pendingPlan.length} objective(s) with ${plannerProfile?.provider || 'fixture'}.`, {
+        objectiveIds: pendingPlan.map((objective) => objective.id),
+        planner: plannerProfile?.provider || 'fixture',
+      })];
+      nextMission.events = nextMission.eventLedger;
+      replaceMissionState(mockCurrentRepoPath, nextMission);
+
+      const next = mutateCoordinatorState(mockCurrentRepoPath, (state) => ({
+        ...state,
+        missionId,
+        title: draftMission.title,
+        state: 'awaiting_launch',
+        draftMission,
+        pendingPlan: [],
+        messages: [
+          ...(state.messages || []),
+          createCoordinatorMessage('coordinator', 'status', 'Plan approved. Ready to launch workers.', { missionId }),
+        ],
+      }));
+      return cloneJson(next);
     }
 
     if (cmd === 'save_agent_profile') {
@@ -853,66 +1697,76 @@ export function createBackendBridge({
           ? (state.profiles || []).find((entry) => entry?.id === requestedProfileId) || null
           : null;
         const profileId = selectedProfile?.id || 'local-code-worker';
+        const liveProfile = String(selectedProfile?.provider || '').trim() === 'local_live_cli';
         const sessionId = `code-session-${(state.sessions?.length || 0) + 1}`;
         const verificationId = `verification-${(state.verifications?.length || 0) + 1}`;
+        const validationCommand = String(state.validationCommand || '');
+        const validationPassed = !validationCommand.toLowerCase().includes('fail');
         const objectives = Array.isArray(state.objectives)
           ? state.objectives.map((objective, index) => {
               const matchesRequested = resolvedObjectiveId ? objective?.id === resolvedObjectiveId : index === 0;
               if (!matchesRequested) return objective;
               return {
                 ...objective,
-                state: 'done',
+                state: liveProfile ? 'claimed' : validationPassed ? 'done' : 'failed',
                 latestSessionId: sessionId,
               };
             })
           : [];
         const objective = objectives.find((entry) => entry?.latestSessionId === sessionId) || null;
         const workspacePath = `${mockCurrentRepoPath}/.sloposcope/worktrees/${state.missionId || 'mission'}/${objective?.id || 'objective-1'}`;
-        const verification = {
-          verificationId,
-          sessionId,
-          objectiveId: objective?.id || null,
-          objectiveTitle: objective?.title || null,
-          profileId,
-          kind: 'code_worker',
-          status: 'passed',
-          summary: objective ? `Code worker completed ${objective.id}.` : 'Code worker ran.',
-          checkedAt: now,
-          command: state.validationCommand || null,
-          workspacePath,
-          patchSummary: objective ? `Patch artifact for ${objective.id}` : 'Patch artifact',
-          patchArtifact: `diff --git a/src/mock_worker.js b/src/mock_worker.js\n+export const objective = '${objective?.id || 'objective-1'}';\n`,
-          targetFile: 'src/mock_worker.js',
-          validationStatus: 'passed',
-          reviewState: 'pending',
-          applyState: 'not_applied',
-          gateState: 'open',
-          validation: {
-            command: state.validationCommand || null,
-            success: true,
-            exitCode: 0,
-            stdout: 'mock validation ok',
-            stderr: '',
-          },
-        };
+        const verification = liveProfile
+          ? null
+          : {
+              verificationId,
+              sessionId,
+              objectiveId: objective?.id || null,
+              objectiveTitle: objective?.title || null,
+              profileId,
+              kind: 'code_worker',
+              status: validationPassed ? 'passed' : 'failed',
+              summary: validationPassed
+                ? (objective ? `Code worker completed ${objective.id}.` : 'Code worker ran.')
+                : (objective ? `Code worker failed ${objective.id}.` : 'Code worker failed.'),
+              checkedAt: now,
+              command: validationCommand || null,
+              workspacePath,
+              patchSummary: objective ? `Patch artifact for ${objective.id}` : 'Patch artifact',
+              patchArtifact: `diff --git a/src/mock_worker.js b/src/mock_worker.js\n+export const objective = '${objective?.id || 'objective-1'}';\n`,
+              targetFile: 'src/mock_worker.js',
+              validationStatus: validationPassed ? 'passed' : 'failed',
+              reviewState: 'pending',
+              applyState: 'not_applied',
+              gateState: 'open',
+              validation: {
+                command: validationCommand || null,
+                success: validationPassed,
+                exitCode: validationPassed ? 0 : 1,
+                stdout: validationPassed ? 'mock validation ok' : '',
+                stderr: validationPassed ? '' : 'mock validation failed',
+              },
+            };
         const session = {
           sessionId,
           objectiveId: objective?.id || null,
           objectiveTitle: objective?.title || null,
           profileId,
           workerKind: 'code_worker',
-          state: 'completed',
-          result: 'passed',
+          state: liveProfile ? 'running' : 'completed',
+          runtimeStatus: liveProfile ? 'running' : 'completed',
+          result: liveProfile ? 'running' : validationPassed ? 'passed' : 'failed',
           startedAt: now,
           updatedAt: now,
-          verificationId,
-          latestEvent: objective ? 'completed' : 'idle',
-          command: state.validationCommand || null,
+          verificationId: verificationId,
+          latestEvent: liveProfile ? 'started' : objective ? 'completed' : 'idle',
+          command: validationCommand || null,
           workspacePath,
           patchSummary: objective ? `Patch artifact for ${objective.id}` : 'Patch artifact',
-          patchArtifact: verification.patchArtifact,
-          validationStatus: 'passed',
-          validation: verification.validation,
+          patchArtifact: verification?.patchArtifact || '',
+          targetFile: 'src/mock_worker.js',
+          touchedPaths: ['src/mock_worker.js'],
+          validationStatus: liveProfile ? 'pending' : validationPassed ? 'passed' : 'failed',
+          validation: verification?.validation || null,
           reviewState: 'pending',
           applyState: 'not_applied',
           gateState: 'open',
@@ -929,7 +1783,7 @@ export function createBackendBridge({
           lastActionAt: now,
           objectives,
           sessions: [...(state.sessions || []), session],
-          verifications: [...(state.verifications || []), verification],
+          verifications: verification ? [...(state.verifications || []), verification] : [...(state.verifications || [])],
           lastRunAt: now,
           mission: {
             ...(state.mission || {}),
@@ -942,11 +1796,18 @@ export function createBackendBridge({
       const objective = objectiveId
         ? next.objectives?.find((entry) => entry?.id === objectiveId) || null
         : null;
-      next.eventLedger = [...(next.eventLedger || []), createMissionEvent('code_worker', objective ? `Code worker completed ${objective.id}.` : 'Code worker ran.', {
-        objectiveId: objective?.id || null,
-        sessionId: next.sessions?.[next.sessions.length - 1]?.sessionId || null,
-        verificationId: next.verifications?.[next.verifications.length - 1]?.verificationId || null,
-      })];
+      const latestSession = next.sessions?.[next.sessions.length - 1] || null;
+      next.eventLedger = [...(next.eventLedger || []), createMissionEvent(
+        latestSession?.state === 'running' ? 'code_worker_started' : 'code_worker',
+        latestSession?.state === 'running'
+          ? `Code worker started ${objective?.id || 'objective-1'}.`
+          : objective ? `Code worker completed ${objective.id}.` : 'Code worker ran.',
+        {
+          objectiveId: objective?.id || null,
+          sessionId: latestSession?.sessionId || null,
+          verificationId: next.verifications?.[next.verifications.length - 1]?.verificationId || null,
+        },
+      )];
       next.events = next.eventLedger;
       replaceMissionState(mockCurrentRepoPath, next);
       return cloneJson(cloneMissionState(next, { omitLatestEvent: true }));
@@ -964,6 +1825,154 @@ export function createBackendBridge({
         objectiveId: scheduler.nextObjectiveId,
         profileId: requestedProfileId || null,
       });
+    }
+
+    if (cmd === 'launch_coordinator_workers') {
+      const coordinator = ensureCoordinatorState();
+      const requestedProfileId = String(args?.profileId || '').trim();
+      const missionId = String(args?.missionId || coordinator.missionId || '').trim();
+      if (!missionId || missionId !== ensureMissionState().missionId) {
+        const next = mutateCoordinatorState(mockCurrentRepoPath, (state) => ({
+          ...state,
+          messages: [
+            ...(state.messages || []),
+            createCoordinatorMessage('coordinator', 'status', 'No runnable objectives to launch.', { launched: 0, profileId: requestedProfileId || null }),
+          ],
+        }));
+        return cloneJson(next);
+      }
+      let launched = 0;
+      while (Number(deriveScheduler(ensureMissionState()).summary?.readyCount || 0) > 0) {
+        invoke('run_next_code_worker', {
+          missionId,
+          profileId: requestedProfileId || null,
+        });
+        launched += 1;
+        if (launched > 16) break;
+      }
+      const next = mutateCoordinatorState(mockCurrentRepoPath, (state) => ({
+        ...state,
+        missionId: ensureMissionState().missionId || state.missionId || '',
+        messages: [
+          ...(state.messages || []),
+          createCoordinatorMessage(
+            'coordinator',
+            'status',
+            launched > 0 ? `Workers launched. ${launched} objective(s) dispatched.` : 'No runnable objectives to launch.',
+            { launched, profileId: requestedProfileId || null },
+          ),
+        ],
+      }));
+      return cloneJson(next);
+    }
+
+    if (cmd === 'request_coordinator_report') {
+      const coordinator = ensureCoordinatorState();
+      const missionId = String(args?.missionId || coordinator.missionId || '').trim();
+      const next = mutateCoordinatorState(mockCurrentRepoPath, (state) => ({
+        ...state,
+        messages: [
+          ...(state.messages || []),
+          createCoordinatorMessage(
+            'coordinator',
+            'report',
+            missionId && missionId === ensureMissionState().missionId
+              ? buildMissionReport(ensureMissionState())
+              : 'Mission report. No mission approved yet.',
+            { report: true, missionId: missionId || null },
+          ),
+        ],
+      }));
+      return cloneJson(next);
+    }
+
+    if (cmd === 'nudge_worker_session') {
+      const coordinator = ensureCoordinatorState();
+      const current = ensureMissionState();
+      const missionId = String(args?.missionId || coordinator.missionId || '').trim();
+      const latestLive = missionId && missionId === current.missionId
+        ? ((current.sessions || []).find((entry) => missionSessionLiveliness(entry) === 'live') || null)
+        : null;
+      const message = String(args?.content || '').trim() || 'Keep moving.';
+      if (latestLive && String(latestLive?.profileId || '').includes('live-local')) {
+        const now = new Date().toISOString();
+        const nextMission = mutateMissionState(mockCurrentRepoPath, (state) => {
+          const sessions = (state.sessions || []).map((entry) => (
+            entry.sessionId === latestLive.sessionId
+              ? {
+                  ...entry,
+                  state: 'completed',
+                  runtimeStatus: 'completed',
+                  result: 'passed',
+                  latestEvent: 'completed',
+                  validationStatus: 'passed',
+                  updatedAt: now,
+                }
+              : entry
+          ));
+          const objectives = (state.objectives || []).map((objective) => (
+            objective?.id === latestLive.objectiveId
+              ? { ...objective, state: 'done' }
+              : objective
+          ));
+          const verificationId = `verification-${(state.verifications?.length || 0) + 1}`;
+          const verification = {
+            verificationId,
+            sessionId: latestLive.sessionId,
+            objectiveId: latestLive.objectiveId || null,
+            objectiveTitle: latestLive.objectiveTitle || null,
+            profileId: latestLive.profileId,
+            kind: 'code_worker',
+            status: 'passed',
+            summary: latestLive.objectiveId ? `Code worker completed ${latestLive.objectiveId}.` : 'Code worker completed.',
+            checkedAt: now,
+            command: state.validationCommand || null,
+            workspacePath: latestLive.workspacePath,
+            patchSummary: latestLive.objectiveId ? `Patch artifact for ${latestLive.objectiveId}` : 'Patch artifact',
+            patchArtifact: `diff --git a/src/mock_worker.js b/src/mock_worker.js\n+export const objective = '${latestLive.objectiveId || 'objective-1'}';\n`,
+            targetFile: 'src/mock_worker.js',
+            validationStatus: 'passed',
+            reviewState: 'pending',
+            applyState: 'not_applied',
+            gateState: 'open',
+            validation: {
+              command: state.validationCommand || null,
+              success: true,
+              exitCode: 0,
+              stdout: `nudge accepted: ${message}`,
+              stderr: '',
+            },
+          };
+          const eventLedger = [...(state.eventLedger || []), createMissionEvent('code_worker_completed', verification.summary, {
+            objectiveId: latestLive.objectiveId || null,
+            sessionId: latestLive.sessionId,
+            verificationId,
+            nudge: message,
+          })];
+          return {
+            ...state,
+            objectives,
+            sessions,
+            verifications: [...(state.verifications || []), verification],
+            eventLedger,
+            events: eventLedger,
+          };
+        });
+        replaceMissionState(mockCurrentRepoPath, nextMission);
+      }
+      const next = mutateCoordinatorState(mockCurrentRepoPath, (state) => ({
+        ...state,
+        messages: [
+          ...(state.messages || []),
+          createCoordinatorMessage(
+            'coordinator',
+            'nudge',
+            latestLive ? `Nudge sent to ${latestLive.sessionId}. ${message}` : 'No live worker to nudge. Ask report or relaunch work.',
+            { sessionId: latestLive?.sessionId || null, nudgeAccepted: Boolean(latestLive) },
+          ),
+        ],
+      }));
+      return cloneJson(next);
     }
 
     if (cmd === 'sweep_stale_sessions') {
@@ -1126,6 +2135,9 @@ export function createBackendBridge({
       })];
       next.events = next.eventLedger;
       replaceMissionState(mockCurrentRepoPath, next);
+      if (action === 'apply') {
+        projectAppliedWorkerSession((next.sessions || []).find((session) => session.sessionId === next.viewerSessionId));
+      }
       return cloneJson(cloneMissionState(next, { omitLatestEvent: true }));
     }
 
@@ -1456,7 +2468,7 @@ export function createBackendBridge({
     if (cmd === 'search_graph_entities') {
       const query = String(args?.query || '').trim().toLowerCase();
       if (!query) return [];
-      return createMockGraph()
+      return createMockGraph(mockProjectionNodes())
         .nodes
         .filter((node) => node.id.toLowerCase().includes(query) || String(node.file || '').toLowerCase().includes(query))
         .map((node, index) => ({
@@ -1469,7 +2481,137 @@ export function createBackendBridge({
         }));
     }
 
-    if (cmd === 'get_file_source') return 'defmodule MockModule do\n  def hello, do: :world\nend';
+    if (cmd === 'get_reviewer_target_context') {
+      const mode = String(args?.input?.mode || 'working_copy');
+      const since = String(args?.input?.since || '@');
+      return {
+        repoPath: mockCurrentRepoPath,
+        branch: 'main',
+        revision: 'deadbeefdead',
+        since,
+        changedFilesTotal: 2,
+        changedFilesTruncated: false,
+        changedFiles: [
+          {
+            path: 'mock_helper.ex',
+            status: 'modified',
+            diffExcerpt: ['@@ -1,2 +1,3 @@', ' defmodule MockHelper do', '+  def ping, do: :pong', ' end'],
+            diffLineCount: 4,
+            excerptTruncated: false,
+          },
+          {
+            path: 'mock.ex',
+            status: mode === 'working_copy' ? 'modified' : 'added',
+            diffExcerpt: ['@@ -1,2 +1,3 @@', ' defmodule MockModule do', '+  def goodbye, do: :moon', ' end'],
+            diffLineCount: 4,
+            excerptTruncated: false,
+          },
+        ],
+        graphCounts: {
+          available: true,
+          entityCount: 2,
+          edgeCount: 1,
+          indexedFileCount: 2,
+          changedFilesWithGraphEntities: 2,
+          changedEntitiesCount: 2,
+        },
+        blastRadius: {
+          available: true,
+          seedFilesCount: 2,
+          oneHopEntityCount: 2,
+          twoHopEntityCount: 2,
+          affectedEntitiesCount: 1,
+          relatedEntitiesCount: 1,
+          affectedEntities: ['MockHelper'],
+          relatedEntities: ['MockModule'],
+        },
+      };
+    }
+
+    if (cmd === 'reviewer_generate_elm') {
+      const question = String(args?.input?.question || '').trim();
+      const kind = String(args?.input?.kind || 'branch').trim();
+      const title = kind === 'question' && question ? `Review answer: ${question}` : 'Task review';
+      return {
+        source: `module Main exposing (main)
+
+import Browser
+import Html exposing (Html, div, h1, p, text)
+import Html.Attributes exposing (class)
+
+
+main : Program () () Never
+main =
+    Browser.sandbox { init = (), update = \\_ model -> model, view = view }
+
+
+view : () -> Html Never
+view _ =
+    div [ class "generated-reviewer" ]
+        [ h1 [] [ text ${JSON.stringify(title)} ]
+        , p [] [ text "Mock reviewer_generate_elm source payload." ]
+        ]`,
+      };
+    }
+
+    if (cmd === 'compile_reviewer_elm') {
+      return `
+window.Elm = window.Elm || {};
+window.Elm.Main = {
+  init: function(opts) {
+    var root = opts.node;
+    root.innerHTML = '<div class="generated-reviewer">'
+      + '<div class="generated-reviewer__nav">'
+      + '<button class="generated-reviewer__tab generated-reviewer__tab--active">Review</button>'
+      + '<button class="generated-reviewer__tab">Decision</button>'
+      + '<button class="generated-reviewer__tab">Evidence</button>'
+      + '<button class="generated-reviewer__tab">Flow</button>'
+      + '</div>'
+      + '<div class="generated-reviewer__slide">'
+      + '<span class="generated-reviewer__kicker">Review</span>'
+      + '<h1>Task review</h1>'
+      + '<p>What changed, why it likely changed, and where reviewer should look first.</p>'
+      + '<div class="generated-reviewer__stats"><div class="generated-reviewer__stat"><span>visible nodes</span><strong>2</strong></div><div class="generated-reviewer__stat"><span>visible edges</span><strong>1</strong></div></div>'
+      + '<pre><code>defmodule MockModule do\\n  def hello, do: :world\\nend</code></pre>'
+      + '</div>'
+      + '</div>';
+    return {};
+  }
+};`;
+    }
+    if (cmd === 'get_file_source') return 'defmodule MockModule do\n  def hello, do: :world\n  defp secret, do: :moon\nend';
+    if (cmd === 'get_file_anatomy') {
+      const file = String(args?.file || '');
+      const fixture = readMockStorage('sloposcope.mockAnatomy', null)?.[file];
+      if (fixture) {
+        const delay = Number(readMockStorage('sloposcope.mockAnatomyDelay', 0));
+        if (delay > 0) await new Promise(resolve => setTimeout(resolve, delay));
+        return cloneJson(fixture);
+      }
+      if (file === 'mock.ex') {
+        return {
+          status: 'partial',
+          file,
+          language: 'ex',
+          evidence: 'tree_sitter',
+          callables: [
+            { name: 'hello', kind: 'def', visibility: 'public', arity: null, startLine: null, endLine: null },
+            { name: 'secret', kind: 'defp', visibility: 'private', arity: null, startLine: null, endLine: null },
+          ],
+          stateSlots: null,
+          reason: 'Current language query captures callable names; missing fields remain unknown',
+        };
+      }
+      return {
+        status: 'unavailable',
+        file,
+        language: file.split('.').pop() || 'unknown',
+        evidence: 'tree_sitter',
+        callables: [],
+        stateSlots: null,
+        reason: 'no Tree-sitter anatomy profile for this extension',
+      };
+    }
     if (cmd === 'get_file_diff') {
       return '@@ -1,2 +1,3 @@\n defmodule MockModule do\n+  def goodbye, do: :moon\n   def hello, do: :world\n end';
     }
@@ -1486,7 +2628,11 @@ export function createBackendBridge({
       return tauriListen(event, _cb);
     }
     debugLog('[MOCK] listen', event);
-    return () => {};
+    if (!mockListeners.has(event)) mockListeners.set(event, new Set());
+    mockListeners.get(event).add(_cb);
+    return () => {
+      mockListeners.get(event)?.delete(_cb);
+    };
   };
 
   return { invoke, listen };

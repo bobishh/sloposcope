@@ -1,31 +1,64 @@
 <script>
   import { onMount, untrack } from 'svelte';
+  import { stepScene, createFrameScheduler } from './sceneRuntime';
   import Window from './Window.svelte';
   import Editor from './Editor.svelte';
+  import CoordinatorWindow from './CoordinatorWindow.svelte';
+  import ReviewerPresentationWindow from './ReviewerPresentationWindow.svelte';
   import NodeDetailsWindow from './NodeDetailsWindow.svelte';
   import Robot from './Robot.svelte';
+  import { buildFileOrganismGeometry, paintFileOrganism } from './fileOrganism.ts';
   import { setupShortcuts } from './shortcuts.js';
+  import {
+    buildOverviewPhenotype,
+    classifyPathRole,
+    buildPathClusterTargets,
+    buildPathRegions,
+    getGraphDetailLevel,
+    getPathClusterKey,
+  } from './ecosystemModel.js';
 
   let { 
     graph = { nodes: [], edges: [] }, 
     graphMeta = null,
+    reviewTarget = null,
     since = null, 
     changes = [], 
     bookmarks = [], 
     contentVersion = '',
     fileContentVersions = new Map(),
+    comparisonSelection = { mode: 'none', since: null },
     getFileDiff, 
     getFileSource, 
+    getFileAnatomy,
+    getFileAnatomyComparison,
+    jevByFile = {},
+    invokeJev = null,
+    getReviewerTargetContext,
+    generateReviewerElm,
+    compileReviewerElm,
     saveFile, 
     theme = 'midnight', 
     heatmapData = new Map(),
     onSelectSince,
+    onReviewTargetChange = null,
     onLoadMoreChanges,
     onProjectChange,
     loadingMore = false,
     hasMoreChanges = true,
     missionState = null,
     missionRobotTargets = [],
+    coordinatorState = null,
+    coordinatorLoading = false,
+    coordinatorSending = false,
+    coordinatorError = '',
+    onCoordinatorSend = null,
+    onCoordinatorApprovePlan = null,
+    onCoordinatorLaunchWorkers = null,
+    onCoordinatorAskReport = null,
+    onCoordinatorNudgeLatestWorker = null,
+    onCoordinatorStartThread = null,
+    onCoordinatorResumeThread = null,
   } = $props();
 
   function normalizeFilePath(path) {
@@ -34,6 +67,41 @@
       .replaceAll('\\', '/')
       .replace(/^\.\/+/, '')
       .replace(/^\/+/, '');
+  }
+
+  function nodePathCandidates(node) {
+    return [
+      normalizeFilePath(node?.file),
+      normalizeFilePath(node?.id),
+    ].filter(Boolean);
+  }
+
+  function hasNodeAnatomyEndpoint(node) {
+    return node?.anatomy != null || node?.anatomyEndpointState != null;
+  }
+
+  function nodeHasKnownCallables(node) {
+    if (hasNodeAnatomyEndpoint(node)) {
+      return Array.isArray(node?.anatomy?.callables)
+        && node?.anatomy?.status !== 'unavailable'
+        && !['absent', 'unavailable'].includes(String(node?.anatomyEndpointState || '').toLowerCase());
+    }
+    return Array.isArray(node?.functions);
+  }
+
+  function nodeCallableCount(node) {
+    if (!nodeHasKnownCallables(node)) return 0;
+    return hasNodeAnatomyEndpoint(node) ? node.anatomy.callables.length : node.functions.length;
+  }
+
+  function pathMatchesNode(path, node) {
+    const normalized = normalizeFilePath(path);
+    if (!normalized) return false;
+    return nodePathCandidates(node).some((candidate) =>
+      candidate === normalized
+        || candidate.endsWith(`/${normalized}`)
+        || normalized.endsWith(`/${candidate}`)
+    );
   }
 
   function getFileContentVersion(file) {
@@ -92,6 +160,53 @@
     return 'idle';
   }
 
+  function nodeWorkerSession(node) {
+    const sessions = Array.isArray(missionState?.sessions) ? [...missionState.sessions].reverse() : [];
+    const explicitSessionId = String(node?.worker_session_id || '').trim();
+    if (explicitSessionId) {
+      const explicit = sessions.find((session) => session?.sessionId === explicitSessionId);
+      if (explicit) return explicit;
+    }
+    return sessions.find((session) => {
+      const touchedPaths = Array.isArray(session?.touchedPaths) ? session.touchedPaths : [];
+      const scopePaths = Array.isArray(session?.scopePaths) ? session.scopePaths : [];
+      return [...touchedPaths, ...scopePaths].some((path) => pathMatchesNode(path, node));
+    }) || null;
+  }
+
+  function nodeWorkerSessionId(node) {
+    return String(nodeWorkerSession(node)?.sessionId || node?.worker_session_id || '').trim();
+  }
+
+  function nodeVerification(node) {
+    const session = nodeWorkerSession(node);
+    const verifications = Array.isArray(missionState?.verifications) ? [...missionState.verifications].reverse() : [];
+    const bySession = session?.sessionId
+      ? verifications.find((verification) => verification?.sessionId === session.sessionId)
+      : null;
+    if (bySession) return bySession;
+    if (session?.objectiveId) {
+      const byObjective = verifications.find((verification) => verification?.objectiveId === session.objectiveId);
+      if (byObjective) return byObjective;
+    }
+    return verifications.find((verification) => pathMatchesNode(verification?.targetFile, node)) || null;
+  }
+
+  function nodeVerificationState(node) {
+    const verification = nodeVerification(node);
+    const session = nodeWorkerSession(node);
+    const status = String(
+      verification?.status
+        || verification?.validationStatus
+        || session?.validationStatus
+        || ''
+    ).toLowerCase();
+    if (status === 'failed' || status === 'error') return 'failed';
+    if (status === 'passed' || status === 'success') return 'passed';
+    if (status === 'pending' || status === 'running') return status;
+    return '';
+  }
+
   function robotAnchorNodeForSession(session, index) {
     const touchedPaths = Array.isArray(session?.touchedPaths) ? session.touchedPaths : [];
     for (const path of touchedPaths) {
@@ -134,6 +249,7 @@
   });
 
   let robotTarget = $derived.by(() => {
+    const _motion = sceneMotionVersion;
     const fallbackNode =
       simNodes.find((n) => n.change_status === 'modified' || n.change_status === 'added') ||
       simNodes[0] ||
@@ -143,8 +259,8 @@
     const screen = worldToScreen(targetNode.x, targetNode.y);
     const size = getNodeSize(targetNode);
     // Keep robot on the edited document (upper-right area), not floating far away.
-    const desiredX = screen.x + size.w * 0.22;
-    const desiredY = screen.y - size.h * 0.28;
+    const desiredX = screen.x + size.w * camera.zoom * 0.22;
+    const desiredY = screen.y - size.h * camera.zoom * 0.28;
     return {
       ...clampRobotScreenTarget(desiredX, desiredY),
       active: true,
@@ -152,6 +268,7 @@
   });
 
   let normalizedMissionRobotTargets = $derived.by(() => {
+    const _motion = sceneMotionVersion;
     const explicitTargets = Array.isArray(missionRobotTargets) ? missionRobotTargets : [];
     const stateTargets = Array.isArray(missionState?.robotTargets) ? missionState.robotTargets : [];
     const sourceTargets = explicitTargets.length > 0 ? explicitTargets : stateTargets;
@@ -177,8 +294,8 @@
         if (!anchorNode) return null;
         const screen = worldToScreen(anchorNode.x, anchorNode.y);
         const size = getNodeSize(anchorNode);
-        const dx = size.w * (0.18 + index * 0.1);
-        const dy = size.h * (0.4 + (index % 2) * 0.22);
+        const dx = size.w * camera.zoom * (0.18 + index * 0.1);
+        const dy = size.h * camera.zoom * (0.4 + (index % 2) * 0.22);
         const clamped = clampRobotScreenTarget(screen.x + dx, screen.y - dy);
         return {
           ...clamped,
@@ -192,6 +309,60 @@
 
   let searchInput = $state(null);
   let highlightedSearchIndex = $state(-1);
+  let coordinatorWindow = $state({
+    x: 26,
+    y: 24,
+    width: 460,
+    height: 580,
+    visible: true,
+  });
+  let reviewerWindow = $state({
+    x: 506,
+    y: 24,
+    width: 520,
+    height: 580,
+    visible: true,
+  });
+
+  function coordinatorCanLaunchWorkers() {
+    return Boolean(
+      coordinatorState?.canLaunchWorkers
+        || (
+          coordinatorState?.missionId
+          && missionState?.missionId === coordinatorState?.missionId
+          && Number(missionState?.scheduler?.readyCount || 0) > 0
+        ),
+    );
+  }
+
+  function coordinatorCanAskReport() {
+    return Boolean(coordinatorState?.missionId && coordinatorState?.canAskReport);
+  }
+
+  function coordinatorDockStateLabel() {
+    if (coordinatorState?.canApprovePlan) return 'Plan ready';
+    if (coordinatorCanLaunchWorkers()) return 'Launch ready';
+    if (coordinatorCanAskReport()) return 'Active';
+    if (coordinatorLoading) return 'Loading';
+    if (coordinatorError) return 'Needs attention';
+    return 'Listening';
+  }
+
+  function reviewerDockStateLabel() {
+    const target = reviewTarget || {};
+    const mode = String(target.mode || 'working_copy');
+    const includeWorkingCopy = target.includeWorkingCopy === undefined ? true : Boolean(target.includeWorkingCopy);
+    if (mode === 'range') {
+      const base = String(target.base || '(base)').trim() || '(base)';
+      const head = String(target.head || '(head)').trim() || '(head)';
+      return `${base}..${head}${includeWorkingCopy ? ' + working copy' : ''}`;
+    }
+    if (mode === 'since') {
+      const sinceLabel = String(target.since || '@').trim() || '@';
+      return `${sinceLabel}${includeWorkingCopy ? ' + working copy' : ''}`;
+    }
+    return includeWorkingCopy ? 'Working copy only' : 'Repository only';
+  }
 
   onMount(() => {
     return setupShortcuts(
@@ -441,32 +612,46 @@
 
   let camera = $state({ x: 0, y: 0, zoom: 1 });
 
-  let simNodes = $state([]);
-  let simEdges = $state([]);
+  let simNodes = $state.raw([]);
+  let simEdges = $state.raw([]);
+  let sceneMotionVersion = $state(0);
   let animating = $state(true);
   let selectedNodeIds = $state(new Set());
   let activeNodeId = $state(null);
   let nodeWindows = $state([]);
-  let hoveredNode = $state(null);
+  let hoveredNode = $state.raw(null);
   let graphNodesById = $derived.by(() => new Map((graph.nodes || []).map((node) => [node.id, node])));
   let sourceWindows = $state([]);
-
   let panelCollapsed = $state(false);
   let searchQuery = $state('');
-  let defaultNodeWindowViewMode = $state('diff');
+  let defaultNodeWindowViewMode = $state('bug');
+  let organismGraphStats = $derived.by(() => ({
+    files: simNodes.length,
+    pathRegions: buildPathRegions(simNodes, 1).length,
+    staticLinks: simEdges.length,
+  }));
 
   let dragging = $state(false);
   let dragStart = $state({ x: 0, y: 0 });
   let dragCameraStart = $state({ x: 0, y: 0 });
 
-  let draggedNode = $state(null);
+  let draggedNode = $state.raw(null);
   let dragOffset = $state({ x: 0, y: 0 });
 
-  let rafId = null;
+  let frameScheduler = null;
+  let scenePositionRevision = 0;
+  const sceneMetrics = { treeVisits: 0, collisionTests: 0, physics: 0, render: 0, preparation: 0, frames: 0 };
+  const regionCache = new Map();
+  function sceneRegions(depth) {
+    const now = performance.now();
+    const previous = regionCache.get(depth);
+    if (previous && (previous.revision === scenePositionRevision || (animating && now - previous.at < 100))) return previous.regions;
+    const regions = buildPathRegions(simNodes, depth);
+    regionCache.set(depth, { at: now, revision: scenePositionRevision, regions });
+    return regions;
+  }
   let simulationIterations = 0;
-  const MAX_INITIAL_ITERATIONS = 300;
-  const SETTLING_ITERATIONS = 50;
-  const MIN_ZOOM = 0.05;
+  const MIN_ZOOM = 0.0001;
   const MAX_ZOOM = 10;
 
   let canvasColors = $state({
@@ -616,16 +801,8 @@
     return parts[0];
   }
 
-  function getNodeClusterKey(node, degreeById) {
-    const persisted = clusterAssignmentByNodeId.get(node.id);
-    if (graphMeta?.clusteringMode === 'persisted' && persisted?.clusterId) {
-      return `persisted:${persisted.clusterId}`;
-    }
-    const degree = degreeById[node.id] || 0;
-    if (degree === 0) {
-      return `ext:${getNodeExtension(node)}`;
-    }
-    return getClusterKey(node.id);
+  function getNodeClusterKey(node) {
+    return getPathClusterKey(node);
   }
 
   function parseHexColor(color, fallback = { r: 128, g: 128, b: 128 }) {
@@ -751,13 +928,29 @@
     };
   }
 
-  function getNodeSize(node) {
-    const lc = node.line_count || 50;
-    const scale = Math.pow(Math.max(1, lc) / 40, 0.4);
-    return {
-      w: Math.min(220, 68 + 56 * scale),
-      h: Math.min(180, 52 + 50 * scale),
+  function buildNodeOrganism(node) {
+    const phenotype = buildOverviewPhenotype(node, 0, 1);
+    const anatomy = {
+      ...node.anatomy,
+      file: node.file || node.id,
+      language: node.anatomy?.language || phenotype.language,
+      status: phenotype.anatomyStatus,
+      callables: phenotype.callablesKnown ? phenotype.callables : null,
     };
+    // A selected historical endpoint must supply its own size.
+    const lineCount = node.anatomy?.lineCount
+      ?? (node.anatomyEndpointState == null ? node.line_count ?? null : null);
+    return buildFileOrganismGeometry({ anatomy, lineCount, roleFact: classifyPathRole(node).role,
+      assessment: jevByFile[normalizeFilePath(node.file)] });
+  }
+
+  function getNodeGeometry(node) {
+    return node.organismGeometry || buildNodeOrganism(node);
+  }
+
+  function getNodeSize(node) {
+    const { bounds } = getNodeGeometry(node);
+    return { w: bounds.width, h: bounds.height };
   }
 
   function getNodeMass(node) {
@@ -775,11 +968,11 @@
     let maxY = -Infinity;
 
     for (const node of nodes) {
-      const size = getNodeSize(node);
-      minX = Math.min(minX, node.x - size.w / 2);
-      maxX = Math.max(maxX, node.x + size.w / 2);
-      minY = Math.min(minY, node.y - size.h / 2);
-      maxY = Math.max(maxY, node.y + size.h / 2);
+      const { bounds } = getNodeGeometry(node);
+      minX = Math.min(minX, node.x + bounds.minX);
+      maxX = Math.max(maxX, node.x + bounds.maxX);
+      minY = Math.min(minY, node.y + bounds.minY);
+      maxY = Math.max(maxY, node.y + bounds.maxY);
     }
 
     camera.x = (minX + maxX) / 2;
@@ -794,7 +987,7 @@
     const fitZoom = Math.min(innerW / graphW, innerH / graphH);
 
     // Keep it comfortably visible, not too tiny and not over-zoomed.
-    camera.zoom = Math.max(0.25, Math.min(1.4, fitZoom));
+    camera.zoom = Math.max(MIN_ZOOM, Math.min(1.4, fitZoom));
   }
 
   function findNodeById(nodeId) {
@@ -828,8 +1021,9 @@
 
   function focusNode(node) {
     if (!node) return;
-    camera.x = node.x;
-    camera.y = node.y;
+    const { bounds } = getNodeGeometry(node);
+    camera.x = node.x + (bounds.minX + bounds.maxX) / 2;
+    camera.y = node.y + (bounds.minY + bounds.maxY) / 2;
     camera.zoom = Math.max(camera.zoom, 1.5);
 
     const next = new Set(selectedNodeIds);
@@ -840,7 +1034,9 @@
   }
 
   function toggleDefaultNodeWindowViewMode() {
-    defaultNodeWindowViewMode = defaultNodeWindowViewMode === 'diff' ? 'source' : 'diff';
+    const modes = ['bug', 'diff', 'source'];
+    const current = modes.indexOf(defaultNodeWindowViewMode);
+    defaultNodeWindowViewMode = modes[(current + 1) % modes.length];
   }
 
   function closeNodeWindow(nodeId) {
@@ -1099,11 +1295,6 @@
     return new Map(entries.map((entry) => [entry.nodeId, entry.reason]));
   });
 
-  let clusterAssignmentByNodeId = $derived.by(() => {
-    const entries = graphMeta?.clusterAssignments || [];
-    return new Map(entries.map((entry) => [entry.nodeId, entry]));
-  });
-
   function buildEdgeKey(edge) {
     return `${edge.source}::${edge.target}::${edge.type || ''}`;
   }
@@ -1118,41 +1309,30 @@
   }
 
   function initSimulation() {
+    const setupStart = performance.now();
+    scenePositionRevision++;
+    regionCache.clear();
     if (!graph.nodes || graph.nodes.length === 0) {
       simNodes = [];
       simEdges = [];
       return;
     }
 
-    const degreeById = {};
-    for (const node of graph.nodes) degreeById[node.id] = 0;
+    const degreeById = Object.fromEntries(graph.nodes.map((node) => [node.id, 0]));
     for (const edge of graph.edges || []) {
-      if (degreeById[edge.source] !== undefined) degreeById[edge.source]++;
-      if (degreeById[edge.target] !== undefined) degreeById[edge.target]++;
+      if (degreeById[edge.source] !== undefined) degreeById[edge.source] += 1;
+      if (degreeById[edge.target] !== undefined) degreeById[edge.target] += 1;
     }
 
     const clusters = {};
     for (const node of graph.nodes) {
-      const key = getNodeClusterKey(node, degreeById);
+      const key = getNodeClusterKey(node);
       if (!clusters[key]) clusters[key] = [];
       clusters[key].push(node);
     }
 
-    const clusterKeys = Object.keys(clusters);
-    const clusterCount = clusterKeys.length;
-    const clusterRadius = clusterCount <= 1
-      ? 0
-      : Math.min(460, 110 + clusterCount * 65);
     const nodeJitter = Math.max(70, Math.min(160, 90 + Math.sqrt(graph.nodes.length) * 5));
-
-    const clusterCenters = {};
-    clusterKeys.forEach((key, i) => {
-      const angle = clusterCount <= 1 ? 0 : (i / clusterCount) * Math.PI * 2;
-      clusterCenters[key] = {
-        x: Math.cos(angle) * clusterRadius,
-        y: Math.sin(angle) * clusterRadius,
-      };
-    });
+    const clusterTargets = new Map(buildPathClusterTargets(graph.nodes).map((target) => [target.id, target]));
 
     const prevNodes = untrack(() => simNodes);
     const prevEdges = untrack(() => simEdges);
@@ -1168,8 +1348,9 @@
     const structureChanged = !sameNodeSet || !sameEdgeSet;
 
     simNodes = graph.nodes.map((node) => {
-      const clusterKey = getNodeClusterKey(node, degreeById);
-      const center = clusterCenters[clusterKey];
+      const clusterKey = getNodeClusterKey(node);
+      const center = clusterTargets.get(clusterKey) || { x: 0, y: 0, boundaryRadius: 115 };
+      const boundaryRadius = Math.max(center.boundaryRadius, 78 + Math.sqrt(clusters[clusterKey].length) * 58);
       const prev = prevNodesById.get(node.id);
       let x = center.x + (Math.random() - 0.5) * nodeJitter;
       let y = center.y + (Math.random() - 0.5) * nodeJitter;
@@ -1194,7 +1375,12 @@
 
       return {
         ...node,
+        organismGeometry: buildNodeOrganism(node),
         cluster_key: clusterKey,
+        cluster_target_x: center.x,
+        cluster_target_y: center.y,
+        cluster_boundary_radius: boundaryRadius,
+        static_degree: degreeById[node.id] || 0,
         file_ext: getNodeExtension(node),
         figure_variant: hashString(`${node.id}|${node.file || ''}`) % FIGURINE_VARIANTS.length,
         mass: getNodeMass(node),
@@ -1215,223 +1401,16 @@
     const firstInit = prevNodes.length === 0;
     const majorReset = prevNodes.length > 0 && overlapRatio < 0.35;
     pendingAutoCenter = firstInit || majorReset;
+    sceneMetrics.preparation = performance.now() - setupStart;
   }
 
   function stepSimulation() {
-    const nodes = simNodes;
-    const edges = simEdges;
-    if (nodes.length === 0) return;
-    const heatRuntime = buildHeatRuntimeIndex(Date.now());
-    const heatIndex = heatRuntime.index;
-
-    const nodeMap = {};
-    for (const n of nodes) {
-      nodeMap[n.id] = n;
-    }
-
-    const repulsionStrength = 30000;
-    const springStrength = 0.003;
-    const springLength = 320;
-    const centerGravity = 0.0008;
-    const clusterGravity = 0.015;
-    const damping = 0.82;
-    const maxVelocity = 20;
-    const maxRepulsionForce = 18;
-    const maxClusterRepulsionForce = 8;
-    const worldRadius = Math.max(900, 420 + Math.sqrt(nodes.length) * 200);
-    const hardWorldRadius = worldRadius * 1.8;
-
-    const clusterSums = {};
-    for (const node of nodes) {
-      const key = node.cluster_key || getClusterKey(node.id);
-      if (!clusterSums[key]) clusterSums[key] = { x: 0, y: 0, count: 0 };
-      clusterSums[key].x += node.x;
-      clusterSums[key].y += node.y;
-      clusterSums[key].count++;
-    }
-    const clusterCenters = {};
-    for (const key in clusterSums) {
-      const s = clusterSums[key];
-      clusterCenters[key] = { x: s.x / s.count, y: s.y / s.count };
-    }
-
-    const cKeys = Object.keys(clusterCenters);
-    const interClusterRepulsion = 55000;
-    const clusterForces = {};
-    for (const key of cKeys) clusterForces[key] = { x: 0, y: 0 };
-
-    for (let i = 0; i < cKeys.length; i++) {
-      for (let j = i + 1; j < cKeys.length; j++) {
-        const ca = clusterCenters[cKeys[i]];
-        const cb = clusterCenters[cKeys[j]];
-        let dx = cb.x - ca.x;
-        let dy = cb.y - ca.y;
-        let dist = Math.sqrt(dx * dx + dy * dy);
-        if (dist < 10) dist = 10;
-
-        const force = Math.min(maxClusterRepulsionForce, interClusterRepulsion / (dist * dist));
-        const fx = (dx / dist) * force;
-        const fy = (dy / dist) * force;
-
-        clusterForces[cKeys[i]].x -= fx;
-        clusterForces[cKeys[i]].y -= fy;
-        clusterForces[cKeys[j]].x += fx;
-        clusterForces[cKeys[j]].y += fy;
-      }
-    }
-
-    for (let i = 0; i < nodes.length; i++) {
-      const a = nodes[i];
-      const sizeA = getNodeSize(a);
-
-      for (let j = i + 1; j < nodes.length; j++) {
-        const b = nodes[j];
-        if (a.pinned && b.pinned) continue;
-        const sizeB = getNodeSize(b);
-        const invMassA = 1 / (a.mass || 1);
-        const invMassB = 1 / (b.mass || 1);
-
-        let dx = b.x - a.x;
-        let dy = b.y - a.y;
-        let dist = Math.sqrt(dx * dx + dy * dy);
-        
-        if (dist < 1) {
-          dx = (Math.random() - 0.5) * 2;
-          dy = (Math.random() - 0.5) * 2;
-          dist = Math.sqrt(dx * dx + dy * dy);
-        }
-
-        const sameCluster = (a.cluster_key || getClusterKey(a.id)) === (b.cluster_key || getClusterKey(b.id));
-        const rep = sameCluster ? repulsionStrength : repulsionStrength * 1.5;
-        let force = Math.min(maxRepulsionForce, rep / (dist * dist));
-
-        const fx = (dx / dist) * force;
-        const fy = (dy / dist) * force;
-
-        if (!a.pinned) { a.vx -= fx * invMassA; a.vy -= fy * invMassA; }
-        if (!b.pinned) { b.vx += fx * invMassB; b.vy += fy * invMassB; }
-
-        const minDx = (sizeA.w + sizeB.w) / 2 + 16; 
-        const minDy = (sizeA.h + sizeB.h) / 2 + 16;
-        
-        if (Math.abs(dx) < minDx && Math.abs(dy) < minDy) {
-          const overlapX = minDx - Math.abs(dx);
-          const overlapY = minDy - Math.abs(dy);
-          
-          let pushRatioA = 0.5;
-          let pushRatioB = 0.5;
-          
-          if (a.pinned && !b.pinned) { pushRatioA = 0; pushRatioB = 1; }
-          else if (!a.pinned && b.pinned) { pushRatioA = 1; pushRatioB = 0; }
-          else if (a.pinned && b.pinned) { pushRatioA = 0; pushRatioB = 0; }
-          
-          const correctionLerp = 0.3;
-          
-          if (overlapX < overlapY) {
-            const pushX = (dx > 0 ? overlapX : -overlapX) * correctionLerp;
-            a.x -= pushX * pushRatioA;
-            b.x += pushX * pushRatioB;
-          } else {
-            const pushY = (dy > 0 ? overlapY : -overlapY) * correctionLerp;
-            a.y -= pushY * pushRatioA;
-            b.y += pushY * pushRatioB;
-          }
-        }
-      }
-    }
-
-    for (const edge of edges) {
-      const source = nodeMap[edge.source];
-      const target = nodeMap[edge.target];
-      if (!source || !target) continue;
-
-      let dx = target.x - source.x;
-      let dy = target.y - source.y;
-      let dist = Math.sqrt(dx * dx + dy * dy);
-      if (dist < 1) dist = 1;
-
-      const sameCluster = (source.cluster_key || getClusterKey(source.id)) === (target.cluster_key || getClusterKey(target.id));
-      const sl = sameCluster ? springLength * 0.6 : springLength;
-      const ss = sameCluster ? springStrength * 1.5 : springStrength * 0.3;
-
-      const displacement = dist - sl;
-      const force = ss * displacement;
-      const fx = (dx / dist) * force;
-      const fy = (dy / dist) * force;
-      const invMassSource = 1 / (source.mass || 1);
-      const invMassTarget = 1 / (target.mass || 1);
-
-      if (!source.pinned) { source.vx += fx * invMassSource; source.vy += fy * invMassSource; }
-      if (!target.pinned) { target.vx -= fx * invMassTarget; target.vy -= fy * invMassTarget; }
-    }
-
-    for (const node of nodes) {
-      if (node.pinned) continue;
-
-      const key = node.cluster_key || getClusterKey(node.id);
-      const cc = clusterCenters[key];
-      const cf = clusterForces[key];
-      const invMass = 1 / (node.mass || 1);
-
-      node.vx -= (node.x - cc.x) * clusterGravity * invMass;
-      node.vy -= (node.y - cc.y) * clusterGravity * invMass;
-
-      // Keep clusters vertically neutral; no artificial downward drift.
-
-      node.vx += cf.x * invMass;
-      node.vy += cf.y * invMass;
-
-      node.vx -= node.x * centerGravity * invMass;
-      node.vy -= node.y * centerGravity * invMass;
-
-      // Soft boundary: nudge far-away nodes back toward center to prevent long-run drift.
-      const radialDist = Math.sqrt(node.x * node.x + node.y * node.y);
-      if (radialDist > worldRadius && radialDist > 0) {
-        const overflow = radialDist - worldRadius;
-        const pull = overflow * 0.0022;
-        node.vx -= (node.x / radialDist) * pull;
-        node.vy -= (node.y / radialDist) * pull;
-      }
-
-      node.vx *= damping;
-      node.vy *= damping;
-
-      const speed = Math.sqrt(node.vx * node.vx + node.vy * node.vy);
-      const heavyMaxVelocity = Math.max(4.5, maxVelocity / Math.sqrt(node.mass || 1));
-      if (speed > heavyMaxVelocity) {
-        node.vx = (node.vx / speed) * heavyMaxVelocity;
-        node.vy = (node.vy / speed) * heavyMaxVelocity;
-      }
-
-      node.x += node.vx;
-      node.y += node.vy;
-
-      // Hard boundary as a final safety net.
-      const postDist = Math.sqrt(node.x * node.x + node.y * node.y);
-      if (postDist > hardWorldRadius && postDist > 0) {
-        const scale = hardWorldRadius / postDist;
-        node.x *= scale;
-        node.y *= scale;
-        node.vx *= 0.2;
-        node.vy *= 0.2;
-      }
-    }
-
-    simulationIterations++;
-
-    if (simulationIterations > MAX_INITIAL_ITERATIONS + SETTLING_ITERATIONS) {
-      let totalEnergy = 0;
-      for (const node of nodes) {
-        if (!node.pinned) {
-          totalEnergy += node.vx * node.vx + node.vy * node.vy;
-        }
-      }
-      if (totalEnergy / nodes.length < 0.01) {
-        animating = false;
-      }
-    }
-
-    simNodes = nodes;
+    const result = stepScene(simNodes, simEdges, simulationIterations++);
+    animating = result.active;
+    sceneMetrics.treeVisits = result.treeVisits;
+    sceneMetrics.collisionTests = result.collisionTests;
+    scenePositionRevision++;
+    if (sceneMetrics.frames % 6 === 0) sceneMotionVersion++;
   }
 
   function screenToWorld(sx, sy) {
@@ -1449,35 +1428,20 @@
   }
 
   function isNodeVisible(node) {
-    const size = getNodeSize(node);
-    const screen = worldToScreen(node.x, node.y);
-    const hw = size.w / 2;
-    const hh = size.h / 2;
-    return (
-      screen.x + hw > 0 &&
-      screen.x - hw < width &&
-      screen.y + hh > 0 &&
-      screen.y - hh < height
-    );
+    const { bounds } = getNodeGeometry(node);
+    const topLeft = worldToScreen(node.x + bounds.minX, node.y + bounds.minY);
+    const bottomRight = worldToScreen(node.x + bounds.maxX, node.y + bounds.maxY);
+    return bottomRight.x > 0 && topLeft.x < width && bottomRight.y > 0 && topLeft.y < height;
   }
 
   function findNodeAt(sx, sy) {
     const world = screenToWorld(sx, sy);
-    const z = camera.zoom;
-
     for (let i = simNodes.length - 1; i >= 0; i--) {
       const node = simNodes[i];
-      const size = getNodeSize(node);
-      const hw = size.w / 2 / z;
-      const hh = size.h / 2 / z;
-      if (
-        world.x >= node.x - hw &&
-        world.x <= node.x + hw &&
-        world.y >= node.y - hh &&
-        world.y <= node.y + hh
-      ) {
-        return node;
-      }
+      const { bounds } = getNodeGeometry(node);
+      const x = world.x - node.x;
+      const y = world.y - node.y;
+      if (x >= bounds.minX && x <= bounds.maxX && y >= bounds.minY && y <= bounds.maxY) return node;
     }
     return null;
   }
@@ -1489,6 +1453,52 @@
       if (edge.target === nodeId) ids.add(edge.source);
     }
     return ids;
+  }
+
+  function drawPathRegionLayer(ctx, regions, alpha, showLabels, alreadyDrawn = new Set()) {
+    for (const region of regions) {
+      if (alreadyDrawn.has(region.id) || region.polygon.length < 3) continue;
+      alreadyDrawn.add(region.id);
+      const screenPoints = region.polygon.map((point) => worldToScreen(point.x, point.y));
+      const path = new Path2D();
+      path.moveTo(screenPoints[0].x, screenPoints[0].y);
+      for (let index = 1; index < screenPoints.length; index += 1) {
+        path.lineTo(screenPoints[index].x, screenPoints[index].y);
+      }
+      path.closePath();
+
+      const seed = hashString(region.id);
+      const primary = parseHexColor(canvasColors.primary);
+      const secondary = parseHexColor(canvasColors.secondary);
+      const bg = parseHexColor(canvasColors.bg100);
+      const base = mixRgb(seed % 2 ? primary : secondary, bg, 0.58 + ((seed >> 3) % 12) / 100);
+      ctx.fillStyle = rgbToCss(base, alpha);
+      ctx.strokeStyle = rgbToCss(mixRgb(base, parseHexColor(canvasColors.text), 0.18), Math.min(0.7, alpha * 3.4));
+      ctx.lineWidth = 1;
+      ctx.lineJoin = 'miter';
+      ctx.fill(path);
+      ctx.stroke(path);
+
+      if (showLabels) {
+        const anchor = screenPoints.reduce((best, point) => {
+          if (!best || point.y < best.y || (point.y === best.y && point.x < best.x)) return point;
+          return best;
+        }, null);
+        ctx.fillStyle = rgbToCss(mixRgb(base, parseHexColor(canvasColors.text), 0.5), 0.88);
+        ctx.font = 'bold 10px monospace';
+        ctx.textAlign = 'left';
+        ctx.textBaseline = 'bottom';
+        ctx.fillText(region.id, anchor.x + 5, anchor.y - 5);
+      }
+    }
+    return alreadyDrawn;
+  }
+
+  function drawPhenotypeNode(ctx, node) {
+    const geometry = getNodeGeometry(node);
+    const screen = worldToScreen(node.x, node.y);
+    const projection = { x: screen.x, y: screen.y, scale: camera.zoom };
+    return paintFileOrganism(ctx, geometry, { ...projection, showCallableLabels: false, detail: 'screen' });
   }
 
   function drawFigurineNode(ctx, node, x0, y0, w, h, showExtensionText) {
@@ -1614,8 +1624,25 @@
     }
     const pulseSeconds = performance.now() * 0.001;
     const heatRuntime = buildHeatRuntimeIndex(Date.now());
+    const detail = getGraphDetailLevel(camera.zoom);
 
     ctx.save();
+
+    const drawnRegions = drawPathRegionLayer(
+      ctx,
+      sceneRegions(1),
+      detail.name === 'repository' ? 0.18 : 0.09,
+      true,
+    );
+    if (detail.regionDepth !== 1) {
+      drawPathRegionLayer(
+        ctx,
+        sceneRegions(detail.regionDepth),
+        detail.name === 'anatomy' ? 0.12 : 0.1,
+        detail.name !== 'repository',
+        drawnRegions,
+      );
+    }
 
     const nodeById = {};
     for (const n of simNodes) nodeById[n.id] = n;
@@ -1650,17 +1677,15 @@
       ctx.stroke();
     }
 
-    const showFunctions = camera.zoom > 1.5;
-
     for (const node of simNodes) {
       if (!isNodeVisible(node)) continue;
 
-      const size = getNodeSize(node);
+      const geometry = getNodeGeometry(node);
       const screen = worldToScreen(node.x, node.y);
-      const w = size.w;
-      const h = size.h;
-      const x0 = screen.x - w / 2;
-      const y0 = screen.y - h / 2;
+      const w = geometry.bounds.width * camera.zoom;
+      const h = geometry.bounds.height * camera.zoom;
+      const x0 = screen.x + geometry.bounds.minX * camera.zoom;
+      const y0 = screen.y + geometry.bounds.minY * camera.zoom;
 
       const isHighlighted = focusContext.has(node.id);
       const isConnected = connectedIds.has(node.id);
@@ -1683,7 +1708,7 @@
 
       ctx.globalAlpha = alpha;
 
-      const bodyPath = drawFigurineNode(ctx, node, x0, y0, w, h, camera.zoom > 0.55);
+      const bodyPath = drawPhenotypeNode(ctx, node);
 
       if (hasHeat) {
         ctx.save();
@@ -1725,33 +1750,29 @@
         ctx.restore();
       }
 
-      const fontSize = 12;
-      ctx.font = `bold ${fontSize}px monospace`;
-      ctx.fillStyle = canvasColors.text;
-      ctx.textAlign = 'center';
-      ctx.textBaseline = 'middle';
-
-      const label = node.label || getShortName(node.id);
-
-      if (showFunctions && node.functions && node.functions.length > 0) {
-        ctx.fillText(label, screen.x, y0 + fontSize + 4);
-
-        const fnFontSize = 9;
-        ctx.font = `${fnFontSize}px monospace`;
+      if (detail.showFileLabels) {
+        const fontSize = 11;
+        ctx.font = `bold ${fontSize}px monospace`;
         ctx.fillStyle = canvasColors.text;
-        ctx.globalAlpha = 0.7;
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'bottom';
+        const label = node.label || getShortName(node.id);
+        ctx.fillText(label, screen.x, y0 + h - 5);
 
-        const maxFns = Math.floor((h - fontSize - 12) / (fnFontSize + 2));
-        const fns = node.functions.slice(0, maxFns);
-        for (let i = 0; i < fns.length; i++) {
-          const fn = fns[i];
-          const fnLabel = `${fn.name}/${fn.arity}`;
-          const fy = y0 + fontSize + 16 + i * (fnFontSize + 2);
-          if (fy + fnFontSize > y0 + h) break;
-          ctx.fillText(fnLabel, screen.x, fy);
+        const trait = getNodeGeometry(node).interpretation?.role;
+        if (trait) {
+          ctx.font = '9px monospace';
+          ctx.fillStyle = canvasColors.text;
+          ctx.fillText(`Jev: ${trait}`, screen.x, y0 - 3);
         }
-      } else {
-        ctx.fillText(label, screen.x, screen.y);
+
+        if (detail.showAnatomyMarks) {
+          ctx.font = '8px monospace';
+          ctx.globalAlpha = Math.min(alpha, 0.68);
+          const phenotype = buildOverviewPhenotype(node, node.static_degree, camera.zoom);
+          const callableCount = phenotype.callablesKnown ? `${phenotype.capturedCallableCount} functions` : 'functions unknown';
+          ctx.fillText(callableCount, screen.x, y0 + h + 7);
+        }
       }
 
       ctx.globalAlpha = 1;
@@ -1857,7 +1878,9 @@
       draggedNode.y = world.y + dragOffset.y;
       draggedNode.vx = 0;
       draggedNode.vy = 0;
-      simNodes = simNodes;
+      scenePositionRevision++;
+      sceneMotionVersion++;
+      frameScheduler?.invalidate();
       return;
     }
 
@@ -1953,25 +1976,37 @@
     const _anim = animating;
     const _drag = draggedNode;
     const _windows = nodeWindows;
+    const _heat = heatmapData;
+    const _theme = theme;
+    const _zoom = camera.zoom;
+    const _cameraX = camera.x;
+    const _cameraY = camera.y;
 
     if (!canvas || _w === 0 || _h === 0) return;
 
-    function loop() {
-      if (animating) {
-        stepSimulation();
-      }
+    frameScheduler = createFrameScheduler({ request: callback => requestAnimationFrame(callback), cancel: id => cancelAnimationFrame(id), frame() {
+      if (document.hidden) return false;
+      const profileStart = performance.now();
+      if (animating) stepSimulation();
+      const profilePhysicsEnd = performance.now();
       render();
-      rafId = requestAnimationFrame(loop);
-    }
-
-    rafId = requestAnimationFrame(loop);
-
-    return () => {
-      if (rafId) {
-        cancelAnimationFrame(rafId);
-        rafId = null;
+      sceneMetrics.physics = profilePhysicsEnd - profileStart;
+      sceneMetrics.render = performance.now() - profilePhysicsEnd;
+      sceneMetrics.frames++;
+      if (sceneMetrics.frames % 20 === 0) {
+        canvas.dataset.physicsMs = sceneMetrics.physics.toFixed(2);
+        canvas.dataset.renderMs = sceneMetrics.render.toFixed(2);
+        canvas.dataset.treeVisits = String(sceneMetrics.treeVisits);
+        canvas.dataset.collisionTests = String(sceneMetrics.collisionTests);
+        canvas.dataset.preparationMs = sceneMetrics.preparation.toFixed(2);
       }
-    };
+      return animating || Boolean(draggedNode) || heatmapData.size > 0;
+    } });
+    const scheduler = frameScheduler;
+    const resume = () => { if (!document.hidden) scheduler.invalidate(); };
+    document.addEventListener('visibilitychange', resume);
+    scheduler.invalidate();
+    return () => { scheduler.dispose(); document.removeEventListener('visibilitychange', resume); };
   });
   function isTickActive(change, index, total) {
     if (!since) return false;
@@ -1992,6 +2027,26 @@
 
 <div class="eyeloss-container" bind:clientWidth={width} bind:clientHeight={height}>
   <canvas
+    class="eyeloss-graph-canvas"
+    aria-label="Repository organism graph"
+    aria-description={`${organismGraphStats.files} files in ${organismGraphStats.pathRegions} path regions with ${organismGraphStats.staticLinks} static links`}
+    data-renderer="organism-regions"
+    data-file-organism-engine="shared-world"
+    data-scene-runtime="spatial"
+    data-graph-seed={graphMeta?.seedLabel || ''}
+    data-camera-x={camera.x}
+    data-camera-y={camera.y}
+    data-camera-zoom={camera.zoom}
+    data-file-count={organismGraphStats.files}
+    data-path-region-count={organismGraphStats.pathRegions}
+    data-static-link-count={organismGraphStats.staticLinks}
+    data-detail-level={getGraphDetailLevel(camera.zoom).name}
+    data-phenotype-grammar="shared-callable-metrics"
+    data-callable-count={simNodes.reduce((total, node) => total + nodeCallableCount(node), 0)}
+    data-callable-coverage={simNodes.filter(nodeHasKnownCallables).length}
+    data-callable-unknown-files={simNodes.filter((node) => !nodeHasKnownCallables(node)).length}
+    data-metric-anatomy-count={simNodes.filter((node) => Array.isArray(node.anatomy?.callables)).length}
+    data-lod-mode="nonlinear-semantic"
     bind:this={canvas}
     onwheel={handleWheel}
     onmousedown={handleMouseDown}
@@ -2019,7 +2074,7 @@
           title="Default mode for newly opened node windows"
           style="border-left: 1px solid var(--bg-300); width: 88px; text-align: center;"
         >
-          {defaultNodeWindowViewMode === 'source' ? 'Open: Source' : 'Open: Diff'}
+          Open: {defaultNodeWindowViewMode === 'bug' ? 'Bug' : defaultNodeWindowViewMode === 'source' ? 'Source' : 'Diff'}
         </button>
         <button
           class="eyeloss-nav-panel__toggle"
@@ -2044,10 +2099,15 @@
       </div>
       <ul class="eyeloss-nav-panel__list">
         {#each filteredNodes as node, i}
+          {@const workerSessionId = nodeWorkerSessionId(node)}
+          {@const verificationState = nodeVerificationState(node)}
           <li>
             <button
               class="eyeloss-nav-panel__item"
               class:eyeloss-nav-panel__item--active={selectedNodeIds.has(node.id) || highlightedSearchIndex === i}
+              data-node-id={normalizeFilePath(node.file || node.id)}
+              data-worker-session-id={workerSessionId || undefined}
+              data-verification-state={verificationState || undefined}
               type="button"
               title={nodeProvenanceById.get(node.id) ? `${getShortName(node.id)} — ${nodeProvenanceById.get(node.id)}` : getShortName(node.id)}
               onclick={() => { focusNode(node); highlightedSearchIndex = i; }}
@@ -2058,6 +2118,12 @@
                 <span class="eyeloss-nav-panel__name">{getNavNodeLabel(node)}</span>
                 {#if nodeProvenanceById.get(node.id)}
                   <span class="eyeloss-nav-panel__meta">{nodeProvenanceById.get(node.id)}</span>
+                {/if}
+                {#if workerSessionId}
+                  <span class="eyeloss-nav-panel__meta">worker {workerSessionId}</span>
+                {/if}
+                {#if verificationState}
+                  <span class="eyeloss-nav-panel__meta">verification {verificationState}</span>
                 {/if}
               </span>
             </button>
@@ -2145,11 +2211,16 @@
         {theme}
         {contentVersion}
         {fileContentVersions}
+        {comparisonSelection}
         {getNodeHeat}
         {getFileDiff}
         {getFileSource}
+        {getFileAnatomy}
+        {getFileAnatomyComparison}
+        jevAssessment={jevByFile[normalizeFilePath(nodeData.file)]}
+        {invokeJev}
         {saveFile}
-        initialViewMode={nodeWindow.initialViewMode || 'diff'}
+        initialViewMode={nodeWindow.initialViewMode || 'bug'}
         sourceReferences={getSourceReferenceLinksForNode(nodeWindow.nodeId)}
         onOpenReference={openSourceWindowForReference}
         onclose={() => closeNodeWindow(nodeWindow.nodeId)}
@@ -2159,6 +2230,74 @@
       />
     {/if}
   {/each}
+
+  <CoordinatorWindow
+    {coordinatorState}
+    {missionState}
+    visible={coordinatorWindow.visible}
+    loading={coordinatorLoading}
+    sending={coordinatorSending}
+    error={coordinatorError}
+    bind:x={coordinatorWindow.x}
+    bind:y={coordinatorWindow.y}
+    bind:windowWidth={coordinatorWindow.width}
+    bind:windowHeight={coordinatorWindow.height}
+    containerWidth={width}
+    containerHeight={height}
+    onclose={() => { coordinatorWindow.visible = false; }}
+    onSendMessage={onCoordinatorSend}
+    onApprovePlan={onCoordinatorApprovePlan}
+    onLaunchWorkers={onCoordinatorLaunchWorkers}
+    onAskReport={onCoordinatorAskReport}
+    onNudgeLatestWorker={onCoordinatorNudgeLatestWorker}
+    onStartThread={onCoordinatorStartThread}
+    onResumeThread={onCoordinatorResumeThread}
+  />
+
+  <ReviewerPresentationWindow
+    {graph}
+    {graphMeta}
+    {reviewTarget}
+    {getFileSource}
+    {getReviewerTargetContext}
+    {generateReviewerElm}
+    {compileReviewerElm}
+    onReviewTargetChange={onReviewTargetChange}
+    visible={reviewerWindow.visible}
+    bind:x={reviewerWindow.x}
+    bind:y={reviewerWindow.y}
+    bind:windowWidth={reviewerWindow.width}
+    bind:windowHeight={reviewerWindow.height}
+    containerWidth={width}
+    containerHeight={height}
+    onclose={() => { reviewerWindow.visible = false; }}
+  />
+
+  {#if !coordinatorWindow.visible || !reviewerWindow.visible}
+    <nav class="eyeloss-window-dock" aria-label="Window dock">
+      {#if !coordinatorWindow.visible}
+        <button
+          type="button"
+          class="eyeloss-window-dock__button"
+          onclick={() => { coordinatorWindow.visible = true; }}
+        >
+          <span class="eyeloss-window-dock__title">Coordinator</span>
+          <span class="eyeloss-window-dock__state">{coordinatorDockStateLabel()}</span>
+        </button>
+      {/if}
+
+      {#if !reviewerWindow.visible}
+        <button
+          type="button"
+          class="eyeloss-window-dock__button"
+          onclick={() => { reviewerWindow.visible = true; }}
+        >
+          <span class="eyeloss-window-dock__title">Review</span>
+          <span class="eyeloss-window-dock__state">{reviewerDockStateLabel()}</span>
+        </button>
+      {/if}
+    </nav>
+  {/if}
 
   {#each sourceWindows as sourceWindow (sourceWindow.id)}
     <Window

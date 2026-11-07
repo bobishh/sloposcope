@@ -37,7 +37,7 @@
   <header class="eyeloss-control-card__header">
     <div>
       <div class="eyeloss-control-card__eyebrow">Config</div>
-      <h2 class="eyeloss-control-card__title">Configuration</h2>
+      <h2 class="eyeloss-control-card__title">Application Config</h2>
     </div>
   </header>
 

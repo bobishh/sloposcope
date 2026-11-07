@@ -1,15 +1,18 @@
 #![recursion_limit = "256"]
 
 mod agent_harness;
+mod anatomy_snapshot;
 mod cluster_service;
 mod conductor;
-mod graph;
+pub mod graph;
 pub mod graph_query;
 pub mod graph_store;
 mod graph_view;
 mod jj;
+pub mod jev_analysis;
 mod julia_sidecar;
 mod parser;
+pub mod program_model;
 pub mod search_service;
 pub mod vcs;
 pub mod watchdog;
@@ -18,8 +21,10 @@ pub mod watchdog_types;
 pub mod work_store;
 
 use cluster_service::ClusterService;
+use anatomy_snapshot::{AnatomySelection, compare_file as compare_file_anatomy, analyze_files_after};
 use conductor::RunnerAdapter as _;
 use graph::{Graph, Node};
+use graph_query::GraphIndex;
 use graph_store::{GraphStore, SqliteGraphStore};
 use graph_view::{GraphViewRequest, GraphViewResponse, GraphViewSeed, GraphViewService};
 use ignore::WalkBuilder;
@@ -32,15 +37,19 @@ use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
 use std::path::Path;
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Child, Command, Stdio};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter, Manager};
 use work_store::{
-    derive_agent_session_runtime_slice_at, AgentProfile, AgentSessionRuntimeRecord, MissionInput,
-    MissionRecord, MissionStateView, NewObjective, NewVerificationRecord, PatchDecisionRecord,
-    PatchGateRecord, UnitVerdict, VerdictArtifact, VerificationRecord, WorkStore, WorkUnitStatus,
+    derive_agent_session_runtime_slice_at, project_task_lifecycle_events_at, AgentProfile,
+    AgentSessionRuntimeRecord, CoordinatorDraftMission, CoordinatorThreadRecord,
+    CoordinatorThreadSummary, MissionInput, MissionRecord, MissionStateView, NewCoordinatorMessage,
+    NewObjective, NewVerificationRecord, PatchDecisionRecord, PatchGateRecord, PlanRecord,
+    UnitVerdict, VerdictArtifact, VerificationRecord, WorkStore, WorkUnit, WorkUnitStatus,
 };
+
+const COORDINATOR_NAME: &str = "Coordinator";
 
 struct AppState {
     repo: Mutex<PathBuf>,
@@ -199,6 +208,13 @@ fn unix_now_seconds() -> u64 {
     }
 }
 
+fn unix_now_millis() -> u128 {
+    match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(d) => d.as_millis(),
+        Err(_) => 0,
+    }
+}
+
 fn should_defer_vcs_refresh(
     pending_vcs_meta: bool,
     last_vcs_meta_at: Option<Instant>,
@@ -269,6 +285,22 @@ fn unix_now_label() -> String {
         Err(_) => 0,
     };
     format!("unix:{secs}")
+}
+
+fn session_lease_label(now_unix_seconds: u64) -> String {
+    format!(
+        "unix:{}",
+        now_unix_seconds.saturating_add(work_store::AGENT_SESSION_STUCK_HEARTBEAT_TIMEOUT_SECS)
+    )
+}
+
+fn make_session_id(prefix: &str, mission_id: &str, objective_id: Option<&str>) -> String {
+    let millis = unix_now_millis();
+    let objective = objective_id
+        .map(normalize_scope_path)
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "session".to_string());
+    format!("{prefix}-{mission_id}-{objective}-{millis}")
 }
 
 fn parse_watchdog_severity_label(label: &str) -> Option<watchdog_types::WatchdogSeverity> {
@@ -613,54 +645,6 @@ fn capture_worktree_patch(worktree: &Path) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
-fn run_shell_command(cwd: &Path, command: &str) -> Result<conductor::ValidationRunResult, String> {
-    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
-    let output = Command::new(&shell)
-        .arg("-lc")
-        .arg(command)
-        .current_dir(cwd)
-        .output()
-        .map_err(|err| format!("Failed to run shell command: {err}"))?;
-    Ok(conductor::ValidationRunResult {
-        command: command.to_string(),
-        success: output.status.success(),
-        exit_code: output.status.code(),
-        stdout: String::from_utf8_lossy(&output.stdout).to_string(),
-        stderr: String::from_utf8_lossy(&output.stderr).to_string(),
-    })
-}
-
-fn validation_from_diagnostics(
-    diagnostics: Option<&serde_json::Value>,
-) -> Option<conductor::ValidationRunResult> {
-    let validation = diagnostics?.get("validation")?;
-    Some(conductor::ValidationRunResult {
-        command: validation
-            .get("command")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or_default()
-            .to_string(),
-        success: validation
-            .get("success")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false),
-        exit_code: validation
-            .get("exitCode")
-            .and_then(serde_json::Value::as_i64)
-            .map(|value| value as i32),
-        stdout: validation
-            .get("stdout")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or_default()
-            .to_string(),
-        stderr: validation
-            .get("stderr")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or_default()
-            .to_string(),
-    })
-}
-
 fn write_patch_artifact(
     workspace_path: &str,
     objective_id: &str,
@@ -786,6 +770,7 @@ fn build_agent_profile_record(input: AgentProfileInput) -> Result<AgentProfile, 
             .trim()
             .to_string(),
         active: input.active.unwrap_or(false),
+        is_reviewer: input.is_reviewer.unwrap_or(false),
         created_at: now.clone(),
         updated_at: now,
     })
@@ -805,6 +790,64 @@ fn resolve_requested_agent_profile(
             .map(Some);
     }
     store.get_active_agent_profile()
+}
+
+fn resolve_reviewer_generation_profile(
+    store: &WorkStore,
+    requested_profile_id: Option<&str>,
+) -> Result<AgentProfile, String> {
+    if let Some(profile_id) = requested_profile_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        let profile = store
+            .get_agent_profile(profile_id)?
+            .ok_or_else(|| format!("Reviewer profile not found: {profile_id}"))?;
+        if !profile.is_reviewer {
+            return Err(format!(
+                "Profile '{profile_id}' not marked as reviewer. Enable is_reviewer first."
+            ));
+        }
+        if !is_nim_http_profile(&profile) {
+            return Err(format!(
+                "Reviewer profile '{profile_id}' not backed by NIM-compatible model transport."
+            ));
+        }
+        return Ok(profile);
+    }
+
+    let profiles = store.list_agent_profiles()?;
+    let reviewer_profiles = profiles
+        .iter()
+        .filter(|profile| profile.is_reviewer)
+        .cloned()
+        .collect::<Vec<_>>();
+    if reviewer_profiles.is_empty() {
+        return Err(
+            "No reviewer profiles found. Create agent profile with is_reviewer=true.".to_string(),
+        );
+    }
+
+    reviewer_profiles
+        .iter()
+        .find(|profile| profile.active && is_nim_http_profile(profile))
+        .cloned()
+        .or_else(|| {
+            reviewer_profiles
+                .iter()
+                .find(|profile| is_nim_http_profile(profile))
+                .cloned()
+        })
+        .ok_or_else(|| {
+            let ids = reviewer_profiles
+                .iter()
+                .map(|profile| profile.id.clone())
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(
+                "Reviewer profiles exist but none NIM-compatible: {ids}. Use nim/opencode/pi reviewer profile."
+            )
+        })
 }
 
 fn verification_details_patch_base_revision(details: &serde_json::Value) -> Option<String> {
@@ -849,7 +892,8 @@ struct MissionSchedulerSummary {
 }
 
 fn normalize_scope_paths(paths: &[String]) -> Vec<String> {
-    paths.iter()
+    paths
+        .iter()
         .map(|path| normalize_scope_path(path))
         .filter(|path| !path.is_empty())
         .collect()
@@ -863,9 +907,7 @@ fn scope_paths_overlap(left: &[String], right: &[String]) -> bool {
     }
     left.iter().any(|lhs| {
         right.iter().any(|rhs| {
-            lhs == rhs
-                || lhs.starts_with(&format!("{rhs}/"))
-                || rhs.starts_with(&format!("{lhs}/"))
+            lhs == rhs || lhs.starts_with(&format!("{rhs}/")) || rhs.starts_with(&format!("{lhs}/"))
         })
     })
 }
@@ -877,7 +919,6 @@ fn derive_mission_scheduler_summary(
     let latest_session_by_objective = view
         .sessions
         .iter()
-        .rev()
         .filter_map(|session| {
             session
                 .objective_id
@@ -899,7 +940,8 @@ fn derive_mission_scheduler_summary(
 
     for objective in &view.objectives {
         let session = latest_session_by_objective.get(&objective.id).copied();
-        let runtime = session.map(|entry| derive_agent_session_runtime_slice_at(entry, now_unix_seconds));
+        let runtime =
+            session.map(|entry| derive_agent_session_runtime_slice_at(entry, now_unix_seconds));
         let normalized_scope = normalize_scope_paths(&objective.meta.scope_paths);
 
         let entry = match objective.status {
@@ -911,7 +953,7 @@ fn derive_mission_scheduler_summary(
                 state: "failed".to_string(),
                 reason: None,
             },
-            WorkUnitStatus::Claimed => {
+            WorkUnitStatus::Claimed | WorkUnitStatus::Running | WorkUnitStatus::RetryScheduled => {
                 let runtime_status = runtime
                     .as_ref()
                     .map(|slice| slice.runtime_status.as_str())
@@ -939,7 +981,8 @@ fn derive_mission_scheduler_summary(
                 if let Some(slice) = runtime.as_ref() {
                     if slice.runtime_status == "stuck" {
                         stale_session_count += 1;
-                        blocked_reason = Some("stale session for objective needs sweep".to_string());
+                        blocked_reason =
+                            Some("stale session for objective needs sweep".to_string());
                     }
                 }
                 if blocked_reason.is_none()
@@ -1138,6 +1181,164 @@ fn build_mission_record(
     })
 }
 
+fn coordinator_draft_from_mission(
+    mission: Option<&MissionRecord>,
+    planner_profile_id: Option<String>,
+) -> CoordinatorDraftMission {
+    CoordinatorDraftMission {
+        title: mission.map(|entry| entry.title.clone()).unwrap_or_default(),
+        brief: mission.map(|entry| entry.brief.clone()).unwrap_or_default(),
+        validation_command: mission
+            .map(|entry| entry.validation_command.clone())
+            .unwrap_or_default(),
+        issue_key: mission.and_then(|entry| entry.issue_key.clone()),
+        issue_url: mission.and_then(|entry| entry.issue_url.clone()),
+        planner_profile_id: mission
+            .and_then(|entry| entry.planner_profile_id.clone())
+            .or(planner_profile_id),
+        planner_notes: mission.and_then(|entry| entry.planner_notes.clone()),
+        planner_prompt_override: mission.and_then(|entry| entry.planner_prompt_override.clone()),
+    }
+}
+
+fn mission_input_from_coordinator_draft(
+    mission_id: Option<&str>,
+    draft: &CoordinatorDraftMission,
+) -> MissionInput {
+    MissionInput {
+        id: mission_id.map(str::to_string),
+        title: draft.title.trim().to_string(),
+        brief: draft.brief.trim().to_string(),
+        validation_command: draft.validation_command.trim().to_string(),
+        planner_notes: draft
+            .planner_notes
+            .as_ref()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty()),
+        planner_profile_id: draft
+            .planner_profile_id
+            .as_ref()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty()),
+        planner_prompt_override: draft
+            .planner_prompt_override
+            .as_ref()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty()),
+        issue_key: draft
+            .issue_key
+            .as_ref()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty()),
+        issue_url: draft
+            .issue_url
+            .as_ref()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty()),
+    }
+}
+
+fn derive_problem_title(problem: &str) -> String {
+    let first_line = problem
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("Unscoped mission");
+    let compact = first_line
+        .trim_matches(|ch: char| ch == '.' || ch == '!' || ch == '?')
+        .trim();
+    let title = compact
+        .split_whitespace()
+        .take(7)
+        .collect::<Vec<_>>()
+        .join(" ");
+    if title.is_empty() {
+        "Unscoped mission".to_string()
+    } else {
+        title
+    }
+}
+
+fn extract_validation_command(content: &str) -> Option<String> {
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    let from_suffix = ["validation command:", "validation:", "command:", "run:"]
+        .iter()
+        .find_map(|prefix| {
+            lower.find(prefix).map(|index| {
+                trimmed[index + prefix.len()..]
+                    .trim()
+                    .trim_matches('`')
+                    .to_string()
+            })
+        });
+    if let Some(found) = from_suffix.filter(|value| !value.is_empty()) {
+        return Some(found);
+    }
+
+    let lower = trimmed.to_ascii_lowercase();
+    for marker in [
+        "npm ", "pnpm ", "yarn ", "bun ", "cargo ", "mix ", "pytest ", "uv ", "./",
+    ] {
+        if let Some(index) = lower.find(marker) {
+            let command = trimmed[index..]
+                .trim()
+                .trim_matches('`')
+                .trim_end_matches(['.', '!', '?', ';'])
+                .trim()
+                .to_string();
+            if !command.is_empty() {
+                return Some(command);
+            }
+        }
+    }
+
+    trimmed
+        .lines()
+        .map(str::trim)
+        .map(|line| line.trim_matches('`'))
+        .find(|line| {
+            let lower = line.to_ascii_lowercase();
+            lower.starts_with("npm ")
+                || lower.starts_with("pnpm ")
+                || lower.starts_with("yarn ")
+                || lower.starts_with("bun ")
+                || lower.starts_with("cargo ")
+                || lower.starts_with("mix ")
+                || lower.starts_with("pytest ")
+                || lower.starts_with("uv ")
+                || lower.starts_with("./")
+        })
+        .map(str::to_string)
+}
+
+fn message_wants_report(content: &str) -> bool {
+    let lower = content.to_ascii_lowercase();
+    lower.contains("report") || lower.contains("status") || lower.contains("progress")
+}
+
+fn message_wants_launch(content: &str) -> bool {
+    let lower = content.to_ascii_lowercase();
+    lower.contains("launch") || lower.contains("spawn") || lower.contains("run workers")
+}
+
+fn message_is_validation_only(content: &str) -> bool {
+    let lower = content.to_ascii_lowercase();
+    extract_validation_command(content).is_some()
+        && (lower.contains("validation command")
+            || lower.starts_with("validation:")
+            || lower.starts_with("command:")
+            || lower.starts_with("run:")
+            || lower.starts_with("use "))
+}
+
+fn coordinator_message_payload(content: &str) -> serde_json::Value {
+    serde_json::json!({ "content": content })
+}
+
 fn agent_profile_has_capability(profile: &AgentProfile, capability: &str) -> bool {
     let wanted = capability.trim().to_ascii_lowercase();
     if wanted.is_empty() {
@@ -1188,27 +1389,22 @@ fn resolve_mission_planner_profile(
         .filter(|profile| is_nim_http_profile(profile))
         .cloned()
         .or_else(|| {
-            profiles
-                .into_iter()
-                .find(|profile| {
-                    is_nim_http_profile(profile) && agent_profile_has_capability(profile, "can_plan")
-                })
+            profiles.into_iter().find(|profile| {
+                is_nim_http_profile(profile) && agent_profile_has_capability(profile, "can_plan")
+            })
         }))
 }
 
 fn profile_env_lookup(profile: &AgentProfile, keys: &[&str]) -> Option<String> {
-    let from_profile = profile
-        .env
-        .as_object()
-        .and_then(|map| {
-            keys.iter().find_map(|key| {
-                map.get(*key)
-                    .and_then(|value| value.as_str())
-                    .map(str::trim)
-                    .filter(|value| !value.is_empty())
-                    .map(|value| value.to_string())
-            })
-        });
+    let from_profile = profile.env.as_object().and_then(|map| {
+        keys.iter().find_map(|key| {
+            map.get(*key)
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(|value| value.to_string())
+        })
+    });
     if from_profile.is_some() {
         return from_profile;
     }
@@ -1282,11 +1478,7 @@ fn profile_launch_env_json(
     profile: &AgentProfile,
     bundle: &agent_harness::AgentHarnessBundle,
 ) -> Result<String, String> {
-    let mut env_map = profile
-        .env
-        .as_object()
-        .cloned()
-        .unwrap_or_default();
+    let mut env_map = profile.env.as_object().cloned().unwrap_or_default();
     if is_opencode_cli_profile(profile) {
         env_map.insert(
             "OPENCODE_CONFIG".to_string(),
@@ -1337,7 +1529,9 @@ fn profile_launch_args_json(
             args.push("--model".to_string());
             args.push(opencode_profile_model(profile));
         }
-        let has_prompt = args.iter().any(|value| value == "-p" || value == "--prompt");
+        let has_prompt = args
+            .iter()
+            .any(|value| value == "-p" || value == "--prompt");
         if !has_prompt {
             let prompt = std::fs::read_to_string(&bundle.prompt_path)
                 .map_err(|err| format!("read {}: {err}", bundle.prompt_path))?;
@@ -1507,6 +1701,18 @@ fn plan_mission_with_nim_profile(
     parse_planned_objectives(&output_text, &input.validation_command)
 }
 
+fn generate_mission_objectives(
+    repo: &Path,
+    input: &MissionInput,
+    planner_profile: Option<&AgentProfile>,
+) -> Result<(String, Vec<NewObjective>), String> {
+    if let Some(profile) = planner_profile {
+        let objectives = plan_mission_with_nim_profile(repo, input, profile)?;
+        return Ok((profile.label.clone(), objectives));
+    }
+    Ok(("fixture".to_string(), fixture_objectives(input)))
+}
+
 fn update_watchdog_from_mission(
     runtime: &mut watchdog::WatchdogRuntimeState,
     mission: &MissionRecord,
@@ -1527,6 +1733,138 @@ fn update_watchdog_from_mission(
     });
 }
 
+fn sync_conductor_to_store(
+    store: &mut WorkStore,
+    runtime: &conductor::ConductorRuntimeState,
+) -> Result<(), String> {
+    for run in &runtime.issue_runs {
+        let plan = PlanRecord {
+            task_id: run.task.task_id.clone(),
+            workflow_id: run.context.workflow_id.clone(),
+            title: run
+                .context
+                .issue_title
+                .clone()
+                .unwrap_or_else(|| run.task.task_id.clone()),
+            prompt: run.context.prompt.clone(),
+            max_retries: run.context.max_retries,
+            timeout_seconds: run.context.timeout_seconds,
+            issue_id: run.context.issue_id.clone(),
+            issue_title: run.context.issue_title.clone(),
+            created_at: run.task.claimed_at.clone().unwrap_or_else(unix_now_label),
+        };
+        store.upsert_plan_record(&plan)?;
+
+        let unit = WorkUnit {
+            id: run.task.task_id.clone(),
+            task_id: run.task.task_id.clone(),
+            title: run
+                .context
+                .issue_title
+                .clone()
+                .unwrap_or_else(|| run.task.task_id.clone()),
+            prompt: run.context.prompt.clone(),
+            status: match run.task.state {
+                conductor::ConductorTaskState::Claimed => WorkUnitStatus::Claimed,
+                conductor::ConductorTaskState::Running => WorkUnitStatus::Running,
+                conductor::ConductorTaskState::RetryScheduled => WorkUnitStatus::RetryScheduled,
+                conductor::ConductorTaskState::Reconciled => match run.task.reconciled_outcome {
+                    Some(conductor::ConductorReconciledOutcome::Succeeded) => WorkUnitStatus::Done,
+                    _ => WorkUnitStatus::Failed,
+                },
+            },
+            claimed_by: None,
+            claimed_at: run.task.claimed_at.clone(),
+            started_at: run.task.started_at.clone(),
+            retry_at: run.task.retry_at.clone(),
+            reconciled_at: run.task.reconciled_at.clone(),
+            run_attempt: run.task.run_attempt,
+            retry_count: run.task.retry_count,
+            max_retries: run.task.max_retries,
+            last_error: run.task.last_error.clone(),
+            reconciled_outcome: run
+                .task
+                .reconciled_outcome
+                .as_ref()
+                .map(|o| format!("{:?}", o)),
+            reconciled_note: run.task.reconciled_note.clone(),
+            created_at: run.task.claimed_at.clone().unwrap_or_else(unix_now_label),
+        };
+        store.upsert_work_unit(&unit)?;
+    }
+    Ok(())
+}
+
+fn load_conductor_from_store(
+    store: &WorkStore,
+    runtime: &mut conductor::ConductorRuntimeState,
+) -> Result<(), String> {
+    let plans = store.list_plans()?;
+    let all_units = store.list_all_work_units()?;
+
+    runtime.tasks.clear();
+    runtime.issue_runs.clear();
+
+    for plan_rec in plans {
+        let units: Vec<_> = all_units
+            .iter()
+            .filter(|u| u.task_id == plan_rec.task_id)
+            .collect();
+        if units.is_empty() {
+            continue;
+        }
+        let unit = units[0];
+
+        let task = conductor::ConductorTask {
+            task_id: unit.task_id.clone(),
+            state: match unit.status {
+                WorkUnitStatus::Claimed => conductor::ConductorTaskState::Claimed,
+                WorkUnitStatus::Running => conductor::ConductorTaskState::Running,
+                WorkUnitStatus::RetryScheduled => conductor::ConductorTaskState::RetryScheduled,
+                WorkUnitStatus::Done | WorkUnitStatus::Failed => {
+                    conductor::ConductorTaskState::Reconciled
+                }
+                WorkUnitStatus::Pending => conductor::ConductorTaskState::Claimed,
+            },
+            claimed_at: unit.claimed_at.clone(),
+            started_at: unit.started_at.clone(),
+            retry_at: unit.retry_at.clone(),
+            reconciled_at: unit.reconciled_at.clone(),
+            run_attempt: unit.run_attempt,
+            retry_count: unit.retry_count,
+            max_retries: unit.max_retries,
+            last_error: unit.last_error.clone(),
+            reconciled_outcome: unit.reconciled_outcome.as_deref().and_then(|o| match o {
+                "Succeeded" => Some(conductor::ConductorReconciledOutcome::Succeeded),
+                "Failed" => Some(conductor::ConductorReconciledOutcome::Failed),
+                "Cancelled" => Some(conductor::ConductorReconciledOutcome::Cancelled),
+                "Exhausted" => Some(conductor::ConductorReconciledOutcome::Exhausted),
+                _ => None,
+            }),
+            reconciled_note: unit.reconciled_note.clone(),
+        };
+
+        let context = conductor::TaskContext {
+            task_id: plan_rec.task_id.clone(),
+            workflow_id: plan_rec.workflow_id.clone(),
+            prompt: plan_rec.prompt.clone(),
+            max_retries: plan_rec.max_retries,
+            timeout_seconds: plan_rec.timeout_seconds,
+            issue_id: plan_rec.issue_id.clone(),
+            issue_title: plan_rec.issue_title.clone(),
+        };
+
+        runtime.tasks.push(task.clone());
+        runtime.issue_runs.push(conductor::IssueRun {
+            task,
+            context,
+            active_session_id: None,
+            artifacts: vec![],
+        });
+    }
+    Ok(())
+}
+
 fn summarize_mission(view: &MissionStateView) -> String {
     let Some(mission) = &view.mission else {
         return "Mission not planned yet.".to_string();
@@ -1537,6 +1875,335 @@ fn summarize_mission(view: &MissionStateView) -> String {
         view.sessions.len(),
         mission.brief
     )
+}
+
+fn unfinished_mission_state(state: &str) -> bool {
+    !matches!(state, "completed" | "resolved" | "abandoned")
+}
+
+fn coordinator_thread_title(
+    draft: &CoordinatorDraftMission,
+    mission: Option<&MissionRecord>,
+) -> String {
+    let explicit = draft.title.trim();
+    if !explicit.is_empty() {
+        return explicit.to_string();
+    }
+    mission
+        .map(|entry| entry.title.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "Unscoped mission".to_string())
+}
+
+fn create_coordinator_thread(
+    repo: &Path,
+    linked_mission: Option<&MissionRecord>,
+    planner_profile_id: Option<String>,
+) -> CoordinatorThreadRecord {
+    let draft = coordinator_draft_from_mission(linked_mission, planner_profile_id);
+    let now = unix_now_label();
+    CoordinatorThreadRecord {
+        id: format!("coordinator-{}", unix_now_millis()),
+        repo_path: repo.display().to_string(),
+        mission_id: linked_mission.map(|mission| mission.id.clone()),
+        persona_name: COORDINATOR_NAME.to_string(),
+        title: coordinator_thread_title(&draft, linked_mission),
+        state: if linked_mission.is_some() {
+            "running".to_string()
+        } else {
+            "wake".to_string()
+        },
+        draft_mission: draft,
+        pending_plan: Vec::new(),
+        created_at: now.clone(),
+        updated_at: now,
+    }
+}
+
+fn build_coordinator_wake_content(
+    repo: &Path,
+    mission_view: Option<&MissionStateView>,
+    thread: &CoordinatorThreadRecord,
+) -> String {
+    let repo_label = repo
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("repo");
+    if let Some(view) = mission_view.and_then(|entry| entry.mission.as_ref().map(|_| entry)) {
+        let mission = view.mission.as_ref().expect("mission exists");
+        format!(
+            "{name}. Repo {repo_label} warm. Resuming mission '{title}' in state {state}. {objectives} objectives, {sessions} sessions. What problem or feature now?",
+            name = COORDINATOR_NAME,
+            repo_label = repo_label,
+            title = mission.title,
+            state = mission.state,
+            objectives = view.summary.total_objectives,
+            sessions = view.sessions.len(),
+        )
+    } else {
+        format!(
+            "{name}. Repo {repo_label} warm. Last thread {thread_title}. No active mission locked. What problem or feature now? Validation can come later.",
+            name = COORDINATOR_NAME,
+            repo_label = repo_label,
+            thread_title = thread.title,
+        )
+    }
+}
+
+fn build_coordinator_plan_content(thread: &CoordinatorThreadRecord, planner_label: &str) -> String {
+    let mut lines = vec![format!(
+        "Plan proposal. {} objective(s). Planner: {}.",
+        thread.pending_plan.len(),
+        planner_label
+    )];
+    for objective in &thread.pending_plan {
+        let scope = if objective.scope_paths.is_empty() {
+            "scope: inferred".to_string()
+        } else {
+            format!("scope: {}", objective.scope_paths.join(", "))
+        };
+        lines.push(format!("- {} ({})", objective.title, scope));
+    }
+    lines.push("Approve plan when ready.".to_string());
+    lines.join("\n")
+}
+
+fn mission_report_content(view: &MissionStateView) -> String {
+    let Some(mission) = &view.mission else {
+        return "Mission report. No active mission.".to_string();
+    };
+    let now_unix_seconds = unix_now_seconds();
+    let live_sessions = view
+        .sessions
+        .iter()
+        .filter(|session| {
+            let runtime = derive_agent_session_runtime_slice_at(session, now_unix_seconds);
+            runtime.runtime_status == "running" || runtime.runtime_status == "idle"
+        })
+        .collect::<Vec<_>>();
+    let latest_live = live_sessions.first().copied();
+    let latest_verification = view
+        .verifications
+        .first()
+        .map(|entry| entry.summary.clone());
+    let latest_event = view.events.last().map(|entry| {
+        entry
+            .payload
+            .get("summary")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_else(|| entry.event_type.clone())
+    });
+    let mut lines = vec![
+        format!("Mission report. {}.", mission.title),
+        format!(
+            "Objectives: {} total, {} pending, {} done, {} failed.",
+            view.summary.total_objectives,
+            view.summary.pending_objectives,
+            view.summary.done_objectives,
+            view.summary.failed_objectives,
+        ),
+        format!("Live sessions: {}.", live_sessions.len()),
+    ];
+    if let Some(session) = latest_live {
+        let runtime = derive_agent_session_runtime_slice_at(session, now_unix_seconds);
+        lines.push(format!(
+            "Latest live session: {} [{}].",
+            session.id, runtime.runtime_status
+        ));
+        if !session.touched_paths.is_empty() {
+            lines.push(format!(
+                "Touched paths: {}.",
+                session.touched_paths.join(", ")
+            ));
+        }
+    }
+    if let Some(summary) = latest_verification.filter(|value| !value.trim().is_empty()) {
+        lines.push(format!("Latest verification: {}.", summary));
+    }
+    if let Some(event_type) = latest_event.filter(|value| !value.trim().is_empty()) {
+        lines.push(format!("Latest event: {}.", event_type));
+    }
+    lines.join(" ")
+}
+
+fn coordinator_latest_live_session_id(
+    view: Option<&MissionStateView>,
+    now_unix_seconds: u64,
+) -> Option<String> {
+    let sessions = view.map(|entry| entry.sessions.as_slice()).unwrap_or(&[]);
+    sessions
+        .iter()
+        .find(|session| {
+            let runtime = derive_agent_session_runtime_slice_at(session, now_unix_seconds);
+            runtime.runtime_status == "running" || runtime.runtime_status == "idle"
+        })
+        .map(|session| session.id.clone())
+}
+
+fn ensure_coordinator_thread(
+    store: &mut WorkStore,
+    repo: &Path,
+    requested_thread_id: Option<&str>,
+    requested_mission_id: Option<&str>,
+) -> Result<CoordinatorThreadRecord, String> {
+    if let Some(thread_id) = requested_thread_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        if let Some(thread) = store.get_coordinator_thread(thread_id)? {
+            return Ok(thread);
+        }
+    }
+
+    let repo_label = repo.display().to_string();
+    if let Some(thread) = store.get_latest_coordinator_thread(&repo_label)? {
+        return Ok(thread);
+    }
+
+    let linked_mission = if let Some(mission_id) = requested_mission_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        store.get_mission(mission_id)?
+    } else {
+        store
+            .get_latest_mission()?
+            .filter(|mission| unfinished_mission_state(&mission.state))
+    };
+    let planner_profile_id =
+        resolve_mission_planner_profile(store, None)?.map(|profile| profile.id);
+    let thread = create_coordinator_thread(repo, linked_mission.as_ref(), planner_profile_id);
+    store.upsert_coordinator_thread(&thread)?;
+    Ok(thread)
+}
+
+fn ensure_coordinator_wake_message(
+    store: &mut WorkStore,
+    repo: &Path,
+    thread: &CoordinatorThreadRecord,
+) -> Result<(), String> {
+    if !store.list_coordinator_messages(&thread.id, 1)?.is_empty() {
+        return Ok(());
+    }
+    let mission_view = thread
+        .mission_id
+        .as_deref()
+        .map(|mission_id| store.load_mission_state(Some(mission_id), 50))
+        .transpose()?;
+    let content = build_coordinator_wake_content(repo, mission_view.as_ref(), thread);
+    store.append_coordinator_message(NewCoordinatorMessage {
+        thread_id: &thread.id,
+        mission_id: thread.mission_id.as_deref(),
+        objective_id: None,
+        session_id: None,
+        role: "coordinator",
+        kind: "wake_brief",
+        content: &content,
+        payload: serde_json::json!({ "personaName": COORDINATOR_NAME }),
+    })?;
+    Ok(())
+}
+
+fn coordinator_state_to_frontend(
+    store: &mut WorkStore,
+    repo: &Path,
+    requested_thread_id: Option<&str>,
+    requested_mission_id: Option<&str>,
+) -> Result<serde_json::Value, String> {
+    let thread = ensure_coordinator_thread(store, repo, requested_thread_id, requested_mission_id)?;
+    ensure_coordinator_wake_message(store, repo, &thread)?;
+    let thread = store
+        .get_coordinator_thread(&thread.id)?
+        .ok_or_else(|| "coordinator thread vanished".to_string())?;
+    let messages = store.list_coordinator_messages(&thread.id, 200)?;
+    let threads = store
+        .list_coordinator_threads(&repo.display().to_string(), 24)?
+        .into_iter()
+        .map(|entry: CoordinatorThreadSummary| {
+            serde_json::json!({
+                "id": entry.id,
+                "missionId": entry.mission_id,
+                "title": entry.title,
+                "state": entry.state,
+                "updatedAt": entry.updated_at,
+            })
+        })
+        .collect::<Vec<_>>();
+    let mission_view = thread
+        .mission_id
+        .as_deref()
+        .map(|mission_id| store.load_mission_state(Some(mission_id), 200))
+        .transpose()?;
+    let now_unix_seconds = unix_now_seconds();
+    let latest_session_id = mission_view
+        .as_ref()
+        .and_then(|view| view.sessions.first().map(|session| session.id.clone()));
+    let latest_live_session_id =
+        coordinator_latest_live_session_id(mission_view.as_ref(), now_unix_seconds);
+    let lifecycle_events = if let Some(view) = mission_view.as_ref() {
+        project_task_lifecycle_events_at(
+            thread.mission_id.as_deref().unwrap_or(&thread.id),
+            &thread.id,
+            &messages,
+            &view.events,
+            &view.sessions,
+            &view.patch_decisions,
+            &view.verifications,
+            now_unix_seconds,
+        )
+    } else {
+        project_task_lifecycle_events_at(
+            &thread.id,
+            &thread.id,
+            &messages,
+            &[],
+            &[],
+            &[],
+            &[],
+            now_unix_seconds,
+        )
+    };
+    Ok(serde_json::json!({
+        "threadId": thread.id,
+        "missionId": thread.mission_id,
+        "personaName": thread.persona_name,
+        "title": thread.title,
+        "state": thread.state,
+        "draftMission": thread.draft_mission,
+        "pendingPlan": thread.pending_plan,
+        "messages": messages,
+        "summary": mission_view.as_ref().map(summarize_mission).unwrap_or_else(|| "Coordinator waiting on mission brief.".to_string()),
+        "latestSessionId": latest_session_id,
+        "latestLiveSessionId": latest_live_session_id,
+        "lifecycleEvents": lifecycle_events,
+        "threads": threads,
+        "canApprovePlan": !thread.pending_plan.is_empty(),
+        "canAskReport": mission_view.as_ref().and_then(|view| view.mission.as_ref()).is_some(),
+        "canLaunchWorkers": mission_view.as_ref().map(|view| view.summary.pending_objectives > 0).unwrap_or(false),
+    }))
+}
+
+#[tauri::command]
+fn resume_mission_thread(
+    state: tauri::State<AppState>,
+    thread_id: String,
+) -> Result<serde_json::Value, String> {
+    let repo = state.repo.lock().clone();
+    let mut store = WorkStore::open_or_create(&repo)?;
+    coordinator_state_to_frontend(&mut store, &repo, Some(thread_id.trim()), None)
+}
+
+#[tauri::command]
+fn start_coordinator_thread(state: tauri::State<AppState>) -> Result<serde_json::Value, String> {
+    let repo = state.repo.lock().clone();
+    let mut store = WorkStore::open_or_create(&repo)?;
+    let planner_profile_id =
+        resolve_mission_planner_profile(&store, None)?.map(|profile| profile.id);
+    let thread = create_coordinator_thread(&repo, None, planner_profile_id);
+    store.upsert_coordinator_thread(&thread)?;
+    ensure_coordinator_wake_message(&mut store, &repo, &thread)?;
+    coordinator_state_to_frontend(&mut store, &repo, Some(&thread.id), None)
 }
 
 fn evaluate_patch_gate_for_objective(
@@ -1680,47 +2347,29 @@ struct CodeWorkerExecution {
     diagnostics: Option<serde_json::Value>,
 }
 
-fn execute_internal_code_worker(
-    repo: &Path,
-    mission: &MissionRecord,
-    objective: &work_store::ObjectiveRecord,
-    session_id: &str,
-) -> Result<CodeWorkerExecution, String> {
-    let write_spec = deterministic_code_write_spec(mission, objective)?;
-    let base_revision = current_repo_revision(repo);
-    let result = conductor::run_deterministic_code_worker(
-        repo,
-        &mission.id,
-        &objective.id,
-        session_id,
-        &write_spec,
-    )?;
-    let patch_artifact_path = write_patch_artifact(
-        &result.workspace.workspace_path,
-        &objective.id,
-        &result.patch,
-    )?;
-    Ok(CodeWorkerExecution {
-        profile_id: "local-code-worker".to_string(),
-        worker_kind: "code_worker".to_string(),
-        workspace_path: result.workspace.workspace_path,
-        relative_path: result.relative_path,
-        touched_paths: result.touched_paths,
-        patch_text: result.patch,
-        patch_artifact_path,
-        validation: result.validation,
-        base_revision,
-        diagnostics: None,
-    })
+struct ProfiledWorkerPrepared {
+    profile_id: String,
+    worker_kind: String,
+    workspace_path: String,
+    base_revision: String,
+    harness_bundle: agent_harness::AgentHarnessBundle,
 }
 
-fn execute_profiled_code_worker(
+fn worker_kind_for_profile(profile: &AgentProfile) -> &'static str {
+    match profile.provider.trim() {
+        "gemini_cli" | "codex_cli" | "claude_cli" | "local_cli" | "pi_cli" | "opencode_cli"
+        | "opencode_nim" => "cli_worker",
+        _ => "code_worker",
+    }
+}
+
+fn build_profiled_worker_launch(
     repo: &Path,
     mission: &MissionRecord,
     objective: &work_store::ObjectiveRecord,
     session_id: &str,
     profile: &AgentProfile,
-) -> Result<CodeWorkerExecution, String> {
+) -> Result<(Command, ProfiledWorkerPrepared), String> {
     if profile.command.trim().is_empty() {
         return Err(format!("agent profile '{}' command is empty", profile.id));
     }
@@ -1799,6 +2448,7 @@ fn execute_profiled_code_worker(
             &harness_bundle.context_snapshot_path,
         )
         .env("SLOPOSCOPE_AGENT_PROMPT_PATH", &harness_bundle.prompt_path)
+        .env("SLOPOSCOPE_AGENT_NUDGE_PATH", &harness_bundle.nudge_path)
         .env(
             "SLOPOSCOPE_PROMPT_TO_STDIN",
             if agent_harness::prompt_to_stdin_for_provider(&profile.provider) {
@@ -1817,15 +2467,33 @@ fn execute_profiled_code_worker(
             &harness_bundle.diagnostics_path,
         )
         .current_dir(&workspace_path);
-    let output = command
-        .output()
+
+    let launch = ProfiledWorkerPrepared {
+        profile_id: profile.id.clone(),
+        worker_kind: worker_kind_for_profile(profile).to_string(),
+        workspace_path: workspace.workspace_path,
+        base_revision,
+        harness_bundle,
+    };
+    Ok((command, launch))
+}
+
+fn collect_profiled_worker_execution(
+    child: Child,
+    prepared: ProfiledWorkerPrepared,
+    objective: &work_store::ObjectiveRecord,
+    profile: &AgentProfile,
+) -> Result<CodeWorkerExecution, String> {
+    let output = child
+        .wait_with_output()
         .map_err(|err| format!("failed to run agent profile '{}': {err}", profile.id))?;
+    let workspace_path = PathBuf::from(&prepared.workspace_path);
     let touched_paths = capture_worktree_touched_paths(&workspace_path)?;
     let patch_text = capture_worktree_patch(&workspace_path)?;
     let patch_artifact_path =
-        write_patch_artifact(&workspace.workspace_path, &objective.id, &patch_text)?;
+        write_patch_artifact(&prepared.workspace_path, &objective.id, &patch_text)?;
     let relative_path = primary_path_from_touched_paths(&touched_paths);
-    let harness_diagnostics = std::fs::read_to_string(&harness_bundle.diagnostics_path)
+    let harness_diagnostics = std::fs::read_to_string(&prepared.harness_bundle.diagnostics_path)
         .ok()
         .and_then(|raw| serde_json::from_str::<Value>(&raw).ok());
     let harness_reported_validation = harness_diagnostics.is_some();
@@ -1853,70 +2521,381 @@ fn execute_profiled_code_worker(
         );
         map.insert(
             "bundleDir".to_string(),
-            serde_json::Value::String(harness_bundle.bundle_dir.clone()),
-        );
-        map.insert(
-            "promptPath".to_string(),
-            serde_json::Value::String(harness_bundle.prompt_path.clone()),
-        );
-        map.insert(
-            "mcpConfigPath".to_string(),
-            serde_json::Value::String(harness_bundle.mcp_config_path.clone()),
-        );
-        map.insert(
-            "opencodeConfigPath".to_string(),
-            serde_json::Value::String(harness_bundle.opencode_config_path.clone()),
-        );
-        map.insert(
-            "piConfigDir".to_string(),
-            serde_json::Value::String(harness_bundle.pi_config_dir.clone()),
-        );
-        map.insert(
-            "piConfigPath".to_string(),
-            serde_json::Value::String(harness_bundle.pi_config_path.clone()),
-        );
-        map.insert(
-            "piModelsPath".to_string(),
-            serde_json::Value::String(harness_bundle.pi_models_path.clone()),
+            serde_json::Value::String(prepared.harness_bundle.bundle_dir.clone()),
         );
         map.insert(
             "contextPath".to_string(),
-            serde_json::Value::String(harness_bundle.context_snapshot_path.clone()),
+            serde_json::Value::String(prepared.harness_bundle.context_snapshot_path.clone()),
         );
+        map.insert(
+            "nudgePath".to_string(),
+            serde_json::Value::String(prepared.harness_bundle.nudge_path.clone()),
+        );
+        if agent_harness::is_opencode_cli_provider(&profile.provider) {
+            map.insert(
+                "opencodeConfigPath".to_string(),
+                serde_json::Value::String(prepared.harness_bundle.opencode_config_path.clone()),
+            );
+        }
+        if agent_harness::is_pi_cli_provider(&profile.provider) {
+            map.insert(
+                "piConfigDir".to_string(),
+                serde_json::Value::String(prepared.harness_bundle.pi_config_dir.clone()),
+            );
+            map.insert(
+                "piConfigPath".to_string(),
+                serde_json::Value::String(prepared.harness_bundle.pi_config_path.clone()),
+            );
+            map.insert(
+                "piModelsPath".to_string(),
+                serde_json::Value::String(prepared.harness_bundle.pi_models_path.clone()),
+            );
+        }
     }
+
     let validation = if harness_reported_validation {
-        validation_from_diagnostics(Some(&diagnostics)).unwrap_or(conductor::ValidationRunResult {
-            command: validation_command.clone(),
-            success: false,
-            exit_code: None,
-            stdout: String::new(),
-            stderr: "agent harness omitted validation result".to_string(),
-        })
+        diagnostics
+            .get("validation")
+            .cloned()
+            .and_then(|value| serde_json::from_value::<conductor::ValidationRunResult>(value).ok())
+            .unwrap_or_else(|| conductor::ValidationRunResult {
+                command: String::new(),
+                success: output.status.success(),
+                exit_code: output.status.code(),
+                stdout: String::new(),
+                stderr: String::new(),
+            })
     } else {
-        run_shell_command(&workspace_path, &validation_command)?
+        conductor::ValidationRunResult {
+            command: String::new(),
+            success: output.status.success(),
+            exit_code: output.status.code(),
+            stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+            stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+        }
     };
+
     Ok(CodeWorkerExecution {
-        profile_id: profile.id.clone(),
-        worker_kind: "cli_worker".to_string(),
-        workspace_path: workspace.workspace_path,
+        profile_id: prepared.profile_id,
+        worker_kind: prepared.worker_kind,
+        workspace_path: prepared.workspace_path,
         relative_path,
         touched_paths,
         patch_text,
         patch_artifact_path,
         validation,
-        base_revision,
+        base_revision: prepared.base_revision,
         diagnostics: Some(diagnostics),
     })
+}
+
+fn execute_internal_code_worker(
+    repo: &Path,
+    mission: &MissionRecord,
+    objective: &work_store::ObjectiveRecord,
+    session_id: &str,
+) -> Result<CodeWorkerExecution, String> {
+    let write_spec = deterministic_code_write_spec(mission, objective)?;
+    let base_revision = current_repo_revision(repo);
+    let result = conductor::run_deterministic_code_worker(
+        repo,
+        &mission.id,
+        &objective.id,
+        session_id,
+        &write_spec,
+    )?;
+    let patch_artifact_path = write_patch_artifact(
+        &result.workspace.workspace_path,
+        &objective.id,
+        &result.patch,
+    )?;
+    Ok(CodeWorkerExecution {
+        profile_id: "local-code-worker".to_string(),
+        worker_kind: "code_worker".to_string(),
+        workspace_path: result.workspace.workspace_path,
+        relative_path: result.relative_path,
+        touched_paths: result.touched_paths,
+        patch_text: result.patch,
+        patch_artifact_path,
+        validation: result.validation,
+        base_revision,
+        diagnostics: None,
+    })
+}
+
+fn execute_profiled_code_worker(
+    repo: &Path,
+    mission: &MissionRecord,
+    objective: &work_store::ObjectiveRecord,
+    session_id: &str,
+    profile: &AgentProfile,
+) -> Result<CodeWorkerExecution, String> {
+    let (mut command, prepared) =
+        build_profiled_worker_launch(repo, mission, objective, session_id, profile)?;
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let child = command
+        .spawn()
+        .map_err(|err| format!("failed to run agent profile '{}': {err}", profile.id))?;
+    collect_profiled_worker_execution(child, prepared, objective, profile)
+}
+
+fn persist_code_worker_completion(
+    repo: &Path,
+    mission: &MissionRecord,
+    objective: &work_store::ObjectiveRecord,
+    unit: &WorkUnit,
+    session_id: &str,
+    session_created_at: &str,
+    execution: CodeWorkerExecution,
+) -> Result<(), String> {
+    let mut store = WorkStore::open_or_create(repo)?;
+    let worker_success = execution
+        .diagnostics
+        .as_ref()
+        .and_then(|details| details.get("exitCode"))
+        .and_then(serde_json::Value::as_i64)
+        .map(|code| code == 0)
+        .unwrap_or(true);
+    store.persist_run_event(
+        &mission.id,
+        &objective.id,
+        session_id,
+        "progress",
+        serde_json::json!({
+            "message": format!("Code worker wrote {}", execution.relative_path),
+            "workspacePath": execution.workspace_path.clone(),
+            "touchedPaths": execution.touched_paths.clone(),
+            "patchPath": execution.patch_artifact_path.clone(),
+        }),
+    )?;
+    let completed_at = unix_now_label();
+    let agent_verification = latest_agent_submitted_verification_for_session(
+        &store,
+        &mission.id,
+        &objective.id,
+        session_id,
+    )?;
+    let verification_status = agent_verification
+        .as_ref()
+        .map(|record| record.status.clone())
+        .unwrap_or_else(|| {
+            if worker_success && execution.validation.success {
+                "passed".to_string()
+            } else {
+                "failed".to_string()
+            }
+        });
+    let workspace_path = execution.workspace_path.clone();
+    let relative_path = execution.relative_path.clone();
+    let patch_text = execution.patch_text.clone();
+    let touched_paths = execution.touched_paths.clone();
+    let validation_command = execution.validation.command.clone();
+    let validation_success = execution.validation.success;
+    let validation_exit_code = execution.validation.exit_code;
+    let validation_stdout = execution.validation.stdout.clone();
+    let validation_stderr = execution.validation.stderr.clone();
+    let mut verification_details = agent_verification
+        .as_ref()
+        .map(|record| record.details.clone())
+        .unwrap_or_else(|| serde_json::json!({}));
+    if let Some(map) = verification_details.as_object_mut() {
+        map.insert(
+            "kind".to_string(),
+            serde_json::Value::String(execution.worker_kind.clone()),
+        );
+        map.insert(
+            "command".to_string(),
+            serde_json::Value::String(validation_command.clone()),
+        );
+        map.insert(
+            "profileId".to_string(),
+            serde_json::Value::String(execution.profile_id.clone()),
+        );
+        map.insert(
+            "workspacePath".to_string(),
+            serde_json::Value::String(workspace_path.clone()),
+        );
+        map.insert(
+            "baseRevision".to_string(),
+            serde_json::Value::String(execution.base_revision.clone()),
+        );
+        map.insert(
+            "patchPath".to_string(),
+            serde_json::Value::String(execution.patch_artifact_path.clone()),
+        );
+        map.insert(
+            "patchSummary".to_string(),
+            serde_json::Value::String(patch_summary_for_path(&relative_path)),
+        );
+        map.insert(
+            "targetFile".to_string(),
+            serde_json::Value::String(relative_path.clone()),
+        );
+        map.insert(
+            "touchedPaths".to_string(),
+            serde_json::to_value(&touched_paths).unwrap_or_else(|_| serde_json::json!([])),
+        );
+        map.insert(
+            "patch".to_string(),
+            serde_json::Value::String(patch_text.clone()),
+        );
+        map.insert(
+            "validationStatus".to_string(),
+            serde_json::Value::String(verification_status.clone()),
+        );
+        map.insert(
+            "validation".to_string(),
+            serde_json::json!({
+                "command": validation_command,
+                "success": validation_success,
+                "exitCode": validation_exit_code,
+                "stdout": validation_stdout,
+                "stderr": validation_stderr,
+            }),
+        );
+        map.insert(
+            "diagnostics".to_string(),
+            execution
+                .diagnostics
+                .clone()
+                .unwrap_or_else(|| serde_json::json!({})),
+        );
+    }
+    let verification_summary = agent_verification
+        .as_ref()
+        .map(|record| record.summary.clone())
+        .unwrap_or_else(|| format!("Code worker completed {}.", objective.id));
+    let verification_id = if let Some(existing) = agent_verification {
+        store.update_verification(
+            existing.id,
+            &verification_status,
+            &verification_summary,
+            &verification_details,
+        )?;
+        existing.id
+    } else {
+        store.insert_verification(&NewVerificationRecord {
+            mission_id: mission.id.clone(),
+            objective_id: Some(objective.id.clone()),
+            session_id: Some(session_id.to_string()),
+            status: verification_status.clone(),
+            summary: verification_summary.clone(),
+            details: verification_details,
+        })?
+    };
+    store.upsert_patch_decision(&PatchDecisionRecord {
+        mission_id: mission.id.clone(),
+        objective_id: objective.id.clone(),
+        session_id: Some(session_id.to_string()),
+        status: "pending_review".to_string(),
+        reason: None,
+        patch_base_revision: Some(execution.base_revision.clone()),
+        apply_target_path: None,
+        apply_branch: None,
+        applied_at: None,
+        apply_error: None,
+        created_at: completed_at.clone(),
+        updated_at: completed_at.clone(),
+    })?;
+    let mut verdict = UnitVerdict {
+        unit_id: objective.id.clone(),
+        task_id: mission.id.clone(),
+        status: if worker_success && validation_success {
+            "done".to_string()
+        } else {
+            "failed".to_string()
+        },
+        summary: format!("Code worker completed {}", unit.title),
+        submitted_at: completed_at.clone(),
+        artifacts: vec![VerdictArtifact {
+            kind: "patch".to_string(),
+            content: patch_text.clone(),
+        }],
+    };
+    verdict.artifacts.push(VerdictArtifact {
+        kind: "verification_id".to_string(),
+        content: format!("verification-{verification_id}"),
+    });
+    store.submit_verdict(verdict)?;
+    store.persist_run_event(
+        &mission.id,
+        &unit.id,
+        session_id,
+        if worker_success && validation_success {
+            "completed"
+        } else {
+            "failed"
+        },
+        serde_json::json!({
+            "summary": format!("Code worker completed {}.", unit.id),
+            "verificationId": verification_id,
+            "validationSuccess": validation_success,
+            "workerSuccess": worker_success,
+            "relativePath": execution.relative_path.clone(),
+        }),
+    )?;
+    store.upsert_agent_session_runtime(&AgentSessionRuntimeRecord {
+        id: session_id.to_string(),
+        mission_id: mission.id.clone(),
+        objective_id: Some(unit.id.clone()),
+        profile_id: execution.profile_id.clone(),
+        assignment_kind: "execute_objective".to_string(),
+        state: if worker_success && validation_success {
+            "completed".to_string()
+        } else {
+            "failed".to_string()
+        },
+        touched_paths,
+        workspace_path: execution.workspace_path,
+        lease_expires_at: None,
+        last_heartbeat_at: Some(completed_at.clone()),
+        last_event_at: Some(completed_at.clone()),
+        last_error: if worker_success && validation_success {
+            None
+        } else {
+            Some(execution.validation.stderr)
+        },
+        created_at: session_created_at.to_string(),
+        updated_at: completed_at.clone(),
+    })?;
+
+    let mut updated_mission = mission.clone();
+    let planned_state = store.load_mission_state(Some(&mission.id), 200)?;
+    updated_mission.state = if planned_state.summary.failed_objectives > 0 {
+        "failed".to_string()
+    } else if planned_state.summary.pending_objectives == 0
+        && planned_state.summary.claimed_objectives == 0
+        && planned_state.summary.total_objectives > 0
+    {
+        "completed".to_string()
+    } else {
+        "running".to_string()
+    };
+    updated_mission.updated_at = unix_now_label();
+    store.upsert_mission(&updated_mission)?;
+    Ok(())
+}
+
+fn emit_mission_runtime_update(app: &AppHandle, mission_id: &str) {
+    let _ = app.emit(
+        "mission-updated",
+        serde_json::json!({
+            "missionId": mission_id,
+        }),
+    );
+    let _ = app.emit(
+        "coordinator-updated",
+        serde_json::json!({
+            "missionId": mission_id,
+        }),
+    );
 }
 
 fn mission_view_to_frontend(view: MissionStateView) -> serde_json::Value {
     mission_view_to_frontend_at(view, unix_now_seconds())
 }
 
-fn mission_view_to_frontend_at(
-    view: MissionStateView,
-    now_unix_seconds: u64,
-) -> serde_json::Value {
+fn mission_view_to_frontend_at(view: MissionStateView, now_unix_seconds: u64) -> serde_json::Value {
     let objective_by_id = view
         .objectives
         .iter()
@@ -1975,9 +2954,7 @@ fn mission_view_to_frontend_at(
         .and_then(|event| event.payload.get("planner"))
         .and_then(serde_json::Value::as_str)
         .map(str::to_string)
-        .or_else(|| {
-            (!planner_profile_id.is_empty()).then(|| planner_profile_id.clone())
-        })
+        .or_else(|| (!planner_profile_id.is_empty()).then(|| planner_profile_id.clone()))
         .unwrap_or_default();
     let planner_summary = last_planned_event
         .and_then(|event| event.payload.get("summary"))
@@ -2012,6 +2989,21 @@ fn mission_view_to_frontend_at(
         .and_then(|objective_id| patch_gate_by_objective.get(objective_id))
         .copied();
     let scheduler = derive_mission_scheduler_summary(&view, now_unix_seconds);
+    let task_id = view
+        .mission
+        .as_ref()
+        .map(|mission| mission.id.clone())
+        .unwrap_or_default();
+    let lifecycle_events = project_task_lifecycle_events_at(
+        &task_id,
+        "",
+        &[],
+        &view.events,
+        &view.sessions,
+        &view.patch_decisions,
+        &view.verifications,
+        now_unix_seconds,
+    );
 
     serde_json::json!({
         "missionId": view.mission.as_ref().map(|mission| mission.id.clone()).unwrap_or_default(),
@@ -2040,6 +3032,8 @@ fn mission_view_to_frontend_at(
                 "state": match objective.status {
                     WorkUnitStatus::Pending => "pending",
                     WorkUnitStatus::Claimed => "claimed",
+                    WorkUnitStatus::Running => "running",
+                    WorkUnitStatus::RetryScheduled => "retry_scheduled",
                     WorkUnitStatus::Done => "done",
                     WorkUnitStatus::Failed => "failed",
                 },
@@ -2221,6 +3215,7 @@ fn mission_view_to_frontend_at(
                 "objectiveId": event.unit_id,
             })
         }).collect::<Vec<_>>(),
+        "lifecycleEvents": lifecycle_events,
         "robotTargets": [],
         "lastSavedAt": view.mission.as_ref().map(|mission| mission.updated_at.clone()),
         "lastPlannedAt": last_planned_at,
@@ -2276,6 +3271,7 @@ struct AgentProfileInput {
     capabilities: Option<Vec<String>>,
     transport_kind: Option<String>,
     active: Option<bool>,
+    is_reviewer: Option<bool>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -2790,13 +3786,14 @@ fn graph_view_changed_statuses(
 fn rebuild_canonical_graph_store(parsers: &[Box<dyn Parser>], repo: &Path) -> Result<(), String> {
     let store = SqliteGraphStore::open_or_create(repo)?;
     let graph = build_canonical_repo_graph(parsers, repo);
-    let snapshot = graph_store::snapshot_from_graph(
+    let model = program_model::program_model_from_graph(
         repo,
         &graph,
         &vcs::get_current_revision(repo),
         graph::source_fingerprint(repo),
     );
-    store.replace_all(&snapshot)?;
+    let snapshot = graph_store::canonical_snapshot_from_program_model(&model);
+    store.replace_program_model(&model)?;
     rebuild_search_index(repo, &snapshot)
 }
 
@@ -2807,7 +3804,7 @@ fn update_canonical_graph_for_file(
 ) -> Result<(), String> {
     let store = SqliteGraphStore::open_or_create(repo)?;
     let mut existing_snapshot = store.load_snapshot()?;
-    store.remove_file(rel_path)?;
+    store.remove_program_file(rel_path)?;
 
     let full_path = repo.join(rel_path);
     if !full_path.exists() || !full_path.is_file() {
@@ -2819,10 +3816,27 @@ fn update_canonical_graph_for_file(
     fragment.add_nodes(nodes);
     fragment.add_edges(edges);
 
+    fragment.add_nodes(
+        existing_snapshot
+            .entities
+            .iter()
+            .filter(|entity| entity.parent_id.is_none() && entity.file_path != rel_path)
+            .map(|entity| Node {
+                id: entity.id.clone(),
+                label: entity.display_name.clone(),
+                kind: graph_store::canonical_entity_kind_label(&entity.kind).to_string(),
+                file: entity.file_path.clone(),
+                line_count: entity.line_count as usize,
+                change_status: "unchanged".to_string(),
+                functions: Vec::new(),
+            })
+            .collect(),
+    );
+
     let mut known_ids = existing_snapshot
         .entities
         .iter()
-        .filter(|entity| entity.file_path != rel_path)
+        .filter(|entity| entity.parent_id.is_none() && entity.file_path != rel_path)
         .map(|entity| entity.id.clone())
         .collect::<Vec<_>>();
     known_ids.extend(fragment.nodes.iter().map(|node| node.id.clone()));
@@ -2864,7 +3878,7 @@ fn update_canonical_graph_for_file(
         .repo_meta
         .insert("built_at".to_string(), unix_now_label());
 
-    let snapshot = graph_store::snapshot_from_graph(
+    let mut model = program_model::program_model_from_graph(
         repo,
         &fragment,
         existing_snapshot
@@ -2874,11 +3888,8 @@ fn update_canonical_graph_for_file(
             .unwrap_or("HEADLESS"),
         graph::source_fingerprint(repo),
     );
-    store.upsert_file(
-        &snapshot.entities,
-        &snapshot.edges,
-        Some(&existing_snapshot.repo_meta),
-    )?;
+    model.repo_meta = existing_snapshot.repo_meta;
+    store.upsert_program_file(rel_path, &model)?;
     let latest_snapshot = store.load_snapshot()?;
     rebuild_search_index(repo, &latest_snapshot)
 }
@@ -3133,6 +4144,12 @@ fn activate_repo(app: &AppHandle, state: &AppState, path_buf: PathBuf) -> Result
     *state.cluster_refresh_scheduled.lock() = false;
     *state.watchdog.lock() = watchdog::WatchdogRuntimeState::default();
     *state.conductor.lock() = conductor::ConductorRuntimeState::default();
+    {
+        if let Ok(store) = WorkStore::open_or_create(&canonical_path) {
+            let mut runtime = state.conductor.lock();
+            let _ = load_conductor_from_store(&store, &mut runtime);
+        }
+    }
 
     let watcher = setup_watcher(app);
     *state.watcher.lock() = watcher;
@@ -3202,13 +4219,14 @@ fn background_rebuild_and_emit(handle: AppHandle, repo: PathBuf) {
             return;
         }
     };
-    let snapshot = graph_store::snapshot_from_graph(
+    let model = program_model::program_model_from_graph(
         &repo,
         &graph,
         &vcs::get_current_revision(&repo),
         graph::source_fingerprint(&repo),
     );
-    if let Err(e) = store.replace_all(&snapshot) {
+    let snapshot = graph_store::canonical_snapshot_from_program_model(&model);
+    if let Err(e) = store.replace_program_model(&model) {
         println!("[BACKEND][graph] bg rebuild store write failed: {e}");
         return;
     }
@@ -3519,6 +4537,645 @@ fn get_file_source(state: tauri::State<AppState>, file: String) -> String {
     content
 }
 
+fn analyze_file_anatomy(
+    parsers: &[Box<dyn Parser>],
+    repo: &Path,
+    file: &str,
+) -> parser::FileAnatomy {
+    let extension = Path::new(file)
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("unknown")
+        .to_ascii_lowercase();
+    let Some(language_parser) = parsers
+        .iter()
+        .find(|candidate| candidate.extensions().contains(&extension.as_str()))
+    else {
+        return parser::FileAnatomy::unavailable(
+            file,
+            &extension,
+            "no Tree-sitter anatomy profile for this extension",
+        );
+    };
+    let content = match anatomy_snapshot::read_working_copy_file(repo, file) {
+        Ok(Some(content)) => content,
+        Ok(None) => {
+            return parser::FileAnatomy::unavailable(file, &extension, "source file is absent")
+        }
+        Err(reason) => return parser::FileAnatomy::unavailable(file, &extension, &reason),
+    };
+    let content = match std::str::from_utf8(&content) {
+        Ok(content) => content,
+        Err(_) => {
+            return parser::FileAnatomy::unavailable(file, &extension, "source file is not UTF-8")
+        }
+    };
+    language_parser.analyze_file(repo, file, content)
+}
+
+#[tauri::command]
+fn get_file_anatomy(state: tauri::State<AppState>, file: String) -> parser::FileAnatomy {
+    let repo = state.repo.lock().clone();
+    analyze_file_anatomy(&state.parsers, &repo, &file)
+}
+
+#[tauri::command]
+fn get_file_anatomy_comparison(
+    state: tauri::State<AppState>,
+    file: String,
+    selection: AnatomySelection,
+) -> anatomy_snapshot::AnatomyComparison {
+    let repo = state.repo.lock().clone();
+    compare_file_anatomy(&state.parsers, &repo, &file, &selection)
+}
+
+#[tauri::command]
+fn get_graph_anatomies(
+    state: tauri::State<AppState>,
+    files: Vec<String>,
+    selection: AnatomySelection,
+) -> Vec<anatomy_snapshot::AnatomyEndpointWithFile> {
+    let repo = state.repo.lock().clone();
+    analyze_files_after(&state.parsers, &repo, &files, &selection)
+}
+
+fn validate_reviewer_elm_source(source: &str) -> Result<(), String> {
+    if source.trim().is_empty() {
+        return Err("Elm source is empty".to_string());
+    }
+    if source.len() > 120_000 {
+        return Err("Elm source is too large".to_string());
+    }
+    if !source.contains("module Main exposing (main)") {
+        return Err("Elm source must define module Main exposing (main)".to_string());
+    }
+    for forbidden in [
+        "port module",
+        "effect module",
+        "Platform.worker",
+        "Browser.application",
+        "Http.",
+        "File.",
+    ] {
+        if source.contains(forbidden) {
+            return Err(format!("Elm source uses forbidden token: {forbidden}"));
+        }
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum ReviewerTargetContextMode {
+    WorkingCopy,
+    Since,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ReviewerTargetContextInput {
+    mode: ReviewerTargetContextMode,
+    since: Option<String>,
+    max_files: Option<usize>,
+    max_diff_lines: Option<usize>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ReviewerTargetContextChangedFile {
+    path: String,
+    status: String,
+    diff_excerpt: Vec<String>,
+    diff_line_count: usize,
+    excerpt_truncated: bool,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ReviewerTargetContextGraphCounts {
+    available: bool,
+    entity_count: usize,
+    edge_count: usize,
+    indexed_file_count: usize,
+    changed_files_with_graph_entities: usize,
+    changed_entities_count: usize,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ReviewerTargetContextBlastRadiusSummary {
+    available: bool,
+    seed_files_count: usize,
+    one_hop_entity_count: usize,
+    two_hop_entity_count: usize,
+    affected_entities_count: usize,
+    related_entities_count: usize,
+    affected_entities: Vec<String>,
+    related_entities: Vec<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ReviewerTargetContextResponse {
+    repo_path: String,
+    branch: String,
+    revision: String,
+    since: String,
+    changed_files_total: usize,
+    changed_files_truncated: bool,
+    changed_files: Vec<ReviewerTargetContextChangedFile>,
+    graph_counts: ReviewerTargetContextGraphCounts,
+    blast_radius: ReviewerTargetContextBlastRadiusSummary,
+}
+
+fn resolve_reviewer_target_since(
+    mode: ReviewerTargetContextMode,
+    since: Option<String>,
+) -> Result<String, String> {
+    match mode {
+        ReviewerTargetContextMode::WorkingCopy => Ok("@".to_string()),
+        ReviewerTargetContextMode::Since => since
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .ok_or_else(|| "since is required when mode is `since`".to_string()),
+    }
+}
+
+fn validate_reviewer_target_bounds(
+    max_files: Option<usize>,
+    max_diff_lines: Option<usize>,
+) -> Result<(usize, usize), String> {
+    let max_files = max_files.unwrap_or(40);
+    if max_files == 0 || max_files > 500 {
+        return Err("max_files must be between 1 and 500".to_string());
+    }
+    let max_diff_lines = max_diff_lines.unwrap_or(40);
+    if max_diff_lines == 0 || max_diff_lines > 400 {
+        return Err("max_diff_lines must be between 1 and 400".to_string());
+    }
+    Ok((max_files, max_diff_lines))
+}
+
+fn reviewer_filtered_diff_lines(diff: &str) -> Vec<String> {
+    diff.lines()
+        .filter(|line| {
+            !line.starts_with("diff --git")
+                && !line.starts_with("index ")
+                && !line.starts_with("--- ")
+                && !line.starts_with("+++ ")
+        })
+        .map(|line| line.to_string())
+        .collect()
+}
+
+fn build_reviewer_target_context(
+    repo: &Path,
+    input: &ReviewerTargetContextInput,
+) -> Result<ReviewerTargetContextResponse, String> {
+    let since = resolve_reviewer_target_since(input.mode, input.since.clone())?;
+    let (max_files, max_diff_lines) =
+        validate_reviewer_target_bounds(input.max_files, input.max_diff_lines)?;
+
+    let branch = vcs::get_current_branch(repo);
+    let revision = vcs::get_current_revision(repo);
+    let mut changed_entries: Vec<(String, String)> =
+        vcs::get_changed_files(repo, &since).into_iter().collect();
+    changed_entries.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let changed_files_total = changed_entries.len();
+    let changed_files_truncated = changed_files_total > max_files;
+    let changed_files: Vec<ReviewerTargetContextChangedFile> = changed_entries
+        .iter()
+        .take(max_files)
+        .map(|(path, status)| {
+            let diff = vcs::get_file_diff(repo, path, Some(&since));
+            let diff_lines = reviewer_filtered_diff_lines(&diff);
+            let diff_excerpt = diff_lines
+                .iter()
+                .take(max_diff_lines)
+                .cloned()
+                .collect::<Vec<_>>();
+            ReviewerTargetContextChangedFile {
+                path: path.clone(),
+                status: status.clone(),
+                diff_excerpt,
+                diff_line_count: diff_lines.len(),
+                excerpt_truncated: diff_lines.len() > max_diff_lines,
+            }
+        })
+        .collect();
+
+    let changed_paths: Vec<&str> = changed_files
+        .iter()
+        .map(|file| file.path.as_str())
+        .collect();
+    let changed_path_set: HashSet<&str> = changed_paths.iter().copied().collect();
+
+    let graph_db_exists = SqliteGraphStore::db_path(repo).exists();
+    let (graph_counts, blast_radius) = if graph_db_exists {
+        let store = SqliteGraphStore::open_or_create(repo)?;
+        let snapshot = store.load_snapshot()?;
+        let index = GraphIndex::build(&snapshot);
+        let one_hop = index.blast_radius(&changed_paths, 1);
+        let two_hop = index.blast_radius(&changed_paths, 2);
+        let changed_entities = index.blast_radius(&changed_paths, 0);
+
+        let mut indexed_files = HashSet::new();
+        for entity in &snapshot.entities {
+            indexed_files.insert(entity.file_path.clone());
+        }
+
+        let mut changed_files_with_graph_entities = HashSet::new();
+        for entity in &changed_entities {
+            changed_files_with_graph_entities.insert(entity.file_path.clone());
+        }
+
+        let mut affected_entities = Vec::new();
+        let mut related_entities = Vec::new();
+        let mut affected_seen = HashSet::new();
+        let mut related_seen = HashSet::new();
+        for entity in &one_hop {
+            if changed_path_set.contains(entity.file_path.as_str()) {
+                if affected_seen.insert(entity.display_name.clone()) {
+                    affected_entities.push(entity.display_name.clone());
+                }
+            } else if related_seen.insert(entity.display_name.clone()) {
+                related_entities.push(entity.display_name.clone());
+            }
+        }
+        affected_entities.truncate(50);
+        related_entities.truncate(50);
+
+        (
+            ReviewerTargetContextGraphCounts {
+                available: true,
+                entity_count: snapshot.entities.len(),
+                edge_count: snapshot.edges.len(),
+                indexed_file_count: indexed_files.len(),
+                changed_files_with_graph_entities: changed_files_with_graph_entities.len(),
+                changed_entities_count: changed_entities.len(),
+            },
+            ReviewerTargetContextBlastRadiusSummary {
+                available: true,
+                seed_files_count: changed_paths.len(),
+                one_hop_entity_count: one_hop.len(),
+                two_hop_entity_count: two_hop.len(),
+                affected_entities_count: affected_entities.len(),
+                related_entities_count: related_entities.len(),
+                affected_entities,
+                related_entities,
+            },
+        )
+    } else {
+        (
+            ReviewerTargetContextGraphCounts {
+                available: false,
+                entity_count: 0,
+                edge_count: 0,
+                indexed_file_count: 0,
+                changed_files_with_graph_entities: 0,
+                changed_entities_count: 0,
+            },
+            ReviewerTargetContextBlastRadiusSummary {
+                available: false,
+                seed_files_count: changed_paths.len(),
+                one_hop_entity_count: 0,
+                two_hop_entity_count: 0,
+                affected_entities_count: 0,
+                related_entities_count: 0,
+                affected_entities: Vec::new(),
+                related_entities: Vec::new(),
+            },
+        )
+    };
+    Ok(ReviewerTargetContextResponse {
+        repo_path: repo.display().to_string(),
+        branch,
+        revision,
+        since,
+        changed_files_total,
+        changed_files_truncated,
+        changed_files,
+        graph_counts,
+        blast_radius,
+    })
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ReviewerGenerateElmInput {
+    target: Option<ReviewerTargetContextInput>,
+    question: Option<String>,
+    profile_id: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ReviewerGenerateElmResponse {
+    source: String,
+    bundle_js: String,
+    context: ReviewerTargetContextResponse,
+    profile_id: String,
+    profile_label: String,
+}
+
+fn build_reviewer_generation_prompt(
+    context: &ReviewerTargetContextResponse,
+    question: Option<&str>,
+) -> String {
+    let changed_files_text = if context.changed_files.is_empty() {
+        "(no changed files in selected range)".to_string()
+    } else {
+        context
+            .changed_files
+            .iter()
+            .enumerate()
+            .map(|(index, file)| {
+                let mut chunk = format!(
+                    "{}. [{}] {} (diff lines: {}, excerpt truncated: {})",
+                    index + 1,
+                    file.status,
+                    file.path,
+                    file.diff_line_count,
+                    file.excerpt_truncated
+                );
+                if !file.diff_excerpt.is_empty() {
+                    chunk.push_str("\n--- diff excerpt ---\n");
+                    chunk.push_str(&file.diff_excerpt.join("\n"));
+                }
+                chunk
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    };
+    let affected_entities = if context.blast_radius.affected_entities.is_empty() {
+        "(none)".to_string()
+    } else {
+        context.blast_radius.affected_entities.join(", ")
+    };
+    let related_entities = if context.blast_radius.related_entities.is_empty() {
+        "(none)".to_string()
+    } else {
+        context.blast_radius.related_entities.join(", ")
+    };
+    let question = question
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("(no direct user question, generate branch summary deck)");
+
+    format!(
+        "You are code reviewer presentation generator.\n\
+Return raw Elm source only. No markdown fences. No prose.\n\
+\n\
+Hard output contract:\n\
+- module Main exposing (main)\n\
+- use Browser.sandbox only\n\
+- no ports/effect module/Http/File/Browser.application/Platform.worker\n\
+- self-contained Elm 0.19.1 module that compiles\n\
+- render polished review slides UI: key changes, why, risks, follow-ups\n\
+- include code snippets from diff excerpts and structured sections\n\
+\n\
+Review target context:\n\
+- repo: {repo}\n\
+- branch: {branch}\n\
+- revision: {revision}\n\
+- since: {since}\n\
+- changed files total: {total} (truncated: {truncated})\n\
+\n\
+Graph summary:\n\
+- graph available: {graph_available}\n\
+- entities: {entity_count}, edges: {edge_count}, indexed files: {indexed_file_count}\n\
+- changed files with entities: {changed_files_with_graph_entities}, changed entities: {changed_entities_count}\n\
+\n\
+Blast radius:\n\
+- seeds: {seed_files_count}, one-hop entities: {one_hop_entity_count}, two-hop entities: {two_hop_entity_count}\n\
+- affected entities ({affected_entities_count}): {affected_entities}\n\
+- related entities ({related_entities_count}): {related_entities}\n\
+\n\
+Changed files + excerpts:\n\
+{changed_files}\n\
+\n\
+User question:\n\
+{question}\n",
+        repo = context.repo_path,
+        branch = context.branch,
+        revision = context.revision,
+        since = context.since,
+        total = context.changed_files_total,
+        truncated = context.changed_files_truncated,
+        graph_available = context.graph_counts.available,
+        entity_count = context.graph_counts.entity_count,
+        edge_count = context.graph_counts.edge_count,
+        indexed_file_count = context.graph_counts.indexed_file_count,
+        changed_files_with_graph_entities = context.graph_counts.changed_files_with_graph_entities,
+        changed_entities_count = context.graph_counts.changed_entities_count,
+        seed_files_count = context.blast_radius.seed_files_count,
+        one_hop_entity_count = context.blast_radius.one_hop_entity_count,
+        two_hop_entity_count = context.blast_radius.two_hop_entity_count,
+        affected_entities_count = context.blast_radius.affected_entities_count,
+        affected_entities = affected_entities,
+        related_entities_count = context.blast_radius.related_entities_count,
+        related_entities = related_entities,
+        changed_files = changed_files_text,
+        question = question,
+    )
+}
+
+fn extract_reviewer_elm_source(raw: &str) -> Result<String, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("Reviewer model returned empty response.".to_string());
+    }
+    if !trimmed.contains("```") {
+        return Ok(trimmed.to_string());
+    }
+
+    let mut in_fence = false;
+    let mut first_block = Vec::new();
+    for line in trimmed.lines() {
+        let token = line.trim();
+        if token.starts_with("```") {
+            if in_fence {
+                break;
+            }
+            in_fence = true;
+            continue;
+        }
+        if in_fence {
+            first_block.push(line);
+        }
+    }
+    if first_block.is_empty() {
+        return Ok(trimmed.to_string());
+    }
+    Ok(first_block.join("\n").trim().to_string())
+}
+
+#[tauri::command]
+fn get_reviewer_target_context(
+    state: tauri::State<AppState>,
+    input: ReviewerTargetContextInput,
+) -> Result<ReviewerTargetContextResponse, String> {
+    let started = Instant::now();
+    let repo = state.repo.lock().clone();
+    let response = build_reviewer_target_context(&repo, &input)?;
+    if debug_enabled() {
+        println!(
+            "[BACKEND][cmd] get_reviewer_target_context mode={:?} since='{}' changed={} returned={} graph={} took={}ms",
+            input.mode,
+            response.since,
+            response.changed_files_total,
+            response.changed_files.len(),
+            response.graph_counts.available,
+            started.elapsed().as_millis()
+        );
+    }
+    Ok(response)
+}
+
+#[tauri::command]
+fn reviewer_generate_elm(
+    state: tauri::State<AppState>,
+    input: ReviewerGenerateElmInput,
+) -> Result<ReviewerGenerateElmResponse, String> {
+    let started = Instant::now();
+    let repo = state.repo.lock().clone();
+    let mut target = input.target.unwrap_or(ReviewerTargetContextInput {
+        mode: ReviewerTargetContextMode::WorkingCopy,
+        since: None,
+        max_files: None,
+        max_diff_lines: None,
+    });
+    if target.max_files.is_none() {
+        target.max_files = Some(20);
+    }
+    if target.max_diff_lines.is_none() {
+        target.max_diff_lines = Some(40);
+    }
+    let context = build_reviewer_target_context(&repo, &target)?;
+
+    let store = WorkStore::open_or_create(&repo)?;
+    let profile = resolve_reviewer_generation_profile(&store, input.profile_id.as_deref())?;
+    let api_key = nim_profile_api_key(&profile)?;
+    let base_url = nim_profile_base_url(&profile);
+    let default_model = profile
+        .model
+        .clone()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "meta/llama3-8b-instruct".to_string());
+    let prompt = build_reviewer_generation_prompt(&context, input.question.as_deref());
+    let (_config, raw_output) = conductor::run_openai_compatible_chat_completion(
+        &format!("Reviewer profile '{}'", profile.label),
+        &api_key,
+        &base_url,
+        &default_model,
+        &prompt,
+        None,
+        90,
+    )?;
+    let source = extract_reviewer_elm_source(&raw_output)?;
+    validate_reviewer_elm_source(&source)?;
+    let bundle_js = compile_reviewer_elm(source.clone())?;
+
+    if debug_enabled() {
+        println!(
+            "[BACKEND][cmd] reviewer_generate_elm profile='{}' mode={:?} since='{}' source_bytes={} bundle_bytes={} took={}ms",
+            profile.id,
+            target.mode,
+            context.since,
+            source.len(),
+            bundle_js.len(),
+            started.elapsed().as_millis()
+        );
+    }
+
+    Ok(ReviewerGenerateElmResponse {
+        source,
+        bundle_js,
+        context,
+        profile_id: profile.id,
+        profile_label: profile.label,
+    })
+}
+
+#[tauri::command]
+fn compile_reviewer_elm(source: String) -> Result<String, String> {
+    let started = Instant::now();
+    validate_reviewer_elm_source(&source)?;
+
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let root = std::env::temp_dir().join(format!(
+        "sloposcope-reviewer-elm-{}-{stamp}",
+        std::process::id()
+    ));
+    let src_dir = root.join("src");
+    std::fs::create_dir_all(&src_dir)
+        .map_err(|err| format!("create generated Elm dir {}: {err}", src_dir.display()))?;
+
+    let elm_json = r#"{
+  "type": "application",
+  "source-directories": [
+    "src"
+  ],
+  "elm-version": "0.19.1",
+  "dependencies": {
+    "direct": {
+      "elm/browser": "1.0.2",
+      "elm/core": "1.0.5",
+      "elm/html": "1.0.0",
+      "elm/json": "1.1.3",
+      "elm/svg": "1.0.1"
+    },
+    "indirect": {
+      "elm/time": "1.0.0",
+      "elm/url": "1.0.0",
+      "elm/virtual-dom": "1.0.3"
+    }
+  },
+  "test-dependencies": {
+    "direct": {},
+    "indirect": {}
+  }
+}
+"#;
+    std::fs::write(root.join("elm.json"), elm_json)
+        .map_err(|err| format!("write elm.json: {err}"))?;
+    std::fs::write(src_dir.join("Main.elm"), source)
+        .map_err(|err| format!("write Main.elm: {err}"))?;
+
+    let output = Command::new("elm")
+        .args(["make", "src/Main.elm", "--output=reviewer.js"])
+        .current_dir(&root)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|err| format!("run elm make: {err}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        return Err(format!("elm make failed:\n{stderr}\n{stdout}"));
+    }
+
+    let bundle = std::fs::read_to_string(root.join("reviewer.js"))
+        .map_err(|err| format!("read compiled reviewer.js: {err}"))?;
+    let _ = std::fs::remove_dir_all(&root);
+
+    if debug_enabled() {
+        println!(
+            "[BACKEND][cmd] compile_reviewer_elm bytes={} took={}ms",
+            bundle.len(),
+            started.elapsed().as_millis()
+        );
+    }
+    Ok(bundle)
+}
+
 #[tauri::command]
 fn save_file(state: tauri::State<AppState>, file: String, content: String) -> Result<(), String> {
     let started = Instant::now();
@@ -3552,6 +5209,30 @@ fn get_repo_path(state: tauri::State<AppState>) -> String {
         println!("[BACKEND][cmd] get_repo_path -> {}", path);
     }
     path
+}
+
+#[tauri::command]
+async fn get_jev_index(state: tauri::State<'_, AppState>, analysis: tauri::State<'_, jev_analysis::AnalysisService>) -> Result<jev_analysis::Inventory, String> {
+    let repo = state.repo.lock().clone();
+    analysis.invalidate();
+    tauri::async_runtime::spawn_blocking(move || jev_analysis::AnalysisService::default().index(&repo))
+        .await.map_err(|_| "Local indexing failed")?
+}
+
+#[tauri::command]
+async fn preview_jev_analysis(state: tauri::State<'_, AppState>, analysis: tauri::State<'_, jev_analysis::AnalysisService>, selected: Vec<String>, max_requests: usize) -> Result<jev_analysis::SendPlan, String> {
+    let repo = state.repo.lock().clone();
+    // Bound frontend input independently of the request cap.
+    if selected.len() > 1000 { return Err("Too many selected groups; filter selection first".into()); }
+    analysis.prepare(&repo, selected, max_requests)
+}
+
+#[tauri::command]
+async fn confirm_jev_analysis(state: tauri::State<'_, AppState>, analysis: tauri::State<'_, jev_analysis::AnalysisService>, plan_id: String, confirmed_requests: usize, api_key: String) -> Result<jev_analysis::RunOutcome, String> {
+    // Do not trace arguments or reuse ambient credentials. Client creation performs no IO.
+    let repo = state.repo.lock().clone();
+    let transport = jev_analysis::SdkTransport::new(api_key)?;
+    analysis.execute(&repo, &plan_id, confirmed_requests, &transport).await
 }
 
 #[tauri::command]
@@ -3829,6 +5510,442 @@ fn mcp_watchdog_get_evidence_snapshot(
 }
 
 #[tauri::command]
+fn get_coordinator_state(
+    state: tauri::State<AppState>,
+    thread_id: Option<String>,
+    mission_id: Option<String>,
+) -> Result<serde_json::Value, String> {
+    let repo = state.repo.lock().clone();
+    let mut store = WorkStore::open_or_create(&repo)?;
+    coordinator_state_to_frontend(
+        &mut store,
+        &repo,
+        thread_id.as_deref(),
+        mission_id.as_deref(),
+    )
+}
+
+#[tauri::command]
+fn send_coordinator_message(
+    state: tauri::State<AppState>,
+    content: String,
+    thread_id: Option<String>,
+    mission_id: Option<String>,
+) -> Result<serde_json::Value, String> {
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        return Err("Coordinator message is required.".to_string());
+    }
+
+    let repo = state.repo.lock().clone();
+    let mut store = WorkStore::open_or_create(&repo)?;
+    let mut thread = ensure_coordinator_thread(
+        &mut store,
+        &repo,
+        thread_id.as_deref(),
+        mission_id.as_deref(),
+    )?;
+    ensure_coordinator_wake_message(&mut store, &repo, &thread)?;
+    store.append_coordinator_message(NewCoordinatorMessage {
+        thread_id: &thread.id,
+        mission_id: thread.mission_id.as_deref(),
+        objective_id: None,
+        session_id: None,
+        role: "user",
+        kind: "prompt",
+        content: trimmed,
+        payload: coordinator_message_payload(trimmed),
+    })?;
+
+    if message_wants_report(trimmed) {
+        let report = if let Some(mission_id) = thread.mission_id.as_deref() {
+            let view = store.load_mission_state(Some(mission_id), 200)?;
+            mission_report_content(&view)
+        } else {
+            "Mission report. No mission approved yet.".to_string()
+        };
+        store.append_coordinator_message(NewCoordinatorMessage {
+            thread_id: &thread.id,
+            mission_id: thread.mission_id.as_deref(),
+            objective_id: None,
+            session_id: None,
+            role: "coordinator",
+            kind: "report",
+            content: &report,
+            payload: serde_json::json!({ "report": true }),
+        })?;
+        return coordinator_state_to_frontend(
+            &mut store,
+            &repo,
+            Some(&thread.id),
+            thread.mission_id.as_deref(),
+        );
+    }
+
+    if message_wants_launch(trimmed) && !thread.pending_plan.is_empty() {
+        store.append_coordinator_message(NewCoordinatorMessage {
+            thread_id: &thread.id,
+            mission_id: thread.mission_id.as_deref(),
+            objective_id: None,
+            session_id: None,
+            role: "coordinator",
+            kind: "status",
+            content: "Approve plan first. Then launch workers.",
+            payload: serde_json::json!({ "requiresApproval": true }),
+        })?;
+        return coordinator_state_to_frontend(
+            &mut store,
+            &repo,
+            Some(&thread.id),
+            thread.mission_id.as_deref(),
+        );
+    }
+
+    let mut draft = thread.draft_mission.clone();
+    let mut should_replan = thread.pending_plan.is_empty();
+    if draft.brief.trim().is_empty() {
+        draft.brief = trimmed.to_string();
+        if draft.title.trim().is_empty() {
+            draft.title = derive_problem_title(trimmed);
+        }
+    } else if !message_wants_report(trimmed) && !message_is_validation_only(trimmed) {
+        draft.brief = format!("{}\n{}", draft.brief.trim(), trimmed)
+            .trim()
+            .to_string();
+        if !thread.pending_plan.is_empty() {
+            should_replan = true;
+            thread.pending_plan.clear();
+        }
+    }
+    if draft.validation_command.trim().is_empty() {
+        if let Some(command) = extract_validation_command(trimmed) {
+            draft.validation_command = command;
+            should_replan = true;
+        }
+    }
+    if draft.planner_profile_id.is_none() {
+        draft.planner_profile_id =
+            resolve_mission_planner_profile(&store, None)?.map(|profile| profile.id);
+    }
+
+    thread.title = coordinator_thread_title(&draft, None);
+    thread.draft_mission = draft.clone();
+    thread.updated_at = unix_now_label();
+
+    if should_replan {
+        let planner_profile =
+            resolve_mission_planner_profile(&store, draft.planner_profile_id.as_deref())?;
+        let input = mission_input_from_coordinator_draft(thread.mission_id.as_deref(), &draft);
+        let (planner_label, objectives) =
+            generate_mission_objectives(&repo, &input, planner_profile.as_ref())?;
+        thread.pending_plan = objectives;
+        thread.state = "plan_ready".to_string();
+        thread.updated_at = unix_now_label();
+        store.upsert_coordinator_thread(&thread)?;
+        let plan_text = build_coordinator_plan_content(&thread, &planner_label);
+        store.append_coordinator_message(NewCoordinatorMessage {
+            thread_id: &thread.id,
+            mission_id: thread.mission_id.as_deref(),
+            objective_id: None,
+            session_id: None,
+            role: "coordinator",
+            kind: "plan",
+            content: &plan_text,
+            payload: serde_json::json!({
+                "planner": planner_label,
+                "objectiveCount": thread.pending_plan.len(),
+            }),
+        })?;
+        return coordinator_state_to_frontend(
+            &mut store,
+            &repo,
+            Some(&thread.id),
+            thread.mission_id.as_deref(),
+        );
+    }
+
+    store.upsert_coordinator_thread(&thread)?;
+    store.append_coordinator_message(NewCoordinatorMessage {
+        thread_id: &thread.id,
+        mission_id: thread.mission_id.as_deref(),
+        objective_id: None,
+        session_id: None,
+        role: "coordinator",
+        kind: "status",
+        content: "Context appended. Approve current plan or add more detail.",
+        payload: serde_json::json!({ "pendingPlan": !thread.pending_plan.is_empty() }),
+    })?;
+    coordinator_state_to_frontend(
+        &mut store,
+        &repo,
+        Some(&thread.id),
+        thread.mission_id.as_deref(),
+    )
+}
+
+#[tauri::command]
+fn approve_coordinator_plan(
+    state: tauri::State<AppState>,
+    thread_id: Option<String>,
+    mission_id: Option<String>,
+) -> Result<serde_json::Value, String> {
+    let repo = state.repo.lock().clone();
+    let last_revision = state.last_revision.lock().clone();
+    let mut store = WorkStore::open_or_create(&repo)?;
+    let mut thread = ensure_coordinator_thread(
+        &mut store,
+        &repo,
+        thread_id.as_deref(),
+        mission_id.as_deref(),
+    )?;
+    ensure_coordinator_wake_message(&mut store, &repo, &thread)?;
+    if thread.pending_plan.is_empty() {
+        return Err("No coordinator plan ready to approve.".to_string());
+    }
+
+    let input =
+        mission_input_from_coordinator_draft(thread.mission_id.as_deref(), &thread.draft_mission);
+    if input.title.trim().is_empty() || input.brief.trim().is_empty() {
+        return Err("Coordinator draft is incomplete. Need title and brief.".to_string());
+    }
+    let mut mission = build_mission_record(&repo, &input, &last_revision)?;
+    if let Some(existing) = store.get_mission(&mission.id)? {
+        mission.created_at = existing.created_at;
+    }
+    mission.state = "awaiting_launch".to_string();
+    mission.updated_at = unix_now_label();
+    store.upsert_mission(&mission)?;
+    store.plan_mission(&mission, &mission.brief, &thread.pending_plan)?;
+    let planner_label = thread
+        .draft_mission
+        .planner_profile_id
+        .clone()
+        .unwrap_or_else(|| "fixture".to_string());
+    store.persist_run_event(
+        &mission.id,
+        "",
+        &planner_label,
+        "planned",
+        serde_json::json!({
+            "objectiveCount": thread.pending_plan.len(),
+            "planner": planner_label,
+            "summary": format!("Planned {} objective(s) with {}.", thread.pending_plan.len(), planner_label),
+        }),
+    )?;
+    update_watchdog_from_mission(&mut state.watchdog.lock(), &mission);
+
+    thread.mission_id = Some(mission.id.clone());
+    thread.title = mission.title.clone();
+    thread.state = "awaiting_launch".to_string();
+    thread.pending_plan.clear();
+    thread.draft_mission =
+        coordinator_draft_from_mission(Some(&mission), mission.planner_profile_id.clone());
+    thread.updated_at = unix_now_label();
+    store.upsert_coordinator_thread(&thread)?;
+    store.append_coordinator_message(NewCoordinatorMessage {
+        thread_id: &thread.id,
+        mission_id: Some(&mission.id),
+        objective_id: None,
+        session_id: None,
+        role: "coordinator",
+        kind: "status",
+        content: "Plan approved. Ready to launch workers.",
+        payload: serde_json::json!({ "missionId": mission.id }),
+    })?;
+    coordinator_state_to_frontend(&mut store, &repo, Some(&thread.id), Some(&mission.id))
+}
+
+#[tauri::command]
+fn launch_coordinator_workers(
+    app: AppHandle,
+    state: tauri::State<AppState>,
+    thread_id: Option<String>,
+    mission_id: Option<String>,
+    profile_id: Option<String>,
+) -> Result<serde_json::Value, String> {
+    let repo = state.repo.lock().clone();
+    let mut store = WorkStore::open_or_create(&repo)?;
+    let thread = ensure_coordinator_thread(
+        &mut store,
+        &repo,
+        thread_id.as_deref(),
+        mission_id.as_deref(),
+    )?;
+    let active_mission_id = thread
+        .mission_id
+        .clone()
+        .or(mission_id)
+        .ok_or_else(|| "No mission approved for launch.".to_string())?;
+    let mut launched = 0usize;
+    loop {
+        let view = store.load_mission_state(Some(&active_mission_id), 200)?;
+        let scheduler = derive_mission_scheduler_summary(&view, unix_now_seconds());
+        if scheduler.ready_count == 0 || scheduler.next_objective_id.is_none() {
+            break;
+        }
+        drop(store);
+        let _ = run_next_code_worker(
+            app.clone(),
+            state.clone(),
+            Some(active_mission_id.clone()),
+            profile_id.clone(),
+        )?;
+        launched += 1;
+        store = WorkStore::open_or_create(&repo)?;
+    }
+    let summary = if launched == 0 {
+        "No runnable objectives to launch.".to_string()
+    } else {
+        format!("Workers launched. {} objective(s) dispatched.", launched)
+    };
+    store.append_coordinator_message(NewCoordinatorMessage {
+        thread_id: &thread.id,
+        mission_id: Some(&active_mission_id),
+        objective_id: None,
+        session_id: None,
+        role: "coordinator",
+        kind: "status",
+        content: &summary,
+        payload: serde_json::json!({ "launched": launched, "profileId": profile_id }),
+    })?;
+    coordinator_state_to_frontend(
+        &mut store,
+        &repo,
+        Some(&thread.id),
+        Some(&active_mission_id),
+    )
+}
+
+#[tauri::command]
+fn request_coordinator_report(
+    state: tauri::State<AppState>,
+    thread_id: Option<String>,
+    mission_id: Option<String>,
+) -> Result<serde_json::Value, String> {
+    let repo = state.repo.lock().clone();
+    let mut store = WorkStore::open_or_create(&repo)?;
+    let thread = ensure_coordinator_thread(
+        &mut store,
+        &repo,
+        thread_id.as_deref(),
+        mission_id.as_deref(),
+    )?;
+    let content = if let Some(active_mission_id) = thread.mission_id.as_deref() {
+        let view = store.load_mission_state(Some(active_mission_id), 200)?;
+        mission_report_content(&view)
+    } else {
+        "Mission report. No mission approved yet.".to_string()
+    };
+    store.append_coordinator_message(NewCoordinatorMessage {
+        thread_id: &thread.id,
+        mission_id: thread.mission_id.as_deref(),
+        objective_id: None,
+        session_id: None,
+        role: "coordinator",
+        kind: "report",
+        content: &content,
+        payload: serde_json::json!({ "report": true }),
+    })?;
+    coordinator_state_to_frontend(
+        &mut store,
+        &repo,
+        Some(&thread.id),
+        thread.mission_id.as_deref(),
+    )
+}
+
+#[tauri::command]
+fn nudge_worker_session(
+    state: tauri::State<AppState>,
+    content: String,
+    thread_id: Option<String>,
+    mission_id: Option<String>,
+    session_id: Option<String>,
+) -> Result<serde_json::Value, String> {
+    let repo = state.repo.lock().clone();
+    let mut store = WorkStore::open_or_create(&repo)?;
+    let thread = ensure_coordinator_thread(
+        &mut store,
+        &repo,
+        thread_id.as_deref(),
+        mission_id.as_deref(),
+    )?;
+    let Some(active_mission_id) = thread.mission_id.as_deref() else {
+        store.append_coordinator_message(NewCoordinatorMessage {
+            thread_id: &thread.id,
+            mission_id: None,
+            objective_id: None,
+            session_id: None,
+            role: "coordinator",
+            kind: "status",
+            content: "No live worker to nudge. No mission approved yet.",
+            payload: serde_json::json!({ "nudgeAccepted": false }),
+        })?;
+        return coordinator_state_to_frontend(&mut store, &repo, Some(&thread.id), None);
+    };
+    let view = store.load_mission_state(Some(active_mission_id), 200)?;
+    let now_unix_seconds = unix_now_seconds();
+    let live_session = session_id
+        .as_deref()
+        .and_then(|target| view.sessions.iter().find(|session| session.id == target))
+        .or_else(|| {
+            let live_id = coordinator_latest_live_session_id(Some(&view), now_unix_seconds)?;
+            view.sessions.iter().find(|session| session.id == live_id)
+        });
+    let Some(session) = live_session else {
+        store.append_coordinator_message(NewCoordinatorMessage {
+            thread_id: &thread.id,
+            mission_id: Some(active_mission_id),
+            objective_id: None,
+            session_id: None,
+            role: "coordinator",
+            kind: "status",
+            content: "No live worker to nudge. Ask report or relaunch work.",
+            payload: serde_json::json!({ "nudgeAccepted": false }),
+        })?;
+        return coordinator_state_to_frontend(
+            &mut store,
+            &repo,
+            Some(&thread.id),
+            Some(active_mission_id),
+        );
+    };
+    let objective_id = session.objective_id.clone().unwrap_or_default();
+    let now = unix_now_label();
+    let nudge_text = if content.trim().is_empty() {
+        "Keep moving."
+    } else {
+        content.trim()
+    };
+    let nudge_delivery = if session.workspace_path.trim().is_empty() {
+        false
+    } else {
+        agent_harness::append_session_nudge(&session.workspace_path, &session.id, nudge_text)
+            .is_ok()
+    };
+    store.persist_run_event(
+        active_mission_id,
+        &objective_id,
+        &session.id,
+        "nudge",
+        serde_json::json!({ "message": nudge_text, "transportDelivered": nudge_delivery }),
+    )?;
+    store.update_agent_session_status(&session.id, &session.state, &now, None)?;
+    let summary = format!("Nudge sent to {}. {}", session.id, nudge_text);
+    store.append_coordinator_message(NewCoordinatorMessage {
+        thread_id: &thread.id,
+        mission_id: Some(active_mission_id),
+        objective_id: session.objective_id.as_deref(),
+        session_id: Some(&session.id),
+        role: "coordinator",
+        kind: "nudge",
+        content: &summary,
+        payload: serde_json::json!({ "nudgeAccepted": true, "sessionId": session.id, "message": nudge_text, "transportDelivered": nudge_delivery }),
+    })?;
+    coordinator_state_to_frontend(&mut store, &repo, Some(&thread.id), Some(active_mission_id))
+}
+
+#[tauri::command]
 fn get_mission_state(
     state: tauri::State<AppState>,
     mission_id: Option<String>,
@@ -3886,15 +6003,8 @@ fn plan_mission(
     store.upsert_mission(&mission)?;
     let planner_profile =
         resolve_mission_planner_profile(&store, input.planner_profile_id.as_deref())?;
-    let planner_label = planner_profile
-        .as_ref()
-        .map(|profile| profile.label.clone())
-        .unwrap_or_else(|| "fixture".to_string());
-    let objectives = if let Some(profile) = planner_profile.as_ref() {
-        plan_mission_with_nim_profile(&repo, &input, profile)?
-    } else {
-        fixture_objectives(&input)
-    };
+    let (planner_label, objectives) =
+        generate_mission_objectives(&repo, &input, planner_profile.as_ref())?;
     store.plan_mission(&mission, &mission.brief, &objectives)?;
     store.persist_run_event(
         &mission.id,
@@ -3956,7 +6066,7 @@ fn run_fixture_worker(
         .find(|entry| entry.id == unit.id)
         .ok_or_else(|| format!("Objective not found after claim: {}", unit.id))?;
     let now = unix_now_label();
-    let session_id = format!("fixture-{}-{}", mission.id, unix_now_seconds());
+    let session_id = make_session_id("fixture", &mission.id, Some(&objective.id));
     let workspace_path = repo
         .join(".sloposcope")
         .join("missions")
@@ -4075,6 +6185,7 @@ fn run_fixture_worker(
 
 #[tauri::command]
 fn run_code_worker(
+    app: AppHandle,
     state: tauri::State<AppState>,
     mission_id: Option<String>,
     objective_id: Option<String>,
@@ -4115,8 +6226,10 @@ fn run_code_worker(
         .into_iter()
         .find(|entry| entry.id == unit.id)
         .ok_or_else(|| format!("Objective not found after claim: {}", unit.id))?;
+    let now_unix_seconds = unix_now_seconds();
     let now = unix_now_label();
-    let session_id = format!("code-{}-{}", mission.id, unix_now_seconds());
+    let lease_expires_at = session_lease_label(now_unix_seconds);
+    let session_id = make_session_id("code", &mission.id, Some(&objective.id));
     let selected_profile = resolve_requested_agent_profile(&store, profile_id.as_deref())?;
     let profile_label = selected_profile
         .as_ref()
@@ -4132,7 +6245,7 @@ fn run_code_worker(
         state: "running".to_string(),
         touched_paths: Vec::new(),
         workspace_path: String::new(),
-        lease_expires_at: Some(now.clone()),
+        lease_expires_at: Some(lease_expires_at.clone()),
         last_heartbeat_at: Some(now.clone()),
         last_event_at: Some(now.clone()),
         last_error: None,
@@ -4149,6 +6262,99 @@ fn run_code_worker(
             "profileId": profile_label.clone(),
         }),
     )?;
+    if let Some(profile) = selected_profile.as_ref() {
+        if !profile.command.trim().is_empty()
+            && profile.transport_kind != "internal"
+            && profile.transport_kind != "http"
+        {
+            let (mut command, prepared) =
+                build_profiled_worker_launch(&repo, &mission, &objective, &session_id, profile)?;
+            command.stdout(Stdio::piped()).stderr(Stdio::piped());
+            let child = command
+                .spawn()
+                .map_err(|err| format!("failed to run agent profile '{}': {err}", profile.id))?;
+            store.upsert_agent_session_runtime(&AgentSessionRuntimeRecord {
+                id: session_id.clone(),
+                mission_id: mission.id.clone(),
+                objective_id: Some(objective.id.clone()),
+                profile_id: profile_label.clone(),
+                assignment_kind: "execute_objective".to_string(),
+                state: "running".to_string(),
+                touched_paths: Vec::new(),
+                workspace_path: prepared.workspace_path.clone(),
+                lease_expires_at: Some(lease_expires_at.clone()),
+                last_heartbeat_at: Some(now.clone()),
+                last_event_at: Some(now.clone()),
+                last_error: None,
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            })?;
+            mission.state = "running".to_string();
+            mission.updated_at = unix_now_label();
+            store.upsert_mission(&mission)?;
+            let repo_clone = repo.clone();
+            let mission_clone = mission.clone();
+            let objective_clone = objective.clone();
+            let unit_clone = unit.clone();
+            let session_id_clone = session_id.clone();
+            let now_clone = now.clone();
+            let profile_clone = profile.clone();
+            let app_clone = app.clone();
+            std::thread::spawn(move || {
+                let result = collect_profiled_worker_execution(
+                    child,
+                    prepared,
+                    &objective_clone,
+                    &profile_clone,
+                )
+                .and_then(|execution| {
+                    persist_code_worker_completion(
+                        &repo_clone,
+                        &mission_clone,
+                        &objective_clone,
+                        &unit_clone,
+                        &session_id_clone,
+                        &now_clone,
+                        execution,
+                    )
+                });
+                if let Err(err) = result {
+                    if let Ok(mut store) = WorkStore::open_or_create(&repo_clone) {
+                        let failed_at = unix_now_label();
+                        let _ = store.persist_run_event(
+                            &mission_clone.id,
+                            &objective_clone.id,
+                            &session_id_clone,
+                            "failed",
+                            serde_json::json!({ "summary": err }),
+                        );
+                        let _ = store.upsert_agent_session_runtime(&AgentSessionRuntimeRecord {
+                            id: session_id_clone.clone(),
+                            mission_id: mission_clone.id.clone(),
+                            objective_id: Some(objective_clone.id.clone()),
+                            profile_id: profile_clone.id.clone(),
+                            assignment_kind: "execute_objective".to_string(),
+                            state: "failed".to_string(),
+                            touched_paths: Vec::new(),
+                            workspace_path: String::new(),
+                            lease_expires_at: None,
+                            last_heartbeat_at: Some(failed_at.clone()),
+                            last_event_at: Some(failed_at.clone()),
+                            last_error: Some(err),
+                            created_at: now_clone.clone(),
+                            updated_at: failed_at,
+                        });
+                    }
+                }
+                emit_mission_runtime_update(&app_clone, &mission_clone.id);
+            });
+            emit_mission_runtime_update(&app, &mission.id);
+            return store
+                .load_mission_state(Some(&mission.id), 200)
+                .map(mission_view_to_frontend);
+        }
+    }
+
     let execution = if let Some(profile) = selected_profile.as_ref() {
         if profile.command.trim().is_empty() || profile.transport_kind == "internal" {
             execute_internal_code_worker(&repo, &mission, &objective, &session_id)?
@@ -4158,229 +6364,16 @@ fn run_code_worker(
     } else {
         execute_internal_code_worker(&repo, &mission, &objective, &session_id)?
     };
-    let worker_success = execution
-        .diagnostics
-        .as_ref()
-        .and_then(|details| details.get("exitCode"))
-        .and_then(serde_json::Value::as_i64)
-        .map(|code| code == 0)
-        .unwrap_or(true);
-    store.persist_run_event(
-        &mission.id,
-        &objective.id,
+    persist_code_worker_completion(
+        &repo,
+        &mission,
+        &objective,
+        &unit,
         &session_id,
-        "progress",
-        serde_json::json!({
-            "message": format!("Code worker wrote {}", execution.relative_path),
-            "workspacePath": execution.workspace_path.clone(),
-            "touchedPaths": execution.touched_paths.clone(),
-            "patchPath": execution.patch_artifact_path.clone(),
-        }),
+        &now,
+        execution,
     )?;
-    let completed_at = unix_now_label();
-    let agent_verification = latest_agent_submitted_verification_for_session(
-        &store,
-        &mission.id,
-        &objective.id,
-        &session_id,
-    )?;
-    let verification_status = agent_verification
-        .as_ref()
-        .map(|record| record.status.clone())
-        .unwrap_or_else(|| {
-            if worker_success && execution.validation.success {
-                "passed".to_string()
-            } else {
-                "failed".to_string()
-            }
-        });
-    let workspace_path = execution.workspace_path.clone();
-    let relative_path = execution.relative_path.clone();
-    let patch_text = execution.patch_text.clone();
-    let touched_paths = execution.touched_paths.clone();
-    let validation_command = execution.validation.command.clone();
-    let validation_success = execution.validation.success;
-    let validation_exit_code = execution.validation.exit_code;
-    let validation_stdout = execution.validation.stdout.clone();
-    let validation_stderr = execution.validation.stderr.clone();
-    let mut verification_details = agent_verification
-        .as_ref()
-        .map(|record| record.details.clone())
-        .unwrap_or_else(|| serde_json::json!({}));
-    if let Some(map) = verification_details.as_object_mut() {
-        map.insert(
-            "kind".to_string(),
-            serde_json::Value::String(execution.worker_kind.clone()),
-        );
-        map.insert(
-            "command".to_string(),
-            serde_json::Value::String(validation_command.clone()),
-        );
-        map.insert(
-            "profileId".to_string(),
-            serde_json::Value::String(execution.profile_id.clone()),
-        );
-        map.insert(
-            "workspacePath".to_string(),
-            serde_json::Value::String(workspace_path.clone()),
-        );
-        map.insert(
-            "baseRevision".to_string(),
-            serde_json::Value::String(execution.base_revision.clone()),
-        );
-        map.insert(
-            "patchPath".to_string(),
-            serde_json::Value::String(execution.patch_artifact_path.clone()),
-        );
-        map.insert(
-            "patchSummary".to_string(),
-            serde_json::Value::String(patch_summary_for_path(&relative_path)),
-        );
-        map.insert(
-            "targetFile".to_string(),
-            serde_json::Value::String(relative_path.clone()),
-        );
-        map.insert(
-            "touchedPaths".to_string(),
-            serde_json::to_value(&touched_paths).unwrap_or_else(|_| serde_json::json!([])),
-        );
-        map.insert(
-            "patch".to_string(),
-            serde_json::Value::String(patch_text.clone()),
-        );
-        map.insert(
-            "validationStatus".to_string(),
-            serde_json::Value::String(verification_status.clone()),
-        );
-        map.insert(
-            "validation".to_string(),
-            serde_json::json!({
-                "command": validation_command,
-                "success": validation_success,
-                "exitCode": validation_exit_code,
-                "stdout": validation_stdout,
-                "stderr": validation_stderr,
-            }),
-        );
-        map.insert(
-            "diagnostics".to_string(),
-            execution
-                .diagnostics
-                .clone()
-                .unwrap_or_else(|| serde_json::json!({})),
-        );
-    }
-    let verification_summary = agent_verification
-        .as_ref()
-        .map(|record| record.summary.clone())
-        .unwrap_or_else(|| format!("Code worker completed {}.", objective.id));
-    let verification_id = if let Some(existing) = agent_verification {
-        store.update_verification(
-            existing.id,
-            &verification_status,
-            &verification_summary,
-            &verification_details,
-        )?;
-        existing.id
-    } else {
-        store.insert_verification(&NewVerificationRecord {
-            mission_id: mission.id.clone(),
-            objective_id: Some(objective.id.clone()),
-            session_id: Some(session_id.clone()),
-            status: verification_status.clone(),
-            summary: verification_summary.clone(),
-            details: verification_details,
-        })?
-    };
-    store.upsert_patch_decision(&PatchDecisionRecord {
-        mission_id: mission.id.clone(),
-        objective_id: objective.id.clone(),
-        session_id: Some(session_id.clone()),
-        status: "pending_review".to_string(),
-        reason: None,
-        patch_base_revision: Some(execution.base_revision.clone()),
-        apply_target_path: None,
-        apply_branch: None,
-        applied_at: None,
-        apply_error: None,
-        created_at: completed_at.clone(),
-        updated_at: completed_at.clone(),
-    })?;
-    let mut verdict = UnitVerdict {
-        unit_id: objective.id.clone(),
-        task_id: mission.id.clone(),
-        status: if worker_success && validation_success {
-            "done".to_string()
-        } else {
-            "failed".to_string()
-        },
-        summary: format!("Code worker completed {}", unit.title),
-        submitted_at: completed_at.clone(),
-        artifacts: vec![VerdictArtifact {
-            kind: "patch".to_string(),
-            content: patch_text.clone(),
-        }],
-    };
-    verdict.artifacts.push(VerdictArtifact {
-        kind: "verification_id".to_string(),
-        content: format!("verification-{verification_id}"),
-    });
-    store.submit_verdict(verdict)?;
-    store.persist_run_event(
-        &mission.id,
-        &unit.id,
-        &session_id,
-        if worker_success && validation_success {
-            "completed"
-        } else {
-            "failed"
-        },
-        serde_json::json!({
-            "summary": format!("Code worker completed {}.", unit.id),
-            "verificationId": verification_id,
-            "validationSuccess": validation_success,
-            "workerSuccess": worker_success,
-            "relativePath": execution.relative_path.clone(),
-        }),
-    )?;
-    store.upsert_agent_session_runtime(&AgentSessionRuntimeRecord {
-        id: session_id,
-        mission_id: mission.id.clone(),
-        objective_id: Some(unit.id),
-        profile_id: execution.profile_id.clone(),
-        assignment_kind: "execute_objective".to_string(),
-        state: if worker_success && validation_success {
-            "completed".to_string()
-        } else {
-            "failed".to_string()
-        },
-        touched_paths,
-        workspace_path: execution.workspace_path,
-        lease_expires_at: None,
-        last_heartbeat_at: Some(completed_at.clone()),
-        last_event_at: Some(completed_at.clone()),
-        last_error: if worker_success && validation_success {
-            None
-        } else {
-            Some(execution.validation.stderr)
-        },
-        created_at: now,
-        updated_at: completed_at,
-    })?;
-
-    let planned_state = store.load_mission_state(Some(&mission.id), 200)?;
-    mission.state = if planned_state.summary.failed_objectives > 0 {
-        "failed".to_string()
-    } else if planned_state.summary.pending_objectives == 0
-        && planned_state.summary.claimed_objectives == 0
-        && planned_state.summary.total_objectives > 0
-    {
-        "completed".to_string()
-    } else {
-        "running".to_string()
-    };
-    mission.updated_at = unix_now_label();
-    store.upsert_mission(&mission)?;
+    emit_mission_runtime_update(&app, &mission.id);
     store
         .load_mission_state(Some(&mission.id), 200)
         .map(mission_view_to_frontend)
@@ -4388,6 +6381,7 @@ fn run_code_worker(
 
 #[tauri::command]
 fn run_next_code_worker(
+    app: AppHandle,
     state: tauri::State<AppState>,
     mission_id: Option<String>,
     profile_id: Option<String>,
@@ -4413,7 +6407,13 @@ fn run_next_code_worker(
         .next_objective_id
         .ok_or_else(|| "No schedulable objective found.".to_string())?;
     drop(store);
-    run_code_worker(state, Some(mission.id), Some(next_objective_id), profile_id)
+    run_code_worker(
+        app,
+        state,
+        Some(mission.id),
+        Some(next_objective_id),
+        profile_id,
+    )
 }
 
 #[tauri::command]
@@ -4806,6 +6806,7 @@ fn agent_login(
 ) -> Result<serde_json::Value, String> {
     let repo = state.repo.lock().clone();
     let mut store = WorkStore::open_or_create(&repo)?;
+    let now_unix_seconds = unix_now_seconds();
     let now = unix_now_label();
     let session_id = input
         .session_id
@@ -4813,7 +6814,9 @@ fn agent_login(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_string)
-        .unwrap_or_else(|| format!("agent-{}-{}", input.profile_id, unix_now_seconds()));
+        .unwrap_or_else(|| {
+            make_session_id("agent", &input.mission_id, input.objective_id.as_deref())
+        });
     store.upsert_agent_session_runtime(&AgentSessionRuntimeRecord {
         id: session_id.clone(),
         mission_id: input.mission_id.clone(),
@@ -4825,7 +6828,7 @@ fn agent_login(
         state: "running".to_string(),
         touched_paths: Vec::new(),
         workspace_path: input.workspace_path.unwrap_or_default(),
-        lease_expires_at: Some(now.clone()),
+        lease_expires_at: Some(session_lease_label(now_unix_seconds)),
         last_heartbeat_at: Some(now.clone()),
         last_event_at: Some(now.clone()),
         last_error: None,
@@ -4985,7 +6988,14 @@ fn conductor_refresh(
 ) -> Result<conductor::ConductorRefreshResponse, String> {
     let now = unix_now_seconds();
     let mut runtime = state.conductor.lock();
-    conductor::refresh_runtime(&mut runtime, updates.as_deref().unwrap_or(&[]), now)
+    let resp = conductor::refresh_runtime(&mut runtime, updates.as_deref().unwrap_or(&[]), now)?;
+
+    let repo = state.repo.lock().clone();
+    if let Ok(mut store) = WorkStore::open_or_create(&repo) {
+        let _ = sync_conductor_to_store(&mut store, &runtime);
+    }
+
+    Ok(resp)
 }
 
 #[tauri::command]
@@ -5015,6 +7025,11 @@ fn conductor_enqueue_task(
             .issue_runs
             .push(conductor::IssueRun::new(task.clone(), context));
     }
+
+    if let Ok(mut store) = WorkStore::open_or_create(&repo) {
+        let _ = sync_conductor_to_store(&mut store, &runtime);
+    }
+
     Ok(task)
 }
 
@@ -5062,7 +7077,13 @@ fn conductor_prepare_launch(
         workspace_path: workspace_spec.workspace_path,
         prompt,
     };
-    conductor::build_app_server_launch_payload(&request)
+    let payload = conductor::build_app_server_launch_payload(&request)?;
+
+    if let Ok(mut store) = WorkStore::open_or_create(&repo) {
+        let _ = sync_conductor_to_store(&mut store, &runtime);
+    }
+
+    Ok(payload)
 }
 
 #[tauri::command]
@@ -5101,7 +7122,13 @@ fn conductor_ingest_runner_event(
         }
     }
     let update = conductor::ConductorRunnerUpdate { task_id, event };
-    conductor::refresh_runtime(&mut runtime, &[update], now)
+    let resp = conductor::refresh_runtime(&mut runtime, &[update], now)?;
+
+    if let Ok(mut store) = WorkStore::open_or_create(&repo) {
+        let _ = sync_conductor_to_store(&mut store, &runtime);
+    }
+
+    Ok(resp)
 }
 
 #[tauri::command]
@@ -5154,6 +7181,10 @@ fn conductor_dispatch_launch(
         {
             ir.attach_session(session_id.clone());
         }
+
+        if let Ok(mut store) = WorkStore::open_or_create(&repo) {
+            let _ = sync_conductor_to_store(&mut store, &runtime);
+        }
     }
     let request = conductor::ConductorRunnerLaunchRequest {
         provider: conductor::ConductorRunnerProvider::CodingAgentAppServer,
@@ -5163,7 +7194,9 @@ fn conductor_dispatch_launch(
         workspace_path: workspace_spec.workspace_path,
         prompt,
     };
-    conductor::build_app_server_launch_payload(&request)
+    let payload = conductor::build_app_server_launch_payload(&request)?;
+
+    Ok(payload)
 }
 
 #[tauri::command]
@@ -5602,7 +7635,7 @@ fn flush_watcher_batch(handle: &AppHandle) {
 
             let update_result = if !path.exists() || !path.is_file() {
                 SqliteGraphStore::open_or_create(&repo)
-                    .and_then(|store| store.remove_file(&rel_path))
+                    .and_then(|store| store.remove_program_file(&rel_path))
             } else {
                 update_canonical_graph_for_file(&state.parsers, &repo, &rel_path)
             };
@@ -6132,6 +8165,7 @@ mod tests {
                 capabilities: vec!["can_edit".into()],
                 transport_kind: "internal".into(),
                 active: true,
+                is_reviewer: false,
                 created_at: "unix:1".into(),
                 updated_at: "unix:1".into(),
             })
@@ -6148,6 +8182,7 @@ mod tests {
                 capabilities: vec!["can_edit".into()],
                 transport_kind: "pty".into(),
                 active: false,
+                is_reviewer: false,
                 created_at: "unix:2".into(),
                 updated_at: "unix:2".into(),
             })
@@ -6186,6 +8221,7 @@ mod tests {
                 capabilities: vec!["can_plan".into()],
                 transport_kind: "pipe".into(),
                 active: true,
+                is_reviewer: false,
                 created_at: "unix:1".into(),
                 updated_at: "unix:1".into(),
             })
@@ -6234,6 +8270,7 @@ mod tests {
             capabilities: vec!["can_edit".into()],
             transport_kind: "pty".into(),
             active: true,
+            is_reviewer: false,
             created_at: "unix:1".into(),
             updated_at: "unix:1".into(),
         };
@@ -6285,6 +8322,7 @@ mod tests {
             capabilities: vec!["can_edit".into()],
             transport_kind: "pty".into(),
             active: true,
+            is_reviewer: false,
             created_at: "unix:1".into(),
             updated_at: "unix:1".into(),
         };
@@ -6403,6 +8441,7 @@ mod tests {
             capabilities: vec!["can_edit".into()],
             transport_kind: "pty".into(),
             active: true,
+            is_reviewer: false,
             created_at: "unix:1".into(),
             updated_at: "unix:1".into(),
         };
@@ -6420,6 +8459,83 @@ mod tests {
             std::fs::read_to_string(Path::new(&result.workspace_path).join(".validate-count"))
                 .expect("validation count"),
             "1"
+        );
+    }
+
+    #[test]
+    fn profiled_cli_worker_accepts_live_nudge_over_pty() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut mission = init_git_repo_with_file(dir.path(), "app.js", "seed\n");
+        mission.validation_command = "test \"$(cat app.js)\" = \"nudged from ruth\"".into();
+        let objective = work_store::ObjectiveRecord {
+            id: "objective-live-nudge".into(),
+            mission_id: mission.id.clone(),
+            title: "Live nudge".into(),
+            prompt: "Wait for nudge".into(),
+            status: WorkUnitStatus::Claimed,
+            claimed_by: Some("worker".into()),
+            claimed_at: Some("unix:2".into()),
+            created_at: "unix:1".into(),
+            meta: work_store::ObjectiveMeta {
+                scope_paths: vec!["app.js".into()],
+                expected_validation: vec![],
+                done_criteria: vec!["app.js updated from live nudge".into()],
+                test_intent: Some("outer_red".into()),
+            },
+        };
+        let profile = AgentProfile {
+            id: "local-cli-live-nudge".into(),
+            label: "Local CLI Live Nudge".into(),
+            provider: "local_cli".into(),
+            model: Some("shell".into()),
+            command: "/bin/sh".into(),
+            args: vec![
+                "-lc".into(),
+                "IFS= read -r line; printf '%s' \"$line\" > app.js".into(),
+            ],
+            env: serde_json::json!({}),
+            capabilities: vec!["can_edit".into()],
+            transport_kind: "pty".into(),
+            active: true,
+            is_reviewer: false,
+            created_at: "unix:1".into(),
+            updated_at: "unix:1".into(),
+        };
+
+        let (mut command, prepared) = build_profiled_worker_launch(
+            dir.path(),
+            &mission,
+            &objective,
+            "session-live-nudge",
+            &profile,
+        )
+        .expect("build launch");
+        command.stdout(Stdio::piped()).stderr(Stdio::piped());
+        let child = command.spawn().expect("spawn harness");
+        agent_harness::append_session_nudge(
+            &prepared.workspace_path,
+            "session-live-nudge",
+            "nudged from ruth",
+        )
+        .expect("append nudge");
+
+        let result = collect_profiled_worker_execution(child, prepared, &objective, &profile)
+            .expect("collect execution");
+        assert_eq!(result.worker_kind, "cli_worker");
+        assert_eq!(
+            std::fs::read_to_string(Path::new(&result.workspace_path).join("app.js"))
+                .expect("app.js"),
+            "nudged from ruth"
+        );
+        assert!(result.validation.success);
+        let diagnostics = result.diagnostics.expect("diagnostics");
+        assert_eq!(
+            diagnostics
+                .get("nudgePath")
+                .and_then(serde_json::Value::as_str)
+                .map(Path::new)
+                .map(Path::exists),
+            Some(true)
         );
     }
 
@@ -6471,6 +8587,7 @@ mod tests {
             capabilities: vec!["can_edit".into()],
             transport_kind: "pipe".into(),
             active: true,
+            is_reviewer: false,
             created_at: "unix:1".into(),
             updated_at: "unix:1".into(),
         };
@@ -6572,6 +8689,7 @@ mod tests {
             capabilities: vec!["can_edit".into()],
             transport_kind: "pipe".into(),
             active: true,
+            is_reviewer: false,
             created_at: "unix:1".into(),
             updated_at: "unix:1".into(),
         };
@@ -6631,7 +8749,9 @@ mod tests {
         );
         let diagnostics = result.diagnostics.expect("diagnostics");
         assert_eq!(
-            diagnostics.get("piConfigDir").and_then(serde_json::Value::as_str),
+            diagnostics
+                .get("piConfigDir")
+                .and_then(serde_json::Value::as_str),
             Some(config_dir.display().to_string().as_str())
         );
         assert_eq!(
@@ -6845,6 +8965,16 @@ pub fn run() {
                 (import_header (qualified_identifier) @edge.target)
             "#,
         }),
+        Box::new(PluggableParser {
+            extensions: vec!["elm"],
+            language: tree_sitter::Language::new(tree_sitter_elm::LANGUAGE),
+            default_node_kind: "module",
+            default_edge_kind: "import",
+            queries: r#"
+                (module_declaration name: (upper_case_qid) @node.name)
+                (function_declaration_left (lower_case_identifier) @func.name)
+            "#,
+        }),
     ];
 
     let graph_start = Instant::now();
@@ -6873,6 +9003,7 @@ pub fn run() {
 
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .manage(jev_analysis::AnalysisService::default())
         .manage(AppState {
             repo: Mutex::new(repo),
             parsers,
@@ -6901,6 +9032,15 @@ pub fn run() {
             get_current_branch,
             get_file_diff,
             get_file_source,
+            get_file_anatomy,
+            get_file_anatomy_comparison,
+            get_graph_anatomies,
+            get_jev_index,
+            preview_jev_analysis,
+            confirm_jev_analysis,
+            get_reviewer_target_context,
+            reviewer_generate_elm,
+            compile_reviewer_elm,
             save_file,
             get_repo_path,
             get_watchdog_state,
@@ -6917,6 +9057,14 @@ pub fn run() {
             mcp_watchdog_get_alerts,
             mcp_watchdog_get_issue_context,
             mcp_watchdog_get_evidence_snapshot,
+            get_coordinator_state,
+            resume_mission_thread,
+            start_coordinator_thread,
+            send_coordinator_message,
+            approve_coordinator_plan,
+            launch_coordinator_workers,
+            request_coordinator_report,
+            nudge_worker_session,
             get_mission_state,
             save_mission_input,
             plan_mission,

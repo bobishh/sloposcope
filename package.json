@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
+    "check:organisms": "tsc --noEmit --strict --target ES2022 --lib ES2022,DOM --module ESNext --moduleResolution Bundler --skipLibCheck src/lib/fileOrganism.ts src/lib/sceneRuntime.ts",
     "tauri": "tauri",
     "test:e2e": "playwright test"
   },
@@ -14,6 +15,7 @@
     "@sveltejs/vite-plugin-svelte": "^5.0.3",
     "@tauri-apps/cli": "^2.5.0",
     "svelte": "^5.28.1",
+    "typescript": "^5.9.3",
     "vite": "^6.3.5",
     "vitest": "^3.0.0"
   },

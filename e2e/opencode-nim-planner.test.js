@@ -1,10 +1,15 @@
 import { test, expect } from '@playwright/test';
 
+async function openAdvancedOperations(page) {
+  await page.locator('.eyeloss-controls__view-btn').click();
+  await page.getByLabel('Developer mode').check();
+  return page.getByRole('tablist', { name: 'Advanced operation sections' });
+}
+
 test('should quick-start opencode on NIM and carry planner notes into profile-backed mission planning', async ({ page }) => {
   await page.goto('/');
-  await page.locator('.eyeloss-controls__view-btn').click();
 
-  const missionTabs = page.getByRole('tablist', { name: 'Mission sections' });
+  const missionTabs = await openAdvancedOperations(page);
   await missionTabs.getByRole('button', { name: 'Debug', exact: true }).click();
   const debugTabs = page.getByRole('tablist', { name: 'Debug sections' });
   await debugTabs.getByRole('button', { name: 'Profiles', exact: true }).click();

@@ -9,6 +9,7 @@
   import ConfigPanel from './lib/ConfigPanel.svelte';
   import RunsPanel from './lib/RunsPanel.svelte';
   import { createBackendBridge } from './lib/backendBridge.js';
+  import { isCurrentGraphSnapshotRequest } from './lib/graphSnapshotRequestModel.js';
   import { getFortune } from './lib/fortunes.js';
   import * as projectSessions from './lib/projectSessionModel.js';
   import * as watchdogOps from './lib/watchdogConductorOrchestrator.js';
@@ -248,6 +249,35 @@
     };
   }
 
+  function createDefaultCoordinatorState() {
+    return {
+      threadId: '',
+      missionId: '',
+      personaName: 'Coordinator',
+      title: 'Unscoped mission',
+      state: 'wake',
+      draftMission: {
+        title: '',
+        brief: '',
+        validationCommand: '',
+        issueKey: '',
+        issueUrl: '',
+        plannerProfileId: '',
+        plannerNotes: '',
+        plannerPromptOverride: '',
+      },
+      pendingPlan: [],
+      messages: [],
+      summary: 'Coordinator waiting on mission brief.',
+      latestSessionId: null,
+      latestLiveSessionId: null,
+      threads: [],
+      canApprovePlan: false,
+      canAskReport: false,
+      canLaunchWorkers: false,
+    };
+  }
+
   function latestMissionSession(state) {
     const sessions = Array.isArray(state?.sessions) ? state.sessions : [];
     return sessions.length > 0 ? sessions[sessions.length - 1] : null;
@@ -274,6 +304,7 @@
   let currentBranch = $state('');
   let currentRevision = $state('');
   let since = $state('@'); 
+  let reviewTarget = $state(projectSessions.createDefaultReviewTarget());
   let loading = $state(true); // Initial load
   let refreshing = $state(false); // Update state
   let graphBuildProgress = $state(null); // { filesProcessed, filesTotal } while bg rebuild runs
@@ -283,6 +314,7 @@
   let showDropdown = $state(false);
   let highlightedIndex = $state(-1);
   let loadGraphRequestSeq = 0;
+  let projectGraphRequestSeq = new Map();
   let inFlightLoadGraph = 0;
   let loadingMore = $state(false);
 
@@ -300,6 +332,29 @@
   // Multi-project tabs (one active project; inactive projects sleep).
   let projectTabs = $state([]);
   let activeProjectId = $state(null);
+  let jevSnapshot = $state(null);
+  async function invokeJev(cmd, args) {
+    if (cmd !== 'get_jev_index') return invoke(cmd, args);
+    const projectId = activeProjectId;
+    const version = contentVersion;
+    const fileVersions = new Map(fileContentVersions);
+    const inventory = await invoke(cmd, args);
+    if (inventory.repo === repoPath && projectId === activeProjectId) {
+      jevSnapshot = { inventory, projectId, version, fileVersions };
+    }
+    return inventory;
+  }
+  let jevByFile = $derived.by(() => {
+    if (!jevSnapshot || jevSnapshot.projectId !== activeProjectId || jevSnapshot.version !== contentVersion) return {};
+    const byFile = {};
+    for (const group of jevSnapshot.inventory.groups) {
+      if (!group.cached) continue;
+      for (const path of group.paths) {
+        if (jevSnapshot.fileVersions.get(path) === fileContentVersions.get(path)) byFile[path] = group.cached;
+      }
+    }
+    return byFile;
+  });
 
   let watchdogState = $state(createDefaultWatchdogState());
   let watchdogTraces = $state([]);
@@ -341,8 +396,10 @@
   let conductorIngestLoading = $state(false);
   let clusterRefreshLoading = $state(false);
   let missionStateByProject = $state(new Map());
+  let coordinatorStateByProject = $state(new Map());
   let selectedCodeWorkerProfileByProject = $state(new Map());
   let missionState = $state(createDefaultMissionState());
+  let coordinatorState = $state(createDefaultCoordinatorState());
   let missionLoading = $state(false);
   let missionSaving = $state(false);
   let missionPlanning = $state(false);
@@ -353,6 +410,10 @@
   let missionReviewAction = $state('');
   let missionError = $state('');
   let missionLoadRequestSeq = 0;
+  let coordinatorLoading = $state(false);
+  let coordinatorSending = $state(false);
+  let coordinatorError = $state('');
+  let coordinatorLoadRequestSeq = 0;
   let missionTitle = $state('');
   let missionBrief = $state('');
   let missionValidationCommand = $state('');
@@ -394,6 +455,7 @@
   let activeMainView = $state('graph');
   let activeSettingsTab = $state('mission');
   let activeDebugTab = $state('issue');
+  let developerMode = $state(false);
 
   let watchdogStatusClass = $derived.by(() => {
     const status = String(watchdogState?.lastVerdict?.status || '');
@@ -476,6 +538,10 @@
     return missionStateByProject.get(projectId) || createDefaultMissionState();
   }
 
+  function getCoordinatorStateForProject(projectId) {
+    return coordinatorStateByProject.get(projectId) || createDefaultCoordinatorState();
+  }
+
   function getSelectedCodeWorkerProfileId(projectId = activeProjectId) {
     return selectedCodeWorkerProfileByProject.get(projectId) || '';
   }
@@ -518,9 +584,52 @@
     }
   }
 
+  function storeCoordinatorState(projectId, nextState) {
+    const nextMap = new Map(coordinatorStateByProject);
+    nextMap.set(projectId, nextState);
+    coordinatorStateByProject = nextMap;
+    if (projectId === activeProjectId) {
+      coordinatorState = nextState;
+    }
+  }
+
   function syncMissionStateToProject(projectId = activeProjectId) {
     if (!projectId) return;
     storeMissionState(projectId, normalizeMissionView(missionState, missionState));
+  }
+
+  function normalizeCoordinatorView(view, fallback = null) {
+    const base = fallback || createDefaultCoordinatorState();
+    return {
+      ...base,
+      ...(view || {}),
+      threadId: String(view?.threadId ?? view?.thread_id ?? base.threadId ?? ''),
+      missionId: String(view?.missionId ?? view?.mission_id ?? base.missionId ?? ''),
+      personaName: String(view?.personaName ?? view?.persona_name ?? base.personaName ?? 'Coordinator'),
+      title: String(view?.title ?? base.title ?? 'Unscoped mission'),
+      state: String(view?.state ?? base.state ?? 'wake'),
+      draftMission: {
+        ...base.draftMission,
+        ...(view?.draftMission || view?.draft_mission || {}),
+        title: String(view?.draftMission?.title ?? view?.draft_mission?.title ?? base.draftMission?.title ?? ''),
+        brief: String(view?.draftMission?.brief ?? view?.draft_mission?.brief ?? base.draftMission?.brief ?? ''),
+        validationCommand: String(view?.draftMission?.validationCommand ?? view?.draft_mission?.validation_command ?? base.draftMission?.validationCommand ?? ''),
+        issueKey: String(view?.draftMission?.issueKey ?? view?.draft_mission?.issue_key ?? base.draftMission?.issueKey ?? ''),
+        issueUrl: String(view?.draftMission?.issueUrl ?? view?.draft_mission?.issue_url ?? base.draftMission?.issueUrl ?? ''),
+        plannerProfileId: String(view?.draftMission?.plannerProfileId ?? view?.draft_mission?.planner_profile_id ?? base.draftMission?.plannerProfileId ?? ''),
+        plannerNotes: String(view?.draftMission?.plannerNotes ?? view?.draft_mission?.planner_notes ?? base.draftMission?.plannerNotes ?? ''),
+        plannerPromptOverride: String(view?.draftMission?.plannerPromptOverride ?? view?.draft_mission?.planner_prompt_override ?? base.draftMission?.plannerPromptOverride ?? ''),
+      },
+      pendingPlan: Array.isArray(view?.pendingPlan) ? view.pendingPlan : Array.isArray(view?.pending_plan) ? view.pending_plan : base.pendingPlan,
+      messages: Array.isArray(view?.messages) ? view.messages : base.messages,
+      threads: Array.isArray(view?.threads) ? view.threads : base.threads,
+      summary: String(view?.summary ?? base.summary ?? 'Coordinator waiting on mission brief.'),
+      latestSessionId: view?.latestSessionId ?? view?.latest_session_id ?? base.latestSessionId ?? null,
+      latestLiveSessionId: view?.latestLiveSessionId ?? view?.latest_live_session_id ?? base.latestLiveSessionId ?? null,
+      canApprovePlan: Boolean(view?.canApprovePlan ?? view?.can_approve_plan ?? base.canApprovePlan),
+      canAskReport: Boolean(view?.canAskReport ?? view?.can_ask_report ?? base.canAskReport),
+      canLaunchWorkers: Boolean(view?.canLaunchWorkers ?? view?.can_launch_workers ?? base.canLaunchWorkers),
+    };
   }
 
   function missionInputFromForm() {
@@ -733,6 +842,175 @@
     }
   }
 
+  async function refreshCoordinatorState(targetProjectId = activeProjectId) {
+    if (!targetProjectId || targetProjectId !== activeProjectId) return;
+    const requestId = ++coordinatorLoadRequestSeq;
+    coordinatorLoading = true;
+    coordinatorError = '';
+    try {
+      const current = getCoordinatorStateForProject(targetProjectId);
+      const view = await watchdogOps.fetchCoordinatorState(
+        invokeTraced,
+        current.missionId || null,
+        current.threadId || null,
+      );
+      if (requestId !== coordinatorLoadRequestSeq || targetProjectId !== activeProjectId) return;
+      storeCoordinatorState(targetProjectId, normalizeCoordinatorView(view, current));
+    } catch (error) {
+      if (requestId === coordinatorLoadRequestSeq && targetProjectId === activeProjectId) {
+        coordinatorError = extractErrorMessage(error) || 'Coordinator load failed.';
+      }
+    } finally {
+      if (requestId === coordinatorLoadRequestSeq && targetProjectId === activeProjectId) {
+        coordinatorLoading = false;
+      }
+    }
+  }
+
+  async function sendCoordinatorMessage(content) {
+    if (coordinatorSending) return;
+    coordinatorSending = true;
+    coordinatorError = '';
+    try {
+      const current = getCoordinatorStateForProject(activeProjectId);
+      const view = await watchdogOps.sendCoordinatorMessage(
+        invokeTraced,
+        content,
+        current.missionId || null,
+        current.threadId || null,
+      );
+      const next = normalizeCoordinatorView(view, current);
+      storeCoordinatorState(activeProjectId, next);
+      if (next.missionId) {
+        await refreshMissionState(activeProjectId);
+      }
+    } catch (error) {
+      coordinatorError = extractErrorMessage(error) || 'Coordinator send failed.';
+      throw error;
+    } finally {
+      coordinatorSending = false;
+    }
+  }
+
+  async function approveCoordinatorPlan() {
+    if (coordinatorSending) return;
+    coordinatorSending = true;
+    coordinatorError = '';
+    try {
+      const current = getCoordinatorStateForProject(activeProjectId);
+      const view = await watchdogOps.approveCoordinatorPlan(
+        invokeTraced,
+        current.missionId || null,
+        current.threadId || null,
+      );
+      const next = normalizeCoordinatorView(view, current);
+      storeCoordinatorState(activeProjectId, next);
+      await refreshMissionState(activeProjectId);
+    } catch (error) {
+      coordinatorError = extractErrorMessage(error) || 'Coordinator approve failed.';
+    } finally {
+      coordinatorSending = false;
+    }
+  }
+
+  async function launchCoordinatorWorkers() {
+    if (coordinatorSending) return;
+    coordinatorSending = true;
+    coordinatorError = '';
+    try {
+      const current = getCoordinatorStateForProject(activeProjectId);
+      const view = await watchdogOps.launchCoordinatorWorkers(
+        invokeTraced,
+        current.missionId || null,
+        current.threadId || null,
+        getSelectedCodeWorkerProfileId(activeProjectId) || null,
+      );
+      storeCoordinatorState(activeProjectId, normalizeCoordinatorView(view, current));
+      await refreshMissionState(activeProjectId);
+    } catch (error) {
+      coordinatorError = extractErrorMessage(error) || 'Coordinator launch failed.';
+    } finally {
+      coordinatorSending = false;
+    }
+  }
+
+  async function requestCoordinatorReport() {
+    if (coordinatorSending) return;
+    coordinatorSending = true;
+    coordinatorError = '';
+    try {
+      const current = getCoordinatorStateForProject(activeProjectId);
+      const view = await watchdogOps.requestCoordinatorReport(
+        invokeTraced,
+        current.missionId || null,
+        current.threadId || null,
+      );
+      storeCoordinatorState(activeProjectId, normalizeCoordinatorView(view, current));
+    } catch (error) {
+      coordinatorError = extractErrorMessage(error) || 'Coordinator report failed.';
+    } finally {
+      coordinatorSending = false;
+    }
+  }
+
+  async function startFreshCoordinatorThread() {
+    if (coordinatorSending) return;
+    coordinatorSending = true;
+    coordinatorError = '';
+    try {
+      const view = await watchdogOps.startCoordinatorThread(invokeTraced);
+      const next = normalizeCoordinatorView(view, createDefaultCoordinatorState());
+      storeCoordinatorState(activeProjectId, next);
+      if (next.missionId) {
+        await refreshMissionState(activeProjectId);
+      }
+    } catch (error) {
+      coordinatorError = extractErrorMessage(error) || 'Coordinator thread start failed.';
+    } finally {
+      coordinatorSending = false;
+    }
+  }
+
+  async function resumeCoordinatorThread(threadId) {
+    const normalized = String(threadId || '').trim();
+    if (!normalized || coordinatorSending) return;
+    coordinatorSending = true;
+    coordinatorError = '';
+    try {
+      const view = await watchdogOps.resumeCoordinatorThread(invokeTraced, normalized);
+      const next = normalizeCoordinatorView(view, getCoordinatorStateForProject(activeProjectId));
+      storeCoordinatorState(activeProjectId, next);
+      if (next.missionId) {
+        await refreshMissionState(activeProjectId);
+      }
+    } catch (error) {
+      coordinatorError = extractErrorMessage(error) || 'Coordinator thread load failed.';
+    } finally {
+      coordinatorSending = false;
+    }
+  }
+
+  async function nudgeLatestWorker() {
+    if (coordinatorSending) return;
+    coordinatorSending = true;
+    coordinatorError = '';
+    try {
+      const current = getCoordinatorStateForProject(activeProjectId);
+      const view = await watchdogOps.nudgeWorkerSession(
+        invokeTraced,
+        'Tighten scope and report blockers.',
+        current.missionId || null,
+        current.threadId || null,
+        current.latestLiveSessionId || null,
+      );
+      storeCoordinatorState(activeProjectId, normalizeCoordinatorView(view, current));
+    } catch (error) {
+      coordinatorError = extractErrorMessage(error) || 'Coordinator nudge failed.';
+    } finally {
+      coordinatorSending = false;
+    }
+  }
+
   async function saveMissionInput() {
     if (missionSaving) return;
     missionSaving = true;
@@ -763,6 +1041,7 @@
       const view = await invokeTraced('save_mission_input', { missionInput: input });
       const next = normalizeMissionView(view, nextState);
       storeMissionState(activeProjectId, next);
+      await refreshCoordinatorState(activeProjectId);
     } catch (error) {
       missionError = extractErrorMessage(error) || 'Failed to save mission input.';
       storeMissionState(activeProjectId, appendMissionEvent(nextState, {
@@ -833,6 +1112,7 @@
       });
       const next = normalizeMissionView(view, localPlan);
       storeMissionState(activeProjectId, next);
+      await refreshCoordinatorState(activeProjectId);
     } catch (error) {
       missionError = extractErrorMessage(error) || 'Failed to plan mission.';
       storeMissionState(activeProjectId, appendMissionEvent(localPlan, {
@@ -1263,6 +1543,17 @@
         args: '-lc\necho ok',
         env: {},
         capabilities: 'can_edit',
+        transportKind: 'pty',
+        active: false,
+      },
+      local_live: {
+        label: 'Live Local horse',
+        provider: 'local_live_cli',
+        model: 'shell',
+        command: '/bin/sh',
+        args: '-lc\nsleep 30',
+        env: {},
+        capabilities: 'can_edit\ncan_run_tools',
         transportKind: 'pty',
         active: false,
       },
@@ -1720,6 +2011,7 @@
     currentBranch = globals.currentBranch;
     currentRevision = globals.currentRevision;
     since = globals.since;
+    reviewTarget = globals.reviewTarget;
     heatCounter = globals.heatCounter;
     heatmapData = globals.heatmapData;
     fileContentVersions = globals.fileContentVersions;
@@ -1741,6 +2033,7 @@
       currentBranch,
       currentRevision,
       since,
+      reviewTarget,
       heatCounter,
       heatmapData,
       fileContentVersions,
@@ -1801,6 +2094,19 @@
     return [...matchedBookmarks, ...matchedChanges];
   });
 
+  async function loadProjectHistoryAndGraph(projectId, isInitial) {
+    try {
+      await loadTimelineChanges(projectId);
+      await loadGraph(isInitial, projectId);
+    } catch (error) {
+      if (activeProjectId === projectId) {
+        loading = false;
+        refreshing = false;
+        repoActionMessage = `Cannot load history: ${extractErrorMessage(error) || 'History unavailable'}`;
+      }
+    }
+  }
+
   async function loadTimelineChanges(targetProjectId = activeProjectId) {
     const project = getProjectById(targetProjectId);
     if (!project) return;
@@ -1808,11 +2114,13 @@
     const unique = uniqueChanges(c);
     debugLog(`[FRONTEND][TRACE] timeline fetched raw=${c?.length || 0}, unique=${unique.length}`);
     project.changes = unique;
+    projectSessions.initializeProjectSelection(project);
     project.changesLimit = unique.length;
     project.hasMoreChanges = false; // We paginate locally after prefetching full history.
 
     if (activeProjectId === targetProjectId) {
       changes = unique;
+      since = project.since;
       changesLimit = unique.length;
       hasMoreChanges = false;
       refreshFortune();
@@ -1837,6 +2145,67 @@
     };
   }
 
+  function buildAnatomySelection(project) {
+    const graphRequest = buildGraphViewRequest(project);
+    if (graphRequest.seed?.kind === 'working_copy') return { mode: 'working_copy', since: '@' };
+    if (graphRequest.seed?.kind !== 'commit') return { mode: 'working_copy', since: '@' };
+    const selected = String(graphRequest.seed.revset || '').trim();
+    if (!selected) return { mode: 'none', since: null };
+    if (selected.includes(' | ')) return { mode: 'unsupported', since: selected };
+    if (selected.includes('..')) return { mode: 'range', since: selected };
+    return { mode: 'change', since: selected };
+  }
+
+  async function attachGraphAnatomies(graphData, selection) {
+    const nodes = Array.isArray(graphData?.nodes) ? graphData.nodes : [];
+    const files = [...new Set(nodes.map((node) => node?.file).filter(Boolean))];
+    if (!files.length) return graphData;
+    try {
+      const endpoints = await invokeTraced(
+        'get_graph_anatomies',
+        { files, selection },
+        { warnAfterMs: 12000 },
+      );
+      const byFile = new Map((Array.isArray(endpoints) ? endpoints : []).map((item) => [item.file, item]));
+      return {
+        ...graphData,
+        nodes: nodes.map((node) => {
+          const endpoint = byFile.get(node?.file);
+          if (!endpoint) return {
+            ...node,
+            anatomyEndpointState: 'unavailable',
+            anatomyEndpointReason: 'Snapshot anatomy response missing',
+            anatomy: null,
+          };
+          return {
+            ...node,
+            anatomyEndpointState: endpoint.status || 'unavailable',
+            anatomyEndpointReason: endpoint.reason || null,
+            anatomy: endpoint.anatomy || null,
+            anatomySourceId: endpoint.sourceId || null,
+            anatomySnapshotLabel: endpoint.label || null,
+          };
+        }),
+      };
+    } catch (error) {
+      console.warn('[FRONTEND] Failed to load map anatomy batch', error);
+      return {
+        ...graphData,
+        nodes: nodes.map((node) => ({
+          ...node,
+          anatomyEndpointState: 'unavailable',
+          anatomyEndpointReason: 'Snapshot anatomy batch failed',
+          anatomy: null,
+        })),
+      };
+    }
+  }
+
+  function projectShowsHistoricalGraph(project) {
+    const sinceLabel = String(project?.since || '@').trim() || '@';
+    return sinceLabel !== '@' || Boolean(project?.graphMeta?.approximateHistorical);
+  }
+
   async function setGraphViewMode(mode, targetProjectId = activeProjectId) {
     const project = getProjectById(targetProjectId);
     if (!project) return;
@@ -1851,9 +2220,13 @@
     const project = getProjectById(targetProjectId);
     if (!project) return;
     const requestId = ++loadGraphRequestSeq;
+    const projectKey = project.id || targetProjectId;
+    const projectRequestId = Number(projectGraphRequestSeq.get(projectKey) || 0) + 1;
+    projectGraphRequestSeq.set(projectKey, projectRequestId);
     const requestStartedAt = performance.now();
     const previousBranch = project.currentBranch || '';
     const request = buildGraphViewRequest(project);
+    const anatomySelection = buildAnatomySelection(project);
     inFlightLoadGraph += 1;
     debugLog(
       `[FRONTEND][BRANCH][req:${requestId}] loadGraph start initial=${isInitial} mode=${request.mode} branch='${previousBranch}' inFlight=${inFlightLoadGraph}`
@@ -1882,7 +2255,20 @@
         invokeTraced('get_bookmarks', {}, { warnAfterMs: 8000 }),
         invokeTraced('get_current_branch', {}, { warnAfterMs: 8000 }),
       ]);
-      const g = view.graph;
+      // Do not extract anatomy for an obsolete whole-repository response.
+      if (!isCurrentGraphSnapshotRequest(
+        projectRequestId,
+        projectGraphRequestSeq.get(projectKey),
+        request,
+        buildGraphViewRequest(project),
+      )) return;
+      const g = await attachGraphAnatomies(view.graph, anatomySelection);
+      if (!isCurrentGraphSnapshotRequest(
+        projectRequestId,
+        projectGraphRequestSeq.get(projectKey),
+        request,
+        buildGraphViewRequest(project),
+      )) return;
 
       const elapsedMs = Math.round(performance.now() - requestStartedAt);
       debugLog(
@@ -1984,6 +2370,16 @@
     loadGraph(false, activeProjectId);
   }
 
+  function setReviewTarget(nextReviewTarget) {
+    const active = getActiveProject();
+    if (!active) return;
+    const next = projectSessions.normalizeReviewTarget(nextReviewTarget, active.reviewTarget);
+    active.reviewTarget = next;
+    if (activeProjectId === active.id) {
+      reviewTarget = next;
+    }
+  }
+
   async function activateProjectTab(
     projectId,
     { skipBackendSet = false, isInitial = false, waitForRefresh = false } = {}
@@ -2006,6 +2402,7 @@
       missionPlannerProfileId = nextMissionState.plannerProfileId || '';
       missionPlannerNotes = nextMissionState.plannerNotes || '';
       missionPlannerPromptOverride = nextMissionState.plannerPromptOverride || '';
+      coordinatorState = getCoordinatorStateForProject(projectId);
       selectedCodeWorkerProfileId = getSelectedCodeWorkerProfileId(projectId);
     }
 
@@ -2036,11 +2433,11 @@
     }
 
     const refreshPromise = Promise.all([
-      loadTimelineChanges(projectId),
-      loadGraph(isInitial, projectId),
+      loadProjectHistoryAndGraph(projectId, isInitial),
       refreshWatchdogState(projectId, true),
       reloadConductorPanel(projectId, false),
       refreshMissionState(projectId),
+      refreshCoordinatorState(projectId),
     ]);
 
     if (waitForRefresh) {
@@ -2239,6 +2636,64 @@
     return invokeTraced('get_file_source', { file }, { warnAfterMs: 6000 });
   }
 
+  async function getFileAnatomy(file) {
+    return invokeTraced('get_file_anatomy', { file }, { warnAfterMs: 6000 });
+  }
+
+  async function getFileAnatomyComparison(file, selection) {
+    return invokeTraced(
+      'get_file_anatomy_comparison',
+      { file, selection },
+      { warnAfterMs: 12000 },
+    );
+  }
+
+  async function compileReviewerElm(source) {
+    return invokeTraced('compile_reviewer_elm', { source }, { warnAfterMs: 30000 });
+  }
+
+  async function generateReviewerElm(input) {
+    const rawTarget = projectSessions.normalizeReviewTarget(input?.target, projectSessions.createDefaultReviewTarget());
+    const target = {
+      mode: rawTarget.mode === 'working_copy' ? 'working_copy' : 'since',
+      since: rawTarget.mode === 'range'
+        ? `${rawTarget.base || '(base)'}..${rawTarget.head || '(head)'}`
+        : (rawTarget.since || '@'),
+      maxFiles: 20,
+      maxDiffLines: 40,
+    };
+    const normalizedInput = {
+      kind: String(input?.kind || 'branch'),
+      question: String(input?.question || '').trim(),
+      target,
+      graphMeta: input?.graphMeta || {},
+      context: input?.context || null,
+      snippets: Array.isArray(input?.snippets) ? input.snippets : [],
+      reviewNodes: Array.isArray(input?.reviewNodes) ? input.reviewNodes : [],
+    };
+    return invokeTraced('reviewer_generate_elm', { input: normalizedInput }, { warnAfterMs: 45000 });
+  }
+
+  async function getReviewerTargetContext(target) {
+    const normalized = projectSessions.normalizeReviewTarget(target, projectSessions.createDefaultReviewTarget());
+    const mode = normalized.mode === 'working_copy' ? 'working_copy' : 'since';
+    const since = normalized.mode === 'range'
+      ? `${normalized.base || '(base)'}..${normalized.head || '(head)'}`
+      : normalized.since || '@';
+    return invokeTraced(
+      'get_reviewer_target_context',
+      {
+        input: {
+          mode,
+          since,
+          maxFiles: 20,
+          maxDiffLines: 40,
+        },
+      },
+      { warnAfterMs: 12000 },
+    );
+  }
+
   async function getFileDiff(file) {
     return invokeTraced('get_file_diff', { file, since: since === '@' ? null : since }, { warnAfterMs: 6000 });
   }
@@ -2258,13 +2713,14 @@
     const initialProject = upsertProject(initialRepoPath);
     activeProjectId = initialProject.id;
     applyProjectToGlobals(initialProject);
+    coordinatorState = getCoordinatorStateForProject(initialProject.id);
     debugLog(`[FRONTEND][TRACE] ${traceNow()} repo path resolved: ${initialRepoPath}`);
     await Promise.all([
-      loadTimelineChanges(initialProject.id),
-      loadGraph(true, initialProject.id),
+      loadProjectHistoryAndGraph(initialProject.id, true),
       refreshWatchdogState(initialProject.id, true),
       reloadConductorPanel(initialProject.id, false),
       refreshMissionState(initialProject.id),
+      refreshCoordinatorState(initialProject.id),
     ]);
     debugLog(`[FRONTEND][TRACE] ${traceNow()} initial data loaded in ${Math.round(performance.now() - mountStart)}ms`);
 
@@ -2277,11 +2733,11 @@
       console.error('[FRONTEND] Failed to register graph-build-progress listener:', e);
     });
 
-    listen('graph-updated', (event) => {
+    listen('graph-updated', async (event) => {
       graphBuildProgress = null;
       const startedAt = performance.now();
       const activeProject = getActiveProject();
-      if (!activeProject) return;
+      if (!activeProject || activeProject.initialSelectionPending) return;
       const previousBranch = activeProject.currentBranch || '';
       const previousRevision = activeProject.currentRevision || '';
       const payload = event?.payload || {};
@@ -2295,12 +2751,27 @@
       debugLog(
         `[FRONTEND][BRANCH][event] graph-updated recv branch='${previousBranch}'->'${payloadBranch || previousBranch}' rev='${previousRevision || '-'}'->'${payloadRevision || previousRevision || '-'}' since='${activeProject.since}'->'${payloadSince || activeProject.since}' reset=${payloadSinceReset} nodes=${payloadNodes} edges=${payloadEdges} bookmarks=${payloadBookmarks}`
       );
-      activeProject.graph = event.payload.graph;
+      if (projectShowsHistoricalGraph(activeProject)) {
+        debugLog('[FRONTEND][BRANCH][event] graph-updated ignored for historical graph view');
+        return;
+      }
+      const eventSelection = buildAnatomySelection(activeProject);
+      const eventSelectionKey = JSON.stringify(eventSelection);
+      const projectKey = activeProject.id || activeProjectId;
+      const eventRequestId = Number(projectGraphRequestSeq.get(projectKey) || 0) + 1;
+      projectGraphRequestSeq.set(projectKey, eventRequestId);
+      const graphWithAnatomy = await attachGraphAnatomies(event.payload.graph, eventSelection);
+      if (
+        projectGraphRequestSeq.get(projectKey) !== eventRequestId
+        || JSON.stringify(buildAnatomySelection(activeProject)) !== eventSelectionKey
+      ) return;
+      if (getActiveProject()?.id !== activeProject.id) return;
+      activeProject.graph = graphWithAnatomy;
       if (payload.graph_view) {
         activeProject.graphMeta = payload.graph_view;
         activeProject.graphViewMode = payload.graph_view.mode || activeProject.graphViewMode || 'investigation';
       }
-      seedHeatmapFromGraph(event.payload.graph, activeProject.id);
+      seedHeatmapFromGraph(graphWithAnatomy, activeProject.id);
       if (event.payload.current_branch) {
         activeProject.currentBranch = event.payload.current_branch;
       }
@@ -2342,6 +2813,10 @@
       if (!activeProject) return;
       const path = normalizeTouchedPath(event.payload);
       if (!path) return;
+      if (projectShowsHistoricalGraph(activeProject)) {
+        debugLog(`[FRONTEND] File touched ignored for historical graph view: ${path}`);
+        return;
+      }
       debugLog(`[FRONTEND] File touched: ${path}`);
 
       activeProject.heatCounter = (activeProject.heatCounter || 0) + 1;
@@ -2374,6 +2849,26 @@
       }
     }).catch((e) => {
       console.error('[FRONTEND] Failed to register file-touched listener:', e);
+    });
+
+    listen('mission-updated', () => {
+      const activeProject = getActiveProject();
+      if (!activeProject) return;
+      refreshMissionState(activeProject.id).catch((e) =>
+        console.error('[FRONTEND] Failed to refresh mission state after runtime update:', e)
+      );
+    }).catch((e) => {
+      console.error('[FRONTEND] Failed to register mission-updated listener:', e);
+    });
+
+    listen('coordinator-updated', () => {
+      const activeProject = getActiveProject();
+      if (!activeProject) return;
+      refreshCoordinatorState(activeProject.id).catch((e) =>
+        console.error('[FRONTEND] Failed to refresh coordinator state after runtime update:', e)
+      );
+    }).catch((e) => {
+      console.error('[FRONTEND] Failed to register coordinator-updated listener:', e);
     });
     debugLog(`[FRONTEND][TRACE] ${traceNow()} listeners registered`);
   });
@@ -2544,9 +3039,9 @@
         onclick={() => {
           activeMainView = activeMainView === 'graph' ? 'mission' : 'graph';
         }}
-        title={activeMainView === 'graph' ? 'Open mission panel' : 'Back to graph'}
+        title={activeMainView === 'graph' ? 'Open settings' : 'Back to graph'}
       >
-        {activeMainView === 'graph' ? 'Mission' : 'Graph'}
+        {activeMainView === 'graph' ? 'Settings' : 'Graph'}
       </button>
       <button type="button" class="btn theme-toggle" onclick={toggleTheme} title="Toggle theme">
         Theme: {theme === 'midnight' ? 'dark' : 'light'}
@@ -2558,19 +3053,40 @@
     <Sloposcope {graph}
       {graphMeta}
       {since}
+      {reviewTarget}
       {changes}
       {bookmarks}
       {contentVersion}
       {fileContentVersions}
+      comparisonSelection={buildAnatomySelection(getActiveProject())}
       {getFileDiff}
       {getFileSource}
+      {getFileAnatomy}
+      {getFileAnatomyComparison}
+      {jevByFile}
+      {invokeJev}
+      {getReviewerTargetContext}
+      {generateReviewerElm}
+      {compileReviewerElm}
       {saveFile}
       {theme}
       {heatmapData}
       {loadingMore}
       {hasMoreChanges}
       {missionState}
+      {coordinatorState}
+      {coordinatorLoading}
+      {coordinatorSending}
+      {coordinatorError}
+      onCoordinatorSend={sendCoordinatorMessage}
+      onCoordinatorApprovePlan={approveCoordinatorPlan}
+      onCoordinatorLaunchWorkers={launchCoordinatorWorkers}
+      onCoordinatorAskReport={requestCoordinatorReport}
+      onCoordinatorNudgeLatestWorker={nudgeLatestWorker}
+      onCoordinatorStartThread={startFreshCoordinatorThread}
+      onCoordinatorResumeThread={resumeCoordinatorThread}
       onSelectSince={setSince}
+      onReviewTargetChange={setReviewTarget}
       onLoadMoreChanges={loadMoreChanges}
       onProjectChange={selectRepo}
     />
@@ -2578,7 +3094,7 @@
     <section class="eyeloss-control-page">
       <div class="eyeloss-control-page__inner">
         <div class="eyeloss-control-page__header">
-          <span>Mission</span>
+          <span>Settings</span>
           <button
             type="button"
             class="btn"
@@ -2590,13 +3106,47 @@
           </button>
         </div>
 
-        <div class="eyeloss-primary-tabs" role="tablist" aria-label="Mission sections">
-          <button type="button" class="btn eyeloss-primary-tab" class:btn-primary={activeSettingsTab === 'mission'} onclick={() => activeSettingsTab = 'mission'}>Mission</button>
-          <button type="button" class="btn eyeloss-primary-tab" class:btn-primary={activeSettingsTab === 'runs'} onclick={() => activeSettingsTab = 'runs'}>Runs</button>
-          <button type="button" class="btn eyeloss-primary-tab" class:btn-primary={activeSettingsTab === 'debug'} onclick={() => activeSettingsTab = 'debug'}>Debug</button>
-        </div>
+        <ConfigPanel
+          {watchdogState}
+          {watchdogError}
+          {watchdogConfigSaving}
+          {conductorWorkflowLoad}
+          {conductorLoading}
+          {conductorWorkflowLoading}
+          {conductorSettingsSaving}
+          {conductorError}
+          bind:watchdogConfigEnabled
+          bind:watchdogConfigTriggerMode
+          bind:watchdogConfigAlertThreshold
+          bind:watchdogConfigRequireActiveIssue
+          bind:watchdogConfigMaxFiles
+          bind:watchdogConfigMaxDiffLines
+          bind:watchdogConfigDedupeWindow
+          bind:watchdogConfigChecks
+          bind:conductorWorkflowProvider
+          bind:conductorWorkflowProviderModel
+          bind:conductorWorkflowTimeout
+          bind:conductorWorkflowTraceRetention
+          bind:conductorWorkflowStrictMode
+          onSaveWatchdogConfig={saveWatchdogConfig}
+          onSaveSettings={saveConductorWorkflowSettings}
+          onRefresh={() => reloadConductorPanel(activeProjectId, false)}
+        />
 
-        {#if activeSettingsTab === 'mission'}
+        <label class="eyeloss-control-field eyeloss-control-field--checkbox">
+          <span>Developer mode</span>
+          <input type="checkbox" bind:checked={developerMode} />
+        </label>
+
+        {#if developerMode}
+          <div class="eyeloss-primary-tabs" role="tablist" aria-label="Advanced operation sections">
+            <button type="button" class="btn eyeloss-primary-tab" class:btn-primary={activeSettingsTab === 'mission'} onclick={() => activeSettingsTab = 'mission'}>Mission</button>
+            <button type="button" class="btn eyeloss-primary-tab" class:btn-primary={activeSettingsTab === 'runs'} onclick={() => activeSettingsTab = 'runs'}>Runs</button>
+            <button type="button" class="btn eyeloss-primary-tab" class:btn-primary={activeSettingsTab === 'debug'} onclick={() => activeSettingsTab = 'debug'}>Debug</button>
+          </div>
+        {/if}
+
+        {#if developerMode && activeSettingsTab === 'mission'}
           <MissionPanel
             {missionState}
             {missionLoading}
@@ -2618,7 +3168,7 @@
             onRunCheck={runMissionCheck}
             onReload={() => refreshMissionState(activeProjectId)}
           />
-        {:else if activeSettingsTab === 'runs'}
+        {:else if developerMode && activeSettingsTab === 'runs'}
           <MissionRunsPanel
             {missionState}
             {missionLoading}
@@ -2638,7 +3188,7 @@
             onGateRun={(sessionId) => runMissionReviewAction('gate', sessionId)}
             onReload={() => refreshMissionState(activeProjectId)}
           />
-        {:else}
+        {:else if developerMode && activeSettingsTab === 'debug'}
           <div class="eyeloss-debug-stack">
             <section class="eyeloss-control-card">
               <header class="eyeloss-control-card__header">

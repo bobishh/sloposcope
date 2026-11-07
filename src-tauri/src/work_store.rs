@@ -18,14 +18,29 @@ use std::path::Path;
 pub enum WorkUnitStatus {
     Pending,
     Claimed,
+    Running,
+    RetryScheduled,
     Done,
     Failed,
 }
 
 impl WorkUnitStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Claimed => "claimed",
+            Self::Running => "running",
+            Self::RetryScheduled => "retry_scheduled",
+            Self::Done => "done",
+            Self::Failed => "failed",
+        }
+    }
+
     fn from_str(s: &str) -> Self {
         match s {
             "claimed" => Self::Claimed,
+            "running" => Self::Running,
+            "retry_scheduled" => Self::RetryScheduled,
             "done" => Self::Done,
             "failed" => Self::Failed,
             _ => Self::Pending,
@@ -43,7 +58,93 @@ pub struct WorkUnit {
     pub status: WorkUnitStatus,
     pub claimed_by: Option<String>,
     pub claimed_at: Option<String>,
+    pub started_at: Option<String>,
+    pub retry_at: Option<String>,
+    pub reconciled_at: Option<String>,
+    pub run_attempt: u32,
+    pub retry_count: u32,
+    pub max_retries: u32,
+    pub last_error: Option<String>,
+    pub reconciled_outcome: Option<String>,
+    pub reconciled_note: Option<String>,
     pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlanRecord {
+    pub task_id: String,
+    pub workflow_id: String,
+    pub title: String,
+    pub prompt: String,
+    pub max_retries: u32,
+    pub timeout_seconds: u64,
+    pub issue_id: Option<String>,
+    pub issue_title: Option<String>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TaskLifecycleEventType {
+    #[serde(rename = "task.created")]
+    TaskCreated,
+    #[serde(rename = "plan.proposed")]
+    PlanProposed,
+    #[serde(rename = "plan.approved")]
+    PlanApproved,
+    #[serde(rename = "worker.started")]
+    WorkerStarted,
+    #[serde(rename = "verification.failed")]
+    VerificationFailed,
+    #[serde(rename = "task.retry_scheduled")]
+    TaskRetryScheduled,
+    #[serde(rename = "session.stale")]
+    SessionStale,
+    #[serde(rename = "workers.launched")]
+    WorkersLaunched,
+    #[serde(rename = "coordinator.reported")]
+    CoordinatorReported,
+    #[serde(rename = "review.accepted")]
+    ReviewAccepted,
+    #[serde(rename = "review.rejected")]
+    ReviewRejected,
+    #[serde(rename = "patch.applied")]
+    PatchApplied,
+}
+
+impl TaskLifecycleEventType {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::TaskCreated => "task.created",
+            Self::PlanProposed => "plan.proposed",
+            Self::PlanApproved => "plan.approved",
+            Self::WorkerStarted => "worker.started",
+            Self::VerificationFailed => "verification.failed",
+            Self::TaskRetryScheduled => "task.retry_scheduled",
+            Self::SessionStale => "session.stale",
+            Self::WorkersLaunched => "workers.launched",
+            Self::CoordinatorReported => "coordinator.reported",
+            Self::ReviewAccepted => "review.accepted",
+            Self::ReviewRejected => "review.rejected",
+            Self::PatchApplied => "patch.applied",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskLifecycleEvent {
+    pub id: String,
+    pub task_id: String,
+    pub thread_id: String,
+    #[serde(rename = "type")]
+    pub r#type: TaskLifecycleEventType,
+    pub actor: String,
+    pub source: Option<String>,
+    pub correlation: Option<String>,
+    pub causation: Option<String>,
+    pub occurred_at: String,
+    pub payload: serde_json::Value,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -196,6 +297,13 @@ fn current_unix_seconds() -> u64 {
         .as_secs()
 }
 
+fn session_lease_label_from_now(now_unix_seconds: u64) -> String {
+    format!(
+        "unix:{}",
+        now_unix_seconds.saturating_add(AGENT_SESSION_STUCK_HEARTBEAT_TIMEOUT_SECS)
+    )
+}
+
 fn parse_unix_label_seconds(label: Option<&str>) -> Option<u64> {
     let raw = label?.strip_prefix("unix:")?;
     raw.parse::<u64>().ok()
@@ -269,6 +377,7 @@ pub struct AgentProfile {
     pub capabilities: Vec<String>,
     pub transport_kind: String,
     pub active: bool,
+    pub is_reviewer: bool,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -354,6 +463,71 @@ pub struct MissionStateView {
     pub summary: MissionSummary,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct CoordinatorDraftMission {
+    pub title: String,
+    pub brief: String,
+    pub validation_command: String,
+    pub issue_key: Option<String>,
+    pub issue_url: Option<String>,
+    pub planner_profile_id: Option<String>,
+    pub planner_notes: Option<String>,
+    pub planner_prompt_override: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CoordinatorThreadRecord {
+    pub id: String,
+    pub repo_path: String,
+    pub mission_id: Option<String>,
+    pub persona_name: String,
+    pub title: String,
+    pub state: String,
+    pub draft_mission: CoordinatorDraftMission,
+    pub pending_plan: Vec<NewObjective>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CoordinatorThreadSummary {
+    pub id: String,
+    pub mission_id: Option<String>,
+    pub title: String,
+    pub state: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CoordinatorMessageRecord {
+    pub id: i64,
+    pub thread_id: String,
+    pub mission_id: Option<String>,
+    pub objective_id: Option<String>,
+    pub session_id: Option<String>,
+    pub role: String,
+    pub kind: String,
+    pub content: String,
+    pub payload: serde_json::Value,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct NewCoordinatorMessage<'a> {
+    pub thread_id: &'a str,
+    pub mission_id: Option<&'a str>,
+    pub objective_id: Option<&'a str>,
+    pub session_id: Option<&'a str>,
+    pub role: &'a str,
+    pub kind: &'a str,
+    pub content: &'a str,
+    pub payload: serde_json::Value,
+}
+
 /// A single event emitted by an external runner for a work unit session.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -365,6 +539,381 @@ pub struct RunEventRecord {
     pub event_type: String, // started | progress | completed | failed
     pub payload: serde_json::Value,
     pub created_at: String,
+}
+
+fn lifecycle_payload_with_base(
+    payload: serde_json::Value,
+    objective_id: Option<&str>,
+    session_id: Option<&str>,
+) -> serde_json::Value {
+    let mut object = match payload {
+        serde_json::Value::Object(map) => map,
+        other => {
+            let mut map = serde_json::Map::new();
+            map.insert("value".to_string(), other);
+            map
+        }
+    };
+    if let Some(objective_id) = objective_id.filter(|value| !value.is_empty()) {
+        object
+            .entry("objectiveId".to_string())
+            .or_insert_with(|| serde_json::Value::String(objective_id.to_string()));
+    }
+    if let Some(session_id) = session_id.filter(|value| !value.is_empty()) {
+        object
+            .entry("sessionId".to_string())
+            .or_insert_with(|| serde_json::Value::String(session_id.to_string()));
+    }
+    serde_json::Value::Object(object)
+}
+
+fn lifecycle_message_type(message: &CoordinatorMessageRecord) -> Option<TaskLifecycleEventType> {
+    match (message.role.as_str(), message.kind.as_str()) {
+        ("user", "prompt") => Some(TaskLifecycleEventType::TaskCreated),
+        (_, "plan") => Some(TaskLifecycleEventType::PlanProposed),
+        (_, "report") => Some(TaskLifecycleEventType::CoordinatorReported),
+        (_, "status")
+            if message
+                .content
+                .to_ascii_lowercase()
+                .starts_with("plan approved")
+                || message.payload.get("missionId").is_some() =>
+        {
+            Some(TaskLifecycleEventType::PlanApproved)
+        }
+        (_, "status")
+            if message
+                .content
+                .to_ascii_lowercase()
+                .starts_with("workers launched") =>
+        {
+            Some(TaskLifecycleEventType::WorkersLaunched)
+        }
+        _ => None,
+    }
+}
+
+fn lifecycle_run_event_type(event: &RunEventRecord) -> Option<TaskLifecycleEventType> {
+    match event.event_type.as_str() {
+        "started" => Some(TaskLifecycleEventType::WorkerStarted),
+        "failed" => Some(TaskLifecycleEventType::VerificationFailed),
+        "retry_scheduled" | "retry" => Some(TaskLifecycleEventType::TaskRetryScheduled),
+        "stale" | "stale_swept" => Some(TaskLifecycleEventType::SessionStale),
+        _ => None,
+    }
+}
+
+pub fn project_task_lifecycle_events_at(
+    task_id: &str,
+    thread_id: &str,
+    messages: &[CoordinatorMessageRecord],
+    run_events: &[RunEventRecord],
+    sessions: &[AgentSessionRuntimeRecord],
+    patch_decisions: &[PatchDecisionRecord],
+    verifications: &[VerificationRecord],
+    now_unix_seconds: u64,
+) -> Vec<TaskLifecycleEvent> {
+    let mut events = Vec::new();
+    for message in messages {
+        if let Some(event_type) = lifecycle_message_type(message) {
+            events.push(TaskLifecycleEvent {
+                id: format!("coordinator-message-{}", message.id),
+                task_id: message
+                    .mission_id
+                    .clone()
+                    .unwrap_or_else(|| task_id.to_string()),
+                thread_id: message.thread_id.clone(),
+                r#type: event_type,
+                actor: message.role.clone(),
+                source: Some("coordinator_message".to_string()),
+                correlation: Some(thread_id.to_string()),
+                causation: None,
+                occurred_at: message.created_at.clone(),
+                payload: lifecycle_payload_with_base(
+                    serde_json::json!({
+                        "messageId": message.id,
+                        "kind": message.kind,
+                        "content": message.content,
+                        "payload": message.payload,
+                    }),
+                    message.objective_id.as_deref(),
+                    message.session_id.as_deref(),
+                ),
+            });
+        }
+    }
+    for event in run_events {
+        if let Some(event_type) = lifecycle_run_event_type(event) {
+            events.push(TaskLifecycleEvent {
+                id: format!("run-event-{}", event.id),
+                task_id: event.task_id.clone(),
+                thread_id: thread_id.to_string(),
+                r#type: event_type,
+                actor: event.session_id.clone(),
+                source: Some("run_event".to_string()),
+                correlation: Some(event.task_id.clone()),
+                causation: None,
+                occurred_at: event.created_at.clone(),
+                payload: lifecycle_payload_with_base(
+                    event.payload.clone(),
+                    Some(&event.unit_id),
+                    Some(&event.session_id),
+                ),
+            });
+        }
+    }
+    for session in sessions {
+        events.push(TaskLifecycleEvent {
+            id: format!("session-{}-started", session.id),
+            task_id: session.mission_id.clone(),
+            thread_id: thread_id.to_string(),
+            r#type: TaskLifecycleEventType::WorkerStarted,
+            actor: session.profile_id.clone(),
+            source: Some("agent_session".to_string()),
+            correlation: Some(session.mission_id.clone()),
+            causation: None,
+            occurred_at: session.created_at.clone(),
+            payload: lifecycle_payload_with_base(
+                serde_json::json!({
+                    "profileId": session.profile_id,
+                    "state": session.state,
+                    "workspacePath": session.workspace_path,
+                    "touchedPaths": session.touched_paths,
+                }),
+                session.objective_id.as_deref(),
+                Some(&session.id),
+            ),
+        });
+        let runtime = derive_agent_session_runtime_slice_at(session, now_unix_seconds);
+        if runtime.runtime_status == "stuck"
+            || session
+                .last_error
+                .as_deref()
+                .map(|error| error.contains("stale"))
+                .unwrap_or(false)
+        {
+            events.push(TaskLifecycleEvent {
+                id: format!("session-{}-stale", session.id),
+                task_id: session.mission_id.clone(),
+                thread_id: thread_id.to_string(),
+                r#type: TaskLifecycleEventType::SessionStale,
+                actor: "scheduler".to_string(),
+                source: Some("agent_session".to_string()),
+                correlation: Some(session.mission_id.clone()),
+                causation: Some(format!("session-{}-started", session.id)),
+                occurred_at: session
+                    .last_event_at
+                    .clone()
+                    .unwrap_or_else(|| session.updated_at.clone()),
+                payload: lifecycle_payload_with_base(
+                    serde_json::json!({
+                        "runtimeStatus": runtime.runtime_status,
+                        "heartbeatAgeSec": runtime.heartbeat_age_sec,
+                        "eventAgeSec": runtime.event_age_sec,
+                        "leaseExpired": runtime.lease_expired,
+                        "lastError": session.last_error,
+                    }),
+                    session.objective_id.as_deref(),
+                    Some(&session.id),
+                ),
+            });
+        }
+    }
+    for verification in verifications {
+        let validation_failed = verification
+            .details
+            .get("validation")
+            .and_then(|entry| entry.get("success"))
+            .and_then(serde_json::Value::as_bool)
+            .map(|ok| !ok)
+            .unwrap_or(false);
+        if verification.status == "failed" || validation_failed {
+            events.push(TaskLifecycleEvent {
+                id: format!("verification-{}", verification.id),
+                task_id: verification.mission_id.clone(),
+                thread_id: thread_id.to_string(),
+                r#type: TaskLifecycleEventType::VerificationFailed,
+                actor: "verifier".to_string(),
+                source: Some("verification".to_string()),
+                correlation: Some(verification.mission_id.clone()),
+                causation: verification
+                    .session_id
+                    .as_ref()
+                    .map(|session_id| format!("session-{session_id}-started")),
+                occurred_at: verification.created_at.clone(),
+                payload: lifecycle_payload_with_base(
+                    serde_json::json!({
+                        "verificationId": format!("verification-{}", verification.id),
+                        "status": verification.status,
+                        "summary": verification.summary,
+                        "details": verification.details,
+                    }),
+                    verification.objective_id.as_deref(),
+                    verification.session_id.as_deref(),
+                ),
+            });
+        }
+        if verification
+            .details
+            .get("retryScheduled")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+            || verification.details.get("retryAt").is_some()
+        {
+            events.push(TaskLifecycleEvent {
+                id: format!("verification-{}-retry", verification.id),
+                task_id: verification.mission_id.clone(),
+                thread_id: thread_id.to_string(),
+                r#type: TaskLifecycleEventType::TaskRetryScheduled,
+                actor: "scheduler".to_string(),
+                source: Some("verification".to_string()),
+                correlation: Some(verification.mission_id.clone()),
+                causation: Some(format!("verification-{}", verification.id)),
+                occurred_at: verification.updated_at.clone(),
+                payload: lifecycle_payload_with_base(
+                    serde_json::json!({
+                        "verificationId": format!("verification-{}", verification.id),
+                        "retryAt": verification.details.get("retryAt"),
+                    }),
+                    verification.objective_id.as_deref(),
+                    verification.session_id.as_deref(),
+                ),
+            });
+        }
+    }
+    for decision in patch_decisions {
+        let status = decision.status.as_str();
+        if matches!(status, "accepted" | "applied" | "apply_failed") {
+            events.push(TaskLifecycleEvent {
+                id: format!(
+                    "patch-decision-{}-{}-review-accepted",
+                    decision.mission_id, decision.objective_id
+                ),
+                task_id: decision.mission_id.clone(),
+                thread_id: thread_id.to_string(),
+                r#type: TaskLifecycleEventType::ReviewAccepted,
+                actor: "reviewer".to_string(),
+                source: Some("patch_decision".to_string()),
+                correlation: Some(decision.mission_id.clone()),
+                causation: decision
+                    .session_id
+                    .as_ref()
+                    .map(|session_id| format!("session-{session_id}-started")),
+                occurred_at: decision.created_at.clone(),
+                payload: lifecycle_payload_with_base(
+                    serde_json::json!({
+                        "status": decision.status,
+                        "reason": decision.reason,
+                        "patchBaseRevision": decision.patch_base_revision,
+                    }),
+                    Some(&decision.objective_id),
+                    decision.session_id.as_deref(),
+                ),
+            });
+        }
+        if status == "rejected" {
+            events.push(TaskLifecycleEvent {
+                id: format!(
+                    "patch-decision-{}-{}-review-rejected",
+                    decision.mission_id, decision.objective_id
+                ),
+                task_id: decision.mission_id.clone(),
+                thread_id: thread_id.to_string(),
+                r#type: TaskLifecycleEventType::ReviewRejected,
+                actor: "reviewer".to_string(),
+                source: Some("patch_decision".to_string()),
+                correlation: Some(decision.mission_id.clone()),
+                causation: decision
+                    .session_id
+                    .as_ref()
+                    .map(|session_id| format!("session-{session_id}-started")),
+                occurred_at: decision.created_at.clone(),
+                payload: lifecycle_payload_with_base(
+                    serde_json::json!({
+                        "status": decision.status,
+                        "reason": decision.reason,
+                    }),
+                    Some(&decision.objective_id),
+                    decision.session_id.as_deref(),
+                ),
+            });
+        }
+        if status == "applied" {
+            events.push(TaskLifecycleEvent {
+                id: format!(
+                    "patch-decision-{}-{}-patch-applied",
+                    decision.mission_id, decision.objective_id
+                ),
+                task_id: decision.mission_id.clone(),
+                thread_id: thread_id.to_string(),
+                r#type: TaskLifecycleEventType::PatchApplied,
+                actor: "system".to_string(),
+                source: Some("patch_decision".to_string()),
+                correlation: Some(decision.mission_id.clone()),
+                causation: Some(format!(
+                    "patch-decision-{}-{}-review-accepted",
+                    decision.mission_id, decision.objective_id
+                )),
+                occurred_at: decision
+                    .applied_at
+                    .clone()
+                    .unwrap_or_else(|| decision.updated_at.clone()),
+                payload: lifecycle_payload_with_base(
+                    serde_json::json!({
+                        "status": decision.status,
+                        "branch": decision.apply_branch,
+                        "targetPath": decision.apply_target_path,
+                    }),
+                    Some(&decision.objective_id),
+                    decision.session_id.as_deref(),
+                ),
+            });
+        }
+    }
+
+    events.sort_by(|left, right| {
+        lifecycle_sort_key(&left.occurred_at)
+            .cmp(&lifecycle_sort_key(&right.occurred_at))
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    let mut previous_id: Option<String> = None;
+    for event in &mut events {
+        if event.causation.is_none() {
+            event.causation = previous_id.clone();
+        }
+        previous_id = Some(event.id.clone());
+    }
+    events
+}
+
+fn lifecycle_sort_key(label: &str) -> (u8, u64, &str) {
+    if let Some(value) = label
+        .strip_prefix("unix:")
+        .and_then(|raw| raw.parse::<u64>().ok())
+    {
+        return (0, value, "");
+    }
+    (1, 0, label)
+}
+
+pub fn project_task_lifecycle_events(
+    task_id: &str,
+    thread_id: &str,
+    messages: &[CoordinatorMessageRecord],
+    run_events: &[RunEventRecord],
+    sessions: &[AgentSessionRuntimeRecord],
+    verifications: &[VerificationRecord],
+) -> Vec<TaskLifecycleEvent> {
+    project_task_lifecycle_events_at(
+        task_id,
+        thread_id,
+        messages,
+        run_events,
+        sessions,
+        &[],
+        verifications,
+        current_unix_seconds(),
+    )
 }
 
 // ── Store ─────────────────────────────────────────────────────────────────────
@@ -389,20 +938,34 @@ impl WorkStore {
             "
             PRAGMA journal_mode=WAL;
             CREATE TABLE IF NOT EXISTS plan (
-                task_id    TEXT PRIMARY KEY,
-                title      TEXT NOT NULL,
-                prompt     TEXT NOT NULL,
-                created_at TEXT NOT NULL
+                task_id           TEXT PRIMARY KEY,
+                workflow_id       TEXT NOT NULL DEFAULT '',
+                title             TEXT NOT NULL,
+                prompt            TEXT NOT NULL,
+                max_retries       INTEGER NOT NULL DEFAULT 2,
+                timeout_seconds   INTEGER NOT NULL DEFAULT 900,
+                issue_id          TEXT,
+                issue_title       TEXT,
+                created_at        TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS work_unit (
-                id         TEXT NOT NULL,
-                task_id    TEXT NOT NULL,
-                title      TEXT NOT NULL,
-                prompt     TEXT NOT NULL,
-                status     TEXT NOT NULL DEFAULT 'pending',
-                claimed_by TEXT,
-                claimed_at TEXT,
-                created_at TEXT NOT NULL,
+                id                TEXT NOT NULL,
+                task_id           TEXT NOT NULL,
+                title             TEXT NOT NULL,
+                prompt            TEXT NOT NULL,
+                status            TEXT NOT NULL DEFAULT 'pending',
+                claimed_by        TEXT,
+                claimed_at        TEXT,
+                started_at        TEXT,
+                retry_at          TEXT,
+                reconciled_at     TEXT,
+                run_attempt       INTEGER NOT NULL DEFAULT 0,
+                retry_count       INTEGER NOT NULL DEFAULT 0,
+                max_retries       INTEGER NOT NULL DEFAULT 0,
+                last_error        TEXT,
+                reconciled_outcome TEXT,
+                reconciled_note   TEXT,
+                created_at        TEXT NOT NULL,
                 PRIMARY KEY (id, task_id)
             );
             CREATE TABLE IF NOT EXISTS unit_verdict (
@@ -488,6 +1051,7 @@ impl WorkStore {
                 capabilities_json TEXT NOT NULL DEFAULT '[]',
                 transport_kind   TEXT NOT NULL DEFAULT 'internal',
                 active           INTEGER NOT NULL DEFAULT 0,
+                is_reviewer      INTEGER NOT NULL DEFAULT 0,
                 created_at       TEXT NOT NULL,
                 updated_at       TEXT NOT NULL
             );
@@ -517,14 +1081,40 @@ impl WorkStore {
                 updated_at       TEXT NOT NULL,
                 PRIMARY KEY (mission_id, objective_id)
             );
+            CREATE TABLE IF NOT EXISTS coordinator_thread (
+                id                 TEXT PRIMARY KEY,
+                repo_path          TEXT NOT NULL,
+                mission_id         TEXT,
+                persona_name       TEXT NOT NULL,
+                title              TEXT NOT NULL,
+                state              TEXT NOT NULL,
+                draft_mission_json TEXT NOT NULL DEFAULT '{}',
+                pending_plan_json  TEXT NOT NULL DEFAULT '[]',
+                created_at         TEXT NOT NULL,
+                updated_at         TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS coordinator_message (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                thread_id    TEXT NOT NULL,
+                mission_id   TEXT,
+                objective_id TEXT,
+                session_id   TEXT,
+                role         TEXT NOT NULL,
+                kind         TEXT NOT NULL,
+                content      TEXT NOT NULL,
+                payload_json TEXT NOT NULL DEFAULT '{}',
+                created_at   TEXT NOT NULL
+            );
             CREATE INDEX IF NOT EXISTS run_event_task ON run_event (task_id, unit_id, id);
             CREATE INDEX IF NOT EXISTS run_event_session ON run_event (task_id, session_id, id);
             CREATE INDEX IF NOT EXISTS mission_updated_at ON mission (updated_at DESC);
             CREATE INDEX IF NOT EXISTS agent_session_mission ON agent_session (mission_id, updated_at DESC);
             CREATE INDEX IF NOT EXISTS verification_mission ON verification (mission_id, updated_at DESC);
-            CREATE INDEX IF NOT EXISTS agent_profile_active ON agent_profile (active, updated_at DESC);
             CREATE INDEX IF NOT EXISTS patch_decision_mission ON patch_decision (mission_id, updated_at DESC);
             CREATE INDEX IF NOT EXISTS patch_gate_mission ON patch_gate (mission_id, updated_at DESC);
+            CREATE INDEX IF NOT EXISTS coordinator_thread_repo ON coordinator_thread (repo_path, updated_at DESC);
+            CREATE INDEX IF NOT EXISTS coordinator_thread_mission ON coordinator_thread (mission_id, updated_at DESC);
+            CREATE INDEX IF NOT EXISTS coordinator_message_thread ON coordinator_message (thread_id, id ASC);
             ",
         )
         .map_err(|e| format!("init schema: {e}"))
@@ -551,6 +1141,87 @@ impl WorkStore {
         })
         .and_then(|_| {
             self.ensure_column("agent_session", "last_error", "ALTER TABLE agent_session ADD COLUMN last_error TEXT")
+        })
+        .and_then(|_| {
+            self.ensure_column("agent_profile", "model", "ALTER TABLE agent_profile ADD COLUMN model TEXT")
+        })
+        .and_then(|_| {
+            self.ensure_column("agent_profile", "command", "ALTER TABLE agent_profile ADD COLUMN command TEXT NOT NULL DEFAULT ''")
+        })
+        .and_then(|_| {
+            self.ensure_column("agent_profile", "args_json", "ALTER TABLE agent_profile ADD COLUMN args_json TEXT NOT NULL DEFAULT '[]'")
+        })
+        .and_then(|_| {
+            self.ensure_column("agent_profile", "env_json", "ALTER TABLE agent_profile ADD COLUMN env_json TEXT NOT NULL DEFAULT '{}'")
+        })
+        .and_then(|_| {
+            self.ensure_column("agent_profile", "capabilities_json", "ALTER TABLE agent_profile ADD COLUMN capabilities_json TEXT NOT NULL DEFAULT '[]'")
+        })
+        .and_then(|_| {
+            self.ensure_column("agent_profile", "transport_kind", "ALTER TABLE agent_profile ADD COLUMN transport_kind TEXT NOT NULL DEFAULT 'internal'")
+        })
+        .and_then(|_| {
+            self.ensure_column("agent_profile", "active", "ALTER TABLE agent_profile ADD COLUMN active INTEGER NOT NULL DEFAULT 0")
+        })
+        .and_then(|_| {
+            self.ensure_column("agent_profile", "is_reviewer", "ALTER TABLE agent_profile ADD COLUMN is_reviewer INTEGER NOT NULL DEFAULT 0")
+        })
+        .and_then(|_| {
+            self.ensure_column("agent_profile", "created_at", "ALTER TABLE agent_profile ADD COLUMN created_at TEXT NOT NULL DEFAULT ''")
+        })
+        .and_then(|_| {
+            self.ensure_column("agent_profile", "updated_at", "ALTER TABLE agent_profile ADD COLUMN updated_at TEXT NOT NULL DEFAULT ''")
+        })
+        .and_then(|_| {
+            self.ensure_column("plan", "workflow_id", "ALTER TABLE plan ADD COLUMN workflow_id TEXT NOT NULL DEFAULT ''")
+        })
+        .and_then(|_| {
+            self.ensure_column("plan", "max_retries", "ALTER TABLE plan ADD COLUMN max_retries INTEGER NOT NULL DEFAULT 2")
+        })
+        .and_then(|_| {
+            self.ensure_column("plan", "timeout_seconds", "ALTER TABLE plan ADD COLUMN timeout_seconds INTEGER NOT NULL DEFAULT 900")
+        })
+        .and_then(|_| {
+            self.ensure_column("plan", "issue_id", "ALTER TABLE plan ADD COLUMN issue_id TEXT")
+        })
+        .and_then(|_| {
+            self.ensure_column("plan", "issue_title", "ALTER TABLE plan ADD COLUMN issue_title TEXT")
+        })
+        .and_then(|_| {
+            self.ensure_column("work_unit", "started_at", "ALTER TABLE work_unit ADD COLUMN started_at TEXT")
+        })
+        .and_then(|_| {
+            self.ensure_column("work_unit", "retry_at", "ALTER TABLE work_unit ADD COLUMN retry_at TEXT")
+        })
+        .and_then(|_| {
+            self.ensure_column("work_unit", "reconciled_at", "ALTER TABLE work_unit ADD COLUMN reconciled_at TEXT")
+        })
+        .and_then(|_| {
+            self.ensure_column("work_unit", "run_attempt", "ALTER TABLE work_unit ADD COLUMN run_attempt INTEGER NOT NULL DEFAULT 0")
+        })
+        .and_then(|_| {
+            self.ensure_column("work_unit", "retry_count", "ALTER TABLE work_unit ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0")
+        })
+        .and_then(|_| {
+            self.ensure_column("work_unit", "max_retries", "ALTER TABLE work_unit ADD COLUMN max_retries INTEGER NOT NULL DEFAULT 0")
+        })
+        .and_then(|_| {
+            self.ensure_column("work_unit", "last_error", "ALTER TABLE work_unit ADD COLUMN last_error TEXT")
+        })
+        .and_then(|_| {
+            self.ensure_column("work_unit", "reconciled_outcome", "ALTER TABLE work_unit ADD COLUMN reconciled_outcome TEXT")
+        })
+        .and_then(|_| {
+            self.ensure_column("work_unit", "reconciled_note", "ALTER TABLE work_unit ADD COLUMN reconciled_note TEXT")
+        })
+        .and_then(|_| {
+            self.conn
+                .execute(
+                    "CREATE INDEX IF NOT EXISTS agent_profile_active ON agent_profile (active, updated_at DESC)",
+                    [],
+                )
+                .map_err(|e| format!("create agent_profile_active index: {e}"))?;
+            Ok(())
         })
     }
 
@@ -955,12 +1626,167 @@ impl WorkStore {
         Ok(())
     }
 
+    pub fn list_plans(&self) -> Result<Vec<PlanRecord>, String> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT task_id, workflow_id, title, prompt, max_retries, timeout_seconds,
+                        issue_id, issue_title, created_at
+                 FROM plan ORDER BY created_at DESC",
+            )
+            .map_err(|e| format!("prepare list plans: {e}"))?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(PlanRecord {
+                    task_id: row.get(0)?,
+                    workflow_id: row.get(1)?,
+                    title: row.get(2)?,
+                    prompt: row.get(3)?,
+                    max_retries: row.get(4)?,
+                    timeout_seconds: row.get(5)?,
+                    issue_id: row.get(6)?,
+                    issue_title: row.get(7)?,
+                    created_at: row.get(8)?,
+                })
+            })
+            .map_err(|e| format!("query list plans: {e}"))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("collect plans: {e}"))
+    }
+
+    pub fn list_all_work_units(&self) -> Result<Vec<WorkUnit>, String> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, task_id, title, prompt, status, claimed_by, claimed_at,
+                        started_at, retry_at, reconciled_at, run_attempt, retry_count,
+                        max_retries, last_error, reconciled_outcome, reconciled_note, created_at
+                 FROM work_unit ORDER BY created_at ASC, id ASC",
+            )
+            .map_err(|e| format!("prepare list all units: {e}"))?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(WorkUnit {
+                    id: row.get(0)?,
+                    task_id: row.get(1)?,
+                    title: row.get(2)?,
+                    prompt: row.get(3)?,
+                    status: WorkUnitStatus::from_str(&row.get::<_, String>(4)?),
+                    claimed_by: row.get(5)?,
+                    claimed_at: row.get(6)?,
+                    started_at: row.get(7)?,
+                    retry_at: row.get(8)?,
+                    reconciled_at: row.get(9)?,
+                    run_attempt: row.get(10)?,
+                    retry_count: row.get(11)?,
+                    max_retries: row.get(12)?,
+                    last_error: row.get(13)?,
+                    reconciled_outcome: row.get(14)?,
+                    reconciled_note: row.get(15)?,
+                    created_at: row.get(16)?,
+                })
+            })
+            .map_err(|e| format!("query list all units: {e}"))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("collect all units: {e}"))
+    }
+
+    pub fn upsert_plan_record(&mut self, plan: &PlanRecord) -> Result<(), String> {
+        self.conn.execute(
+            "INSERT INTO plan (task_id, workflow_id, title, prompt, max_retries, timeout_seconds, issue_id, issue_title, created_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)
+             ON CONFLICT(task_id) DO UPDATE SET
+                workflow_id=excluded.workflow_id,
+                title=excluded.title,
+                prompt=excluded.prompt,
+                max_retries=excluded.max_retries,
+                timeout_seconds=excluded.timeout_seconds,
+                issue_id=excluded.issue_id,
+                issue_title=excluded.issue_title,
+                created_at=excluded.created_at",
+            params![
+                plan.task_id,
+                plan.workflow_id,
+                plan.title,
+                plan.prompt,
+                plan.max_retries,
+                plan.timeout_seconds,
+                plan.issue_id,
+                plan.issue_title,
+                plan.created_at,
+            ],
+        ).map_err(|e| format!("upsert plan record: {e}"))?;
+        Ok(())
+    }
+
+    pub fn upsert_work_unit(&mut self, unit: &WorkUnit) -> Result<(), String> {
+        self.conn
+            .execute(
+                "INSERT INTO work_unit (
+                id, task_id, title, prompt, status, claimed_by, claimed_at,
+                started_at, retry_at, reconciled_at, run_attempt, retry_count,
+                max_retries, last_error, reconciled_outcome, reconciled_note, created_at
+            ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)
+            ON CONFLICT(id, task_id) DO UPDATE SET
+                title=excluded.title,
+                prompt=excluded.prompt,
+                status=excluded.status,
+                claimed_by=excluded.claimed_by,
+                claimed_at=excluded.claimed_at,
+                started_at=excluded.started_at,
+                retry_at=excluded.retry_at,
+                reconciled_at=excluded.reconciled_at,
+                run_attempt=excluded.run_attempt,
+                retry_count=excluded.retry_count,
+                max_retries=excluded.max_retries,
+                last_error=excluded.last_error,
+                reconciled_outcome=excluded.reconciled_outcome,
+                reconciled_note=excluded.reconciled_note,
+                created_at=excluded.created_at",
+                params![
+                    unit.id,
+                    unit.task_id,
+                    unit.title,
+                    unit.prompt,
+                    unit.status.as_str(),
+                    unit.claimed_by,
+                    unit.claimed_at,
+                    unit.started_at,
+                    unit.retry_at,
+                    unit.reconciled_at,
+                    unit.run_attempt,
+                    unit.retry_count,
+                    unit.max_retries,
+                    unit.last_error,
+                    unit.reconciled_outcome,
+                    unit.reconciled_note,
+                    unit.created_at,
+                ],
+            )
+            .map_err(|e| format!("upsert work unit: {e}"))?;
+        Ok(())
+    }
+
+    pub fn delete_plan(&mut self, task_id: &str) -> Result<(), String> {
+        let tx = self
+            .conn
+            .transaction()
+            .map_err(|e| format!("begin delete plan tx: {e}"))?;
+        tx.execute("DELETE FROM plan WHERE task_id=?1", params![task_id])
+            .map_err(|e| format!("delete plan: {e}"))?;
+        tx.execute("DELETE FROM work_unit WHERE task_id=?1", params![task_id])
+            .map_err(|e| format!("delete units: {e}"))?;
+        tx.commit().map_err(|e| format!("commit delete plan: {e}"))
+    }
+
     /// Return all work units for a task, in creation order.
     pub fn list_work_units(&self, task_id: &str) -> Result<Vec<WorkUnit>, String> {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT id, task_id, title, prompt, status, claimed_by, claimed_at, created_at
+                "SELECT id, task_id, title, prompt, status, claimed_by, claimed_at,
+                        started_at, retry_at, reconciled_at, run_attempt, retry_count,
+                        max_retries, last_error, reconciled_outcome, reconciled_note, created_at
              FROM work_unit WHERE task_id=?1 ORDER BY created_at ASC, id ASC",
             )
             .map_err(|e| format!("prepare list: {e}"))?;
@@ -975,7 +1801,16 @@ impl WorkStore {
                     status: WorkUnitStatus::from_str(&row.get::<_, String>(4)?),
                     claimed_by: row.get(5)?,
                     claimed_at: row.get(6)?,
-                    created_at: row.get(7)?,
+                    started_at: row.get(7)?,
+                    retry_at: row.get(8)?,
+                    reconciled_at: row.get(9)?,
+                    run_attempt: row.get(10)?,
+                    retry_count: row.get(11)?,
+                    max_retries: row.get(12)?,
+                    last_error: row.get(13)?,
+                    reconciled_outcome: row.get(14)?,
+                    reconciled_note: row.get(15)?,
+                    created_at: row.get(16)?,
                 })
             })
             .map_err(|e| format!("list units query: {e}"))?
@@ -1218,6 +2053,10 @@ impl WorkStore {
         session.last_error = last_error;
         if matches!(state, "completed" | "failed" | "logged_out") {
             session.lease_expires_at = None;
+        } else {
+            let now_unix_seconds =
+                parse_unix_label_seconds(Some(updated_at)).unwrap_or_else(current_unix_seconds);
+            session.lease_expires_at = Some(session_lease_label_from_now(now_unix_seconds));
         }
         self.upsert_agent_session_runtime(&session)
     }
@@ -1238,8 +2077,8 @@ impl WorkStore {
         tx.execute(
             "INSERT INTO agent_profile (
                 id, label, provider, model, command, args_json, env_json, capabilities_json,
-                transport_kind, active, created_at, updated_at
-             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)
+                transport_kind, active, is_reviewer, created_at, updated_at
+             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)
              ON CONFLICT(id) DO UPDATE SET
                 label=excluded.label,
                 provider=excluded.provider,
@@ -1250,6 +2089,7 @@ impl WorkStore {
                 capabilities_json=excluded.capabilities_json,
                 transport_kind=excluded.transport_kind,
                 active=excluded.active,
+                is_reviewer=excluded.is_reviewer,
                 updated_at=excluded.updated_at",
             params![
                 profile.id,
@@ -1262,6 +2102,7 @@ impl WorkStore {
                 capabilities_json,
                 profile.transport_kind,
                 if profile.active { 1 } else { 0 },
+                if profile.is_reviewer { 1 } else { 0 },
                 profile.created_at,
                 profile.updated_at,
             ],
@@ -1276,7 +2117,7 @@ impl WorkStore {
             .conn
             .prepare(
                 "SELECT id, label, provider, model, command, args_json, env_json, capabilities_json,
-                        transport_kind, active, created_at, updated_at
+                        transport_kind, active, is_reviewer, created_at, updated_at
                  FROM agent_profile
                  ORDER BY active DESC, updated_at DESC, id ASC",
             )
@@ -1297,8 +2138,9 @@ impl WorkStore {
                     capabilities: serde_json::from_str(&capabilities_json).unwrap_or_default(),
                     transport_kind: row.get(8)?,
                     active: row.get::<_, i64>(9)? != 0,
-                    created_at: row.get(10)?,
-                    updated_at: row.get(11)?,
+                    is_reviewer: row.get::<_, i64>(10)? != 0,
+                    created_at: row.get(11)?,
+                    updated_at: row.get(12)?,
                 })
             })
             .map_err(|e| format!("query list agent profiles: {e}"))?;
@@ -1311,7 +2153,7 @@ impl WorkStore {
             .conn
             .prepare(
                 "SELECT id, label, provider, model, command, args_json, env_json, capabilities_json,
-                        transport_kind, active, created_at, updated_at
+                        transport_kind, active, is_reviewer, created_at, updated_at
                  FROM agent_profile WHERE id=?1 LIMIT 1",
             )
             .map_err(|e| format!("prepare get agent profile: {e}"))?;
@@ -1330,8 +2172,9 @@ impl WorkStore {
                 capabilities: serde_json::from_str(&capabilities_json).unwrap_or_default(),
                 transport_kind: row.get(8)?,
                 active: row.get::<_, i64>(9)? != 0,
-                created_at: row.get(10)?,
-                updated_at: row.get(11)?,
+                is_reviewer: row.get::<_, i64>(10)? != 0,
+                created_at: row.get(11)?,
+                updated_at: row.get(12)?,
             })
         })
         .optional()
@@ -1343,7 +2186,7 @@ impl WorkStore {
             .conn
             .prepare(
                 "SELECT id, label, provider, model, command, args_json, env_json, capabilities_json,
-                        transport_kind, active, created_at, updated_at
+                        transport_kind, active, is_reviewer, created_at, updated_at
                  FROM agent_profile WHERE active=1
                  ORDER BY updated_at DESC, id ASC
                  LIMIT 1",
@@ -1364,8 +2207,9 @@ impl WorkStore {
                 capabilities: serde_json::from_str(&capabilities_json).unwrap_or_default(),
                 transport_kind: row.get(8)?,
                 active: row.get::<_, i64>(9)? != 0,
-                created_at: row.get(10)?,
-                updated_at: row.get(11)?,
+                is_reviewer: row.get::<_, i64>(10)? != 0,
+                created_at: row.get(11)?,
+                updated_at: row.get(12)?,
             })
         })
         .optional()
@@ -1377,6 +2221,234 @@ impl WorkStore {
             .execute("DELETE FROM agent_profile WHERE id=?1", params![profile_id])
             .map_err(|e| format!("delete agent profile: {e}"))?;
         Ok(())
+    }
+
+    pub fn upsert_coordinator_thread(
+        &mut self,
+        thread: &CoordinatorThreadRecord,
+    ) -> Result<(), String> {
+        let draft_mission_json =
+            serde_json::to_string(&thread.draft_mission).unwrap_or_else(|_| "{}".to_string());
+        let pending_plan_json =
+            serde_json::to_string(&thread.pending_plan).unwrap_or_else(|_| "[]".to_string());
+        self.conn
+            .execute(
+                "INSERT INTO coordinator_thread (
+                    id, repo_path, mission_id, persona_name, title, state,
+                    draft_mission_json, pending_plan_json, created_at, updated_at
+                ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)
+                ON CONFLICT(id) DO UPDATE SET
+                    repo_path=excluded.repo_path,
+                    mission_id=excluded.mission_id,
+                    persona_name=excluded.persona_name,
+                    title=excluded.title,
+                    state=excluded.state,
+                    draft_mission_json=excluded.draft_mission_json,
+                    pending_plan_json=excluded.pending_plan_json,
+                    updated_at=excluded.updated_at",
+                params![
+                    thread.id,
+                    thread.repo_path,
+                    thread.mission_id,
+                    thread.persona_name,
+                    thread.title,
+                    thread.state,
+                    draft_mission_json,
+                    pending_plan_json,
+                    thread.created_at,
+                    thread.updated_at,
+                ],
+            )
+            .map_err(|e| format!("upsert coordinator thread: {e}"))?;
+        Ok(())
+    }
+
+    pub fn get_coordinator_thread(
+        &self,
+        thread_id: &str,
+    ) -> Result<Option<CoordinatorThreadRecord>, String> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, repo_path, mission_id, persona_name, title, state,
+                        draft_mission_json, pending_plan_json, created_at, updated_at
+                 FROM coordinator_thread
+                 WHERE id=?1
+                 LIMIT 1",
+            )
+            .map_err(|e| format!("prepare get coordinator thread: {e}"))?;
+        stmt.query_row(params![thread_id], |row| {
+            let draft_mission_json: String = row.get(6)?;
+            let pending_plan_json: String = row.get(7)?;
+            Ok(CoordinatorThreadRecord {
+                id: row.get(0)?,
+                repo_path: row.get(1)?,
+                mission_id: row.get(2)?,
+                persona_name: row.get(3)?,
+                title: row.get(4)?,
+                state: row.get(5)?,
+                draft_mission: serde_json::from_str(&draft_mission_json).unwrap_or_default(),
+                pending_plan: serde_json::from_str(&pending_plan_json).unwrap_or_default(),
+                created_at: row.get(8)?,
+                updated_at: row.get(9)?,
+            })
+        })
+        .optional()
+        .map_err(|e| format!("get coordinator thread: {e}"))
+    }
+
+    pub fn get_latest_coordinator_thread(
+        &self,
+        repo_path: &str,
+    ) -> Result<Option<CoordinatorThreadRecord>, String> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, repo_path, mission_id, persona_name, title, state,
+                        draft_mission_json, pending_plan_json, created_at, updated_at
+                 FROM coordinator_thread
+                 WHERE repo_path=?1
+                 ORDER BY
+                    CASE state
+                        WHEN 'resolved' THEN 1
+                        WHEN 'abandoned' THEN 1
+                        ELSE 0
+                    END ASC,
+                    updated_at DESC,
+                    id DESC
+                 LIMIT 1",
+            )
+            .map_err(|e| format!("prepare latest coordinator thread: {e}"))?;
+        stmt.query_row(params![repo_path], |row| {
+            let draft_mission_json: String = row.get(6)?;
+            let pending_plan_json: String = row.get(7)?;
+            Ok(CoordinatorThreadRecord {
+                id: row.get(0)?,
+                repo_path: row.get(1)?,
+                mission_id: row.get(2)?,
+                persona_name: row.get(3)?,
+                title: row.get(4)?,
+                state: row.get(5)?,
+                draft_mission: serde_json::from_str(&draft_mission_json).unwrap_or_default(),
+                pending_plan: serde_json::from_str(&pending_plan_json).unwrap_or_default(),
+                created_at: row.get(8)?,
+                updated_at: row.get(9)?,
+            })
+        })
+        .optional()
+        .map_err(|e| format!("latest coordinator thread: {e}"))
+    }
+
+    pub fn list_coordinator_threads(
+        &self,
+        repo_path: &str,
+        limit: usize,
+    ) -> Result<Vec<CoordinatorThreadSummary>, String> {
+        let limit = limit.max(1) as i64;
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, mission_id, title, state, updated_at
+                 FROM coordinator_thread
+                 WHERE repo_path = ?1
+                 ORDER BY updated_at DESC
+                 LIMIT ?2",
+            )
+            .map_err(|e| format!("prepare list coordinator threads: {e}"))?;
+        let rows = stmt
+            .query_map(params![repo_path, limit], |row| {
+                Ok(CoordinatorThreadSummary {
+                    id: row.get(0)?,
+                    mission_id: row.get(1)?,
+                    title: row.get(2)?,
+                    state: row.get(3)?,
+                    updated_at: row.get(4)?,
+                })
+            })
+            .map_err(|e| format!("query list coordinator threads: {e}"))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("collect coordinator threads: {e}"))
+    }
+
+    pub fn append_coordinator_message(
+        &mut self,
+        message: NewCoordinatorMessage<'_>,
+    ) -> Result<CoordinatorMessageRecord, String> {
+        let payload_json =
+            serde_json::to_string(&message.payload).unwrap_or_else(|_| "{}".to_string());
+        let created_at = crate::unix_now_label();
+        self.conn
+            .execute(
+                "INSERT INTO coordinator_message (
+                    thread_id, mission_id, objective_id, session_id, role, kind, content, payload_json, created_at
+                ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+                params![
+                    message.thread_id,
+                    message.mission_id,
+                    message.objective_id,
+                    message.session_id,
+                    message.role,
+                    message.kind,
+                    message.content,
+                    payload_json,
+                    created_at,
+                ],
+            )
+            .map_err(|e| format!("insert coordinator message: {e}"))?;
+        let id = self.conn.last_insert_rowid();
+        Ok(CoordinatorMessageRecord {
+            id,
+            thread_id: message.thread_id.to_string(),
+            mission_id: message.mission_id.map(str::to_string),
+            objective_id: message.objective_id.map(str::to_string),
+            session_id: message.session_id.map(str::to_string),
+            role: message.role.to_string(),
+            kind: message.kind.to_string(),
+            content: message.content.to_string(),
+            payload: message.payload,
+            created_at,
+        })
+    }
+
+    pub fn list_coordinator_messages(
+        &self,
+        thread_id: &str,
+        limit: usize,
+    ) -> Result<Vec<CoordinatorMessageRecord>, String> {
+        let take = i64::try_from(limit.max(1)).unwrap_or(200);
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, thread_id, mission_id, objective_id, session_id, role, kind, content, payload_json, created_at
+                 FROM coordinator_message
+                 WHERE thread_id=?1
+                 ORDER BY id DESC
+                 LIMIT ?2",
+            )
+            .map_err(|e| format!("prepare list coordinator messages: {e}"))?;
+        let rows = stmt
+            .query_map(params![thread_id, take], |row| {
+                let payload_json: String = row.get(8)?;
+                Ok(CoordinatorMessageRecord {
+                    id: row.get(0)?,
+                    thread_id: row.get(1)?,
+                    mission_id: row.get(2)?,
+                    objective_id: row.get(3)?,
+                    session_id: row.get(4)?,
+                    role: row.get(5)?,
+                    kind: row.get(6)?,
+                    content: row.get(7)?,
+                    payload: serde_json::from_str(&payload_json)
+                        .unwrap_or_else(|_| serde_json::json!({})),
+                    created_at: row.get(9)?,
+                })
+            })
+            .map_err(|e| format!("query coordinator messages: {e}"))?;
+        let mut messages = rows
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("collect coordinator messages: {e}"))?;
+        messages.reverse();
+        Ok(messages)
     }
 
     pub fn upsert_patch_decision(&mut self, decision: &PatchDecisionRecord) -> Result<(), String> {
@@ -1919,7 +2991,9 @@ impl WorkStore {
         unit_id: &str,
     ) -> Result<WorkUnit, String> {
         tx.query_row(
-            "SELECT id, task_id, title, prompt, status, claimed_by, claimed_at, created_at
+            "SELECT id, task_id, title, prompt, status, claimed_by, claimed_at,
+                    started_at, retry_at, reconciled_at, run_attempt, retry_count,
+                    max_retries, last_error, reconciled_outcome, reconciled_note, created_at
              FROM work_unit WHERE id=?1 AND task_id=?2",
             params![unit_id, task_id],
             |row| {
@@ -1931,7 +3005,16 @@ impl WorkStore {
                     status: WorkUnitStatus::from_str(&row.get::<_, String>(4)?),
                     claimed_by: row.get(5)?,
                     claimed_at: row.get(6)?,
-                    created_at: row.get(7)?,
+                    started_at: row.get(7)?,
+                    retry_at: row.get(8)?,
+                    reconciled_at: row.get(9)?,
+                    run_attempt: row.get(10)?,
+                    retry_count: row.get(11)?,
+                    max_retries: row.get(12)?,
+                    last_error: row.get(13)?,
+                    reconciled_outcome: row.get(14)?,
+                    reconciled_note: row.get(15)?,
+                    created_at: row.get(16)?,
                 })
             },
         )
@@ -1960,6 +3043,303 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = WorkStore::open_or_create(dir.path()).expect("open store");
         (store, dir)
+    }
+
+    fn task_lifecycle_event(
+        id: &str,
+        event_type: TaskLifecycleEventType,
+        actor: &str,
+        causation: Option<&str>,
+        occurred_at: &str,
+        payload: serde_json::Value,
+    ) -> TaskLifecycleEvent {
+        TaskLifecycleEvent {
+            id: id.into(),
+            task_id: "task-123".into(),
+            thread_id: "thread-abc".into(),
+            r#type: event_type,
+            actor: actor.into(),
+            source: Some("coordinator".into()),
+            correlation: Some("corr-789".into()),
+            causation: causation.map(str::to_string),
+            occurred_at: occurred_at.into(),
+            payload,
+        }
+    }
+
+    #[test]
+    fn task_lifecycle_events_preserve_transition_ordering() {
+        let events = vec![
+            task_lifecycle_event(
+                "evt-1",
+                TaskLifecycleEventType::TaskCreated,
+                "user",
+                None,
+                "unix:1",
+                serde_json::json!({"title": "Coordinator first"}),
+            ),
+            task_lifecycle_event(
+                "evt-2",
+                TaskLifecycleEventType::PlanProposed,
+                "planner",
+                Some("evt-1"),
+                "unix:2",
+                serde_json::json!({"objectiveCount": 2}),
+            ),
+            task_lifecycle_event(
+                "evt-3",
+                TaskLifecycleEventType::PlanApproved,
+                "user",
+                Some("evt-2"),
+                "unix:3",
+                serde_json::json!({"approved": true}),
+            ),
+            task_lifecycle_event(
+                "evt-4",
+                TaskLifecycleEventType::WorkerStarted,
+                "worker",
+                Some("evt-3"),
+                "unix:4",
+                serde_json::json!({"sessionId": "sess-1", "objectiveId": "objective-1"}),
+            ),
+        ];
+
+        let event_types: Vec<&str> = events.iter().map(|event| event.r#type.as_str()).collect();
+        assert_eq!(
+            event_types,
+            vec![
+                "task.created",
+                "plan.proposed",
+                "plan.approved",
+                "worker.started"
+            ]
+        );
+        assert_eq!(events[0].causation, None);
+        assert_eq!(events[1].causation.as_deref(), Some("evt-1"));
+        assert_eq!(events[2].causation.as_deref(), Some("evt-2"));
+        assert_eq!(events[3].causation.as_deref(), Some("evt-3"));
+        assert!(events
+            .windows(2)
+            .all(|pair| pair[0].occurred_at < pair[1].occurred_at));
+    }
+
+    #[test]
+    fn task_lifecycle_event_envelope_serializes_required_fields() {
+        let event = task_lifecycle_event(
+            "evt-envelope",
+            TaskLifecycleEventType::PlanProposed,
+            "planner",
+            Some("evt-previous"),
+            "unix:22",
+            serde_json::json!({"objectiveCount": 3}),
+        );
+
+        let json = serde_json::to_value(&event).expect("serialize lifecycle event");
+
+        assert_eq!(json["id"], "evt-envelope");
+        assert_eq!(json["taskId"], "task-123");
+        assert_eq!(json["threadId"], "thread-abc");
+        assert_eq!(json["type"], "plan.proposed");
+        assert_eq!(json["actor"], "planner");
+        assert_eq!(json["source"], "coordinator");
+        assert_eq!(json["correlation"], "corr-789");
+        assert_eq!(json["causation"], "evt-previous");
+        assert_eq!(json["occurredAt"], "unix:22");
+        assert_eq!(json["payload"]["objectiveCount"], 3);
+    }
+
+    #[test]
+    fn verification_failed_lifecycle_event_shape_is_typed() {
+        let event = task_lifecycle_event(
+            "evt-verification-failed",
+            TaskLifecycleEventType::VerificationFailed,
+            "verifier",
+            Some("evt-worker-started"),
+            "unix:40",
+            serde_json::json!({
+                "objectiveId": "objective-1",
+                "sessionId": "sess-1",
+                "summary": "cargo test failed",
+                "status": "failed",
+                "details": {
+                    "command": "cargo test",
+                    "exitCode": 101
+                }
+            }),
+        );
+
+        let json = serde_json::to_value(&event).expect("serialize verification event");
+
+        assert_eq!(event.r#type, TaskLifecycleEventType::VerificationFailed);
+        assert_eq!(json["type"], "verification.failed");
+        assert_eq!(json["actor"], "verifier");
+        assert_eq!(json["source"], "coordinator");
+        assert_eq!(json["correlation"], "corr-789");
+        assert_eq!(json["causation"], "evt-worker-started");
+        assert_eq!(json["payload"]["status"], "failed");
+        assert_eq!(json["payload"]["summary"], "cargo test failed");
+        assert_eq!(json["payload"]["details"]["command"], "cargo test");
+        assert_eq!(json["payload"]["details"]["exitCode"], 101);
+    }
+
+    #[test]
+    fn task_lifecycle_projection_orders_verification_failed_then_retry() {
+        let run_events = vec![
+            RunEventRecord {
+                id: 1,
+                task_id: "task-123".into(),
+                unit_id: "objective-1".into(),
+                session_id: "sess-1".into(),
+                event_type: "started".into(),
+                payload: serde_json::json!({"summary": "worker started"}),
+                created_at: "unix:10".into(),
+            },
+            RunEventRecord {
+                id: 2,
+                task_id: "task-123".into(),
+                unit_id: "objective-1".into(),
+                session_id: "sess-1".into(),
+                event_type: "retry_scheduled".into(),
+                payload: serde_json::json!({"retryAt": "unix:30", "reason": "verification failed"}),
+                created_at: "unix:30".into(),
+            },
+        ];
+        let verifications = vec![VerificationRecord {
+            id: 7,
+            mission_id: "task-123".into(),
+            objective_id: Some("objective-1".into()),
+            session_id: Some("sess-1".into()),
+            status: "failed".into(),
+            summary: "cargo test failed".into(),
+            details: serde_json::json!({
+                "validation": {
+                    "command": "cargo test",
+                    "success": false,
+                    "exitCode": 101
+                },
+                "retryScheduled": true,
+                "retryAt": "unix:30"
+            }),
+            created_at: "unix:20".into(),
+            updated_at: "unix:30".into(),
+        }];
+
+        let events = project_task_lifecycle_events_at(
+            "task-123",
+            "thread-abc",
+            &[],
+            &run_events,
+            &[],
+            &[],
+            &verifications,
+            40,
+        );
+        let event_types = events
+            .iter()
+            .map(|event| event.r#type.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            event_types,
+            vec![
+                "worker.started",
+                "verification.failed",
+                "task.retry_scheduled",
+                "task.retry_scheduled"
+            ]
+        );
+        assert_eq!(events[1].payload["summary"], "cargo test failed");
+        assert_eq!(events[1].payload["details"]["validation"]["exitCode"], 101);
+        assert_eq!(events[2].payload["reason"], "verification failed");
+        assert_eq!(events[3].payload["verificationId"], "verification-7");
+    }
+
+    #[test]
+    fn task_lifecycle_projection_marks_stale_session_path() {
+        let sessions = vec![AgentSessionRuntimeRecord {
+            id: "sess-stale".into(),
+            mission_id: "task-123".into(),
+            objective_id: Some("objective-1".into()),
+            profile_id: "worker-profile".into(),
+            assignment_kind: "execute_objective".into(),
+            state: "running".into(),
+            touched_paths: vec!["src/lib.rs".into()],
+            workspace_path: "/tmp/worktree".into(),
+            lease_expires_at: Some("unix:12".into()),
+            last_heartbeat_at: Some("unix:10".into()),
+            last_event_at: Some("unix:11".into()),
+            last_error: None,
+            created_at: "unix:9".into(),
+            updated_at: "unix:11".into(),
+        }];
+
+        let events = project_task_lifecycle_events_at(
+            "task-123",
+            "thread-abc",
+            &[],
+            &[],
+            &sessions,
+            &[],
+            &[],
+            20,
+        );
+        let event_types = events
+            .iter()
+            .map(|event| event.r#type.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(event_types, vec!["worker.started", "session.stale"]);
+        assert_eq!(events[1].payload["runtimeStatus"], "stuck");
+        assert_eq!(events[1].payload["leaseExpired"], true);
+        assert_eq!(events[1].payload["sessionId"], "sess-stale");
+        assert_eq!(
+            events[1].causation.as_deref(),
+            Some("session-sess-stale-started")
+        );
+    }
+
+    #[test]
+    fn task_lifecycle_projection_attaches_review_decisions() {
+        let decisions = vec![PatchDecisionRecord {
+            mission_id: "task-123".into(),
+            objective_id: "objective-1".into(),
+            session_id: Some("sess-1".into()),
+            status: "applied".into(),
+            reason: None,
+            patch_base_revision: Some("base-rev".into()),
+            apply_target_path: Some("/repo".into()),
+            apply_branch: Some("main".into()),
+            applied_at: Some("unix:30".into()),
+            apply_error: None,
+            created_at: "unix:20".into(),
+            updated_at: "unix:30".into(),
+        }];
+
+        let events = project_task_lifecycle_events_at(
+            "task-123",
+            "thread-abc",
+            &[],
+            &[],
+            &[],
+            &decisions,
+            &[],
+            40,
+        );
+        let event_types = events
+            .iter()
+            .map(|event| event.r#type.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(event_types, vec!["review.accepted", "patch.applied"]);
+        assert_eq!(events[0].actor, "reviewer");
+        assert_eq!(events[0].payload["objectiveId"], "objective-1");
+        assert_eq!(events[0].payload["sessionId"], "sess-1");
+        assert_eq!(events[1].actor, "system");
+        assert_eq!(events[1].payload["branch"], "main");
+        assert_eq!(
+            events[1].causation.as_deref(),
+            Some("patch-decision-task-123-objective-1-review-accepted")
+        );
     }
 
     // ── Outer RED: full plan → claim → verdict lifecycle ─────────────────────
@@ -2412,16 +3792,17 @@ mod tests {
     #[test]
     fn derive_agent_session_runtime_slice_marks_running_when_activity_is_recent() {
         let mut session = runtime_session_fixture();
-        session.last_heartbeat_at = Some(format!(
-            "unix:{}",
-            200 - AGENT_SESSION_RUNNING_WINDOW_SECS
-        ));
+        session.last_heartbeat_at =
+            Some(format!("unix:{}", 200 - AGENT_SESSION_RUNNING_WINDOW_SECS));
         session.last_event_at = Some("unix:199".into());
         session.lease_expires_at = Some("unix:260".into());
 
         let slice = derive_agent_session_runtime_slice_at(&session, 200);
         assert_eq!(slice.runtime_status, "running");
-        assert_eq!(slice.heartbeat_age_sec, Some(AGENT_SESSION_RUNNING_WINDOW_SECS));
+        assert_eq!(
+            slice.heartbeat_age_sec,
+            Some(AGENT_SESSION_RUNNING_WINDOW_SECS)
+        );
         assert_eq!(slice.event_age_sec, Some(1));
         assert!(!slice.lease_expired);
     }
@@ -2445,8 +3826,47 @@ mod tests {
             slice.heartbeat_age_sec,
             Some(AGENT_SESSION_RUNNING_WINDOW_SECS + 1)
         );
-        assert_eq!(slice.event_age_sec, Some(AGENT_SESSION_RUNNING_WINDOW_SECS + 1));
+        assert_eq!(
+            slice.event_age_sec,
+            Some(AGENT_SESSION_RUNNING_WINDOW_SECS + 1)
+        );
         assert!(!slice.lease_expired);
+    }
+
+    #[test]
+    fn update_agent_session_status_refreshes_lease_for_running_session() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let mut store = WorkStore::open_or_create(repo.path()).expect("store");
+        store
+            .upsert_agent_session_runtime(&AgentSessionRuntimeRecord {
+                id: "sess-refresh".into(),
+                mission_id: "mission-runtime".into(),
+                objective_id: Some("objective-1".into()),
+                profile_id: "worker-1".into(),
+                assignment_kind: "execute_objective".into(),
+                state: "running".into(),
+                touched_paths: vec![],
+                workspace_path: "/tmp/worktree".into(),
+                lease_expires_at: Some("unix:1".into()),
+                last_heartbeat_at: Some("unix:1".into()),
+                last_event_at: Some("unix:1".into()),
+                last_error: None,
+                created_at: "unix:1".into(),
+                updated_at: "unix:1".into(),
+            })
+            .expect("upsert session");
+
+        store
+            .update_agent_session_status("sess-refresh", "running", "unix:200", None)
+            .expect("refresh session");
+
+        let session = store
+            .get_agent_session_runtime("sess-refresh")
+            .expect("get session")
+            .expect("session exists");
+        assert_eq!(session.lease_expires_at.as_deref(), Some("unix:320"));
+        assert_eq!(session.last_heartbeat_at.as_deref(), Some("unix:200"));
+        assert_eq!(session.last_event_at.as_deref(), Some("unix:200"));
     }
 
     #[test]
@@ -2584,6 +4004,7 @@ mod tests {
                 capabilities: vec!["can_edit".into()],
                 transport_kind: "pty".into(),
                 active: true,
+                is_reviewer: false,
                 created_at: "unix:2".into(),
                 updated_at: "unix:2".into(),
             })
@@ -2626,5 +4047,37 @@ mod tests {
         assert_eq!(state.patch_decisions[0].status, "accepted");
         assert_eq!(state.patch_gates.len(), 1);
         assert_eq!(state.patch_gates[0].status, "ready");
+    }
+
+    #[test]
+    fn open_or_create_migrates_old_agent_profile_schema() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join(".sloposcope").join("conductor.sqlite3");
+        std::fs::create_dir_all(db_path.parent().expect("db parent")).expect("create db dir");
+        let conn = Connection::open(&db_path).expect("open raw sqlite");
+        conn.execute_batch(
+            "
+            CREATE TABLE agent_profile (
+                id TEXT PRIMARY KEY,
+                label TEXT NOT NULL,
+                provider TEXT NOT NULL
+            );
+            INSERT INTO agent_profile (id, label, provider)
+            VALUES ('legacy', 'Legacy profile', 'local_cli');
+            ",
+        )
+        .expect("seed old schema");
+        drop(conn);
+
+        let store = WorkStore::open_or_create(dir.path()).expect("migrate store");
+        let profile = store
+            .get_agent_profile("legacy")
+            .expect("get profile")
+            .expect("profile exists");
+        assert_eq!(profile.id, "legacy");
+        assert_eq!(profile.label, "Legacy profile");
+        assert_eq!(profile.provider, "local_cli");
+        assert!(!profile.is_reviewer);
+        assert_eq!(profile.transport_kind, "internal");
     }
 }

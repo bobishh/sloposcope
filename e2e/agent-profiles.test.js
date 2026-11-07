@@ -1,10 +1,15 @@
 import { test, expect } from '@playwright/test';
 
+async function openAdvancedOperations(page) {
+  await page.locator('.eyeloss-controls__view-btn').click();
+  await page.getByLabel('Developer mode').check();
+  return page.getByRole('tablist', { name: 'Advanced operation sections' });
+}
+
 test('should save a code-worker profile, select it, and run with that profile', async ({ page }) => {
   await page.goto('/');
-  await page.locator('.eyeloss-controls__view-btn').click();
 
-  const missionTabs = page.getByRole('tablist', { name: 'Mission sections' });
+  const missionTabs = await openAdvancedOperations(page);
   await missionTabs.getByRole('button', { name: 'Mission', exact: true }).click();
   await page.getByLabel('Title').fill('Profile wiring mission');
   await page.getByLabel('Brief').fill('Use saved CLI profile for code worker.');
@@ -25,10 +30,23 @@ test('should save a code-worker profile, select it, and run with that profile', 
   await profilePanel.getByLabel('Model').fill('gemini-2.5-pro');
   await profilePanel.getByLabel('Args').fill('--sandbox\n--yolo');
   await profilePanel.getByLabel('Capabilities').fill('can_edit\ncan_run_tools');
+
+  // Given reviewer role starts unchecked.
+  const reviewerRole = profilePanel.getByLabel('Reviewer role');
+  await expect(reviewerRole).not.toBeChecked();
+
+  // When reviewer role is enabled and profile saved.
+  await reviewerRole.check();
+  await expect(reviewerRole).toBeChecked();
   await profilePanel.getByRole('button', { name: 'Save profile', exact: true }).click();
 
+  // Then reviewer role survives reload and can toggle back off.
   await expect(profilePanel).toContainText('Gemini horse');
   await expect(profilePanel).toContainText('gemini_cli');
+  await profilePanel.getByRole('button', { name: 'Reload', exact: true }).click();
+  await expect(reviewerRole).toBeChecked();
+  await reviewerRole.uncheck();
+  await expect(reviewerRole).not.toBeChecked();
 
   await missionTabs.getByRole('button', { name: 'Runs', exact: true }).click();
   const runs = page.locator('.eyeloss-mission-runs-panel');
@@ -42,9 +60,8 @@ test('should save a code-worker profile, select it, and run with that profile', 
 
 test('should load a built-in horse template into the profile form', async ({ page }) => {
   await page.goto('/');
-  await page.locator('.eyeloss-controls__view-btn').click();
 
-  const missionTabs = page.getByRole('tablist', { name: 'Mission sections' });
+  const missionTabs = await openAdvancedOperations(page);
   await missionTabs.getByRole('button', { name: 'Debug', exact: true }).click();
   const debugTabs = page.getByRole('tablist', { name: 'Debug sections' });
   await debugTabs.getByRole('button', { name: 'Profiles', exact: true }).click();
@@ -63,9 +80,8 @@ test('should load a built-in horse template into the profile form', async ({ pag
 
 test('should load PI on NIM template into the profile form', async ({ page }) => {
   await page.goto('/');
-  await page.locator('.eyeloss-controls__view-btn').click();
 
-  const missionTabs = page.getByRole('tablist', { name: 'Mission sections' });
+  const missionTabs = await openAdvancedOperations(page);
   await missionTabs.getByRole('button', { name: 'Debug', exact: true }).click();
   const debugTabs = page.getByRole('tablist', { name: 'Debug sections' });
   await debugTabs.getByRole('button', { name: 'Profiles', exact: true }).click();
@@ -86,9 +102,8 @@ test('should load PI on NIM template into the profile form', async ({ page }) =>
 
 test('should show env token hints and keep env json visible after profile reload', async ({ page }) => {
   await page.goto('/');
-  await page.locator('.eyeloss-controls__view-btn').click();
 
-  const missionTabs = page.getByRole('tablist', { name: 'Mission sections' });
+  const missionTabs = await openAdvancedOperations(page);
   await missionTabs.getByRole('button', { name: 'Debug', exact: true }).click();
   const debugTabs = page.getByRole('tablist', { name: 'Debug sections' });
   await debugTabs.getByRole('button', { name: 'Profiles', exact: true }).click();
@@ -117,9 +132,8 @@ test('should show env token hints and keep env json visible after profile reload
 
 test('should load NIM template and use active NIM planner on mission plan', async ({ page }) => {
   await page.goto('/');
-  await page.locator('.eyeloss-controls__view-btn').click();
 
-  const missionTabs = page.getByRole('tablist', { name: 'Mission sections' });
+  const missionTabs = await openAdvancedOperations(page);
   await missionTabs.getByRole('button', { name: 'Debug', exact: true }).click();
   const debugTabs = page.getByRole('tablist', { name: 'Debug sections' });
   await debugTabs.getByRole('button', { name: 'Profiles', exact: true }).click();

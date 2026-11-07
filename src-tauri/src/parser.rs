@@ -1,7 +1,94 @@
 use crate::graph::{Edge, Func, Node};
+use serde::Serialize;
 use std::path::Path;
 use streaming_iterator::StreamingIterator;
 use tree_sitter::{Language, Query, QueryCursor};
+
+#[path = "parser_metrics.rs"]
+mod parser_metrics;
+pub(crate) use parser_metrics::source_id;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AnatomyStatus {
+    Partial,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CallableVisibility {
+    Public,
+    Private,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CallableAnatomy {
+    pub id: String,
+    pub match_key: String,
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    pub kind: String,
+    pub visibility: CallableVisibility,
+    pub arity: Option<usize>,
+    pub start_line: Option<u32>,
+    pub end_line: Option<u32>,
+    pub body_line_span: Option<u32>,
+    pub decision_count: Option<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StateSlotAnatomy {
+    pub name: String,
+    pub kind: String,
+    pub visibility: CallableVisibility,
+    pub start_line: Option<u32>,
+    pub end_line: Option<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FileAnatomy {
+    pub status: AnatomyStatus,
+    pub file: String,
+    pub language: String,
+    pub source_id: String,
+    pub profile_id: String,
+    pub line_count: Option<u32>,
+    pub first_seen_at: Option<String>,
+    pub age_as_of: Option<String>,
+    pub age_days: Option<u32>,
+    pub age_reason: Option<String>,
+    pub evidence: String,
+    pub callables: Vec<CallableAnatomy>,
+    pub state_slots: Option<Vec<StateSlotAnatomy>>,
+    pub reason: Option<String>,
+}
+
+impl FileAnatomy {
+    pub fn unavailable(file: &str, language: &str, reason: &str) -> Self {
+        Self {
+            status: AnatomyStatus::Unavailable,
+            file: file.to_string(),
+            language: language.to_string(),
+            source_id: String::new(),
+            profile_id: format!("{language}:unavailable"),
+            line_count: None,
+            first_seen_at: None,
+            age_as_of: None,
+            age_days: None,
+            age_reason: None,
+            evidence: "tree_sitter".to_string(),
+            callables: Vec::new(),
+            state_slots: None,
+            reason: Some(reason.to_string()),
+        }
+    }
+}
 
 /// Every language parser implements this trait.
 pub trait Parser: Send + Sync {
@@ -12,6 +99,27 @@ pub trait Parser: Send + Sync {
         relative_path: &str,
         content: &str,
     ) -> (Vec<Node>, Vec<Edge>);
+
+    fn analyze_file(&self, repo_root: &Path, relative_path: &str, content: &str) -> FileAnatomy {
+        let language = Path::new(relative_path)
+            .extension()
+            .and_then(|value| value.to_str())
+            .unwrap_or("unknown");
+        let _ = (repo_root, content);
+        let mut anatomy =
+            FileAnatomy::unavailable(relative_path, language, "anatomy profile unavailable");
+        anatomy.source_id = parser_metrics::source_id(content.as_bytes());
+        anatomy.line_count = Some(physical_line_count(content.as_bytes()));
+        anatomy
+    }
+}
+
+pub(crate) fn physical_line_count(content: &[u8]) -> u32 {
+    let line_feeds = content.iter().filter(|byte| **byte == b'\n').count() as u64;
+    let trailing_line = u64::from(!content.is_empty() && content.last() != Some(&b'\n'));
+    line_feeds
+        .saturating_add(trailing_line)
+        .min(u32::MAX as u64) as u32
 }
 
 /// A generic parser that uses Tree-sitter queries to extract nodes and edges.
@@ -160,11 +268,175 @@ impl Parser for PluggableParser {
         edges.extend(file_edges);
         (nodes, edges)
     }
+
+    fn analyze_file(&self, repo_root: &Path, relative_path: &str, content: &str) -> FileAnatomy {
+        let extension = Path::new(relative_path)
+            .extension()
+            .and_then(|value| value.to_str())
+            .unwrap_or("unknown")
+            .to_ascii_lowercase();
+        let _ = repo_root;
+        parser_metrics::analyze(relative_path, &extension, self.language.clone(), content)
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    /// Given callable declarations in each supported grammar, when anatomy is
+    /// extracted, then body spans and decision counts come from source syntax.
+    #[test]
+    fn measured_anatomy_captures_ranges_and_decisions_across_language_families() {
+        use super::{Parser as _, PluggableParser};
+        use std::path::Path;
+
+        let cases = [
+            (
+                "rs",
+                tree_sitter::Language::new(tree_sitter_rust::LANGUAGE),
+                "fn f(x: bool) {\n if x {\n  return;\n }\n}\n",
+                "f",
+                5,
+                1,
+            ),
+            (
+                "rb",
+                tree_sitter::Language::new(tree_sitter_ruby::LANGUAGE),
+                "def f(x)\n  if x\n    return\n  end\nend\n",
+                "f",
+                3,
+                1,
+            ),
+            (
+                "js",
+                tree_sitter::Language::new(tree_sitter_javascript::LANGUAGE),
+                "function f(x) {\n if (x) {\n  return;\n }\n}\n",
+                "f",
+                5,
+                1,
+            ),
+            (
+                "ts",
+                tree_sitter::Language::new(tree_sitter_typescript::LANGUAGE_TYPESCRIPT),
+                "function f(x: boolean) {\n if (x) {\n  return;\n }\n}\n",
+                "f",
+                5,
+                1,
+            ),
+            (
+                "ex",
+                tree_sitter::Language::new(tree_sitter_elixir::LANGUAGE),
+                "defmodule M do\n def f(x) do\n  if x do\n   :ok\n  end\n end\nend\n",
+                "f",
+                5,
+                1,
+            ),
+            (
+                "elm",
+                tree_sitter::Language::new(tree_sitter_elm::LANGUAGE),
+                "f x =\n    if x then 1 else 0\n",
+                "f",
+                1,
+                1,
+            ),
+        ];
+
+        for (extension, language, source, expected_name, expected_span, expected_decisions) in cases
+        {
+            let parser = PluggableParser {
+                extensions: vec!["test"],
+                language,
+                queries: "",
+                default_node_kind: "file",
+                default_edge_kind: "call",
+            };
+            let anatomy =
+                parser.analyze_file(Path::new("/repo"), &format!("sample.{extension}"), source);
+            assert_eq!(
+                anatomy.status,
+                super::AnatomyStatus::Partial,
+                ".{extension}"
+            );
+            assert!(anatomy.source_id.starts_with("sha256:"), ".{extension}");
+            assert!(
+                anatomy.profile_id.ends_with("callable-anatomy-v1"),
+                ".{extension}"
+            );
+            let callable = anatomy
+                .callables
+                .iter()
+                .find(|callable| callable.name == expected_name)
+                .unwrap_or_else(|| {
+                    panic!("missing {expected_name} callable for .{extension}: {anatomy:?}")
+                });
+            assert_eq!(callable.body_line_span, Some(expected_span), ".{extension}");
+            assert_eq!(
+                callable.decision_count,
+                Some(expected_decisions),
+                ".{extension}"
+            );
+            assert!(callable.start_line.is_some(), ".{extension}");
+            assert!(callable.end_line.is_some(), ".{extension}");
+        }
+    }
+
+    #[test]
+    fn anatomy_preserves_same_name_methods_from_distinct_source_captures() {
+        let parser = super::PluggableParser {
+            extensions: vec!["js"],
+            language: tree_sitter::Language::new(tree_sitter_javascript::LANGUAGE),
+            queries: "(method_definition name: (property_identifier) @func.name)",
+            default_node_kind: "file",
+            default_edge_kind: "call",
+        };
+        let anatomy = super::Parser::analyze_file(
+            &parser,
+            std::path::Path::new("."),
+            "classes.js",
+            "class A { run() {} } class B { run() {} }",
+        );
+        assert_eq!(
+            anatomy.callables.len(),
+            2,
+            "Distinct method captures must not merge by name"
+        );
+        assert!(anatomy.callables.iter().all(|c| c.name == "run"));
+    }
     use super::*;
+
+    #[test]
+    fn elixir_anatomy_preserves_captured_visibility_and_unknown_facts() {
+        let parser = PluggableParser {
+            extensions: vec!["ex", "exs"],
+            language: tree_sitter::Language::new(tree_sitter_elixir::LANGUAGE),
+            default_node_kind: "module",
+            default_edge_kind: "call",
+            queries: r#"
+                (call target: (identifier) @func.kind (#match? @func.kind "^(def|defp)$") (arguments [(identifier) @func.name (call target: (identifier) @func.name)]))
+            "#,
+        };
+
+        let anatomy = parser.analyze_file(
+            Path::new("/repo"),
+            "lib/sample.ex",
+            "defmodule Sample do\n  def shown(x), do: x\n  defp hidden, do: :ok\nend\n",
+        );
+
+        assert_eq!(anatomy.status, AnatomyStatus::Partial);
+        assert_eq!(anatomy.evidence, "tree_sitter");
+        assert_eq!(anatomy.state_slots, None);
+        assert!(
+            anatomy.callables.iter().any(|callable| {
+                callable.name == "shown"
+                    && callable.visibility == CallableVisibility::Public
+                    && callable.arity == Some(1)
+                    && callable.start_line.is_some()
+            }),
+            "{anatomy:?}"
+        );
+        assert!(anatomy.callables.iter().any(|callable| {
+            callable.name == "hidden" && callable.visibility == CallableVisibility::Private
+        }));
+    }
 
     // ── Outer RED: named-kind captures produce correct edge kinds ─────────────
 

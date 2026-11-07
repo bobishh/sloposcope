@@ -1,6 +1,11 @@
 <script>
   import Window from './Window.svelte';
   import Editor from './Editor.svelte';
+  import BugComparison from './BugComparison.svelte';
+  import { buildBugComparison } from './bugComparisonModel.js';
+  import JevTraits from './JevTraits.svelte';
+  import JevAnalysisPanel from './JevAnalysisPanel.svelte';
+  import { projectFileInterpretation } from './fileInterpretation';
 
   let {
     node,
@@ -15,10 +20,15 @@
     getNodeHeat = () => 0,
     contentVersion = '',
     fileContentVersions = new Map(),
+    comparisonSelection = { mode: 'none', since: null },
     getFileDiff,
     getFileSource,
+    getFileAnatomy,
+    getFileAnatomyComparison,
+    jevAssessment = null,
+    invokeJev = null,
     saveFile,
-    initialViewMode = 'diff',
+    initialViewMode = 'bug',
     sourceReferences = [],
     onOpenReference = null,
     onclose = null,
@@ -29,7 +39,11 @@
 
   let fileDiff = $state(null);
   let fileSource = $state(null);
-  let viewMode = $state('diff'); // 'diff' | 'source'
+  let fileComparison = $state(null);
+  let comparisonLoading = $state(false);
+  let comparisonPendingKey = $state(null);
+  let comparisonLoadedKey = $state(null);
+  let viewMode = $state('bug'); // 'bug' | 'diff' | 'source'
   let initialModeAppliedForNodeId = $state(null);
   let diffLoading = $state(false);
   let sourceLoading = $state(false);
@@ -39,8 +53,15 @@
   let sourceLoadedKey = $state(null);
   let isSaving = $state(false);
   let showSignatures = $state(false);
+  let showAnalysis = $state(false);
+  let matchingAssessment = $derived(projectFileInterpretation(anatomyComparison?.after, jevAssessment) ? jevAssessment : null);
   let expandedChunks = $state(new Set());
   let autoFallbackAppliedForFile = $state(null);
+  let anatomyComparison = $derived(buildBugComparison(
+    fileComparison?.before || null,
+    fileComparison?.after || null,
+    { hasBaseline: fileComparison?.hasBaseline ?? false },
+  ));
 
   let diffLines = $derived.by(() => {
     if (!fileDiff) return [];
@@ -201,6 +222,23 @@
     return Number(fileContentVersions?.get(file) || 0);
   }
 
+  function reuseMatchingMapAfter(comparison, file) {
+    const mapped = node?.anatomy;
+    const after = comparison?.after;
+    const mapSourceId = node?.anatomySourceId || mapped?.sourceId;
+    if (
+      node?.file === file && mapped?.file === file && after?.status === 'available'
+      && node?.anatomyEndpointState === 'available' && mapped.status !== 'unavailable'
+      && Array.isArray(mapped.callables)
+      && mapSourceId && mapSourceId === after.sourceId
+      && mapped.sourceId === after.sourceId
+      && mapped.profileId && mapped.profileId === after.anatomy?.profileId
+    ) {
+      return { ...comparison, after: { ...after, anatomy: mapped } };
+    }
+    return comparison;
+  }
+
   function handleEditorTokenClick(token) {
     const ref = findReferenceByToken(token);
     if (!ref || !onOpenReference) return;
@@ -226,7 +264,7 @@
       return;
     }
     if (initialModeAppliedForNodeId === nodeId) return;
-    viewMode = initialViewMode === 'source' ? 'source' : 'diff';
+    viewMode = ['bug', 'diff', 'source'].includes(initialViewMode) ? initialViewMode : 'bug';
     initialModeAppliedForNodeId = nodeId;
   });
 
@@ -303,6 +341,58 @@
 
   $effect(() => {
     const file = node?.file;
+    const selectionKey = JSON.stringify(comparisonSelection || {});
+    if (!file) {
+      fileComparison = null;
+      comparisonLoading = false;
+      comparisonPendingKey = null;
+      comparisonLoadedKey = null;
+      return;
+    }
+    const fileVersion = getFileContentVersion(file);
+    const anatomyKey = `${file}|${contentVersion}|${fileVersion}|${selectionKey}|comparison`;
+    if (comparisonLoadedKey === anatomyKey || comparisonPendingKey === anatomyKey) return;
+    fileComparison = null;
+    comparisonLoading = true;
+    comparisonPendingKey = anatomyKey;
+    const request = getFileAnatomyComparison
+      ? getFileAnatomyComparison(file, comparisonSelection)
+      : getFileAnatomy?.(file).then((after) => ({
+        file,
+        comparisonId: 'none',
+        hasBaseline: false,
+        before: { status: 'absent', anatomy: null, reason: 'No comparison selected' },
+        after: { status: after?.status === 'unavailable' ? 'unavailable' : 'available', anatomy: after, label: 'current snapshot' },
+      }));
+    Promise.resolve(request)
+      .then((comparison) => {
+        if (node?.file === file && comparisonPendingKey === anatomyKey) {
+          fileComparison = reuseMatchingMapAfter(comparison, file);
+          comparisonLoadedKey = anatomyKey;
+        }
+      })
+      .catch((error) => {
+        console.error('[FRONTEND] Failed to load file anatomy comparison', { file, error });
+        if (node?.file === file && comparisonPendingKey === anatomyKey) {
+          fileComparison = {
+            file,
+            comparisonId: selectionKey,
+            hasBaseline: comparisonSelection?.mode !== 'none',
+            before: { status: 'unavailable', anatomy: null, reason: 'Comparison request failed' },
+            after: { status: 'unavailable', anatomy: null, reason: 'Comparison request failed' },
+          };
+        }
+      })
+      .finally(() => {
+        if (comparisonPendingKey === anatomyKey) {
+          comparisonPendingKey = null;
+          comparisonLoading = false;
+        }
+      });
+  });
+
+  $effect(() => {
+    const file = node?.file;
     if (!file) return;
     if (autoFallbackAppliedForFile === file) return;
     if (viewMode !== 'diff') return;
@@ -337,12 +427,13 @@
       <div class="eyeloss-node-details__meta" style="margin-bottom: 8px; font-size: 11px; display: flex; justify-content: space-between; align-items: center;">
         <span>{node.file || 'unknown'}  |  {node.line_count || '--'} lines</span>
         <div class="tabs" style="display: flex; gap: 4px;">
-          <button class="btn {viewMode === 'diff' ? 'btn-primary' : ''}" style="font-size: 0.6rem; padding: 2px 6px;" onclick={() => (viewMode = 'diff')}>Diff</button>
-          <button class="btn {viewMode === 'source' ? 'btn-primary' : ''}" style="font-size: 0.6rem; padding: 2px 6px;" onclick={() => (viewMode = 'source')}>Source</button>
+          <button class="btn {viewMode === 'bug' ? 'btn-primary' : ''}" aria-pressed={viewMode === 'bug'} style="font-size: 0.6rem; padding: 2px 6px;" onclick={() => (viewMode = 'bug')}>Bug</button>
+          <button class="btn {viewMode === 'diff' ? 'btn-primary' : ''}" aria-pressed={viewMode === 'diff'} style="font-size: 0.6rem; padding: 2px 6px;" onclick={() => (viewMode = 'diff')}>Diff</button>
+          <button class="btn {viewMode === 'source' ? 'btn-primary' : ''}" aria-pressed={viewMode === 'source'} style="font-size: 0.6rem; padding: 2px 6px;" onclick={() => (viewMode = 'source')}>Source</button>
         </div>
       </div>
 
-      {#if node.functions && node.functions.length > 0}
+      {#if viewMode !== 'bug' && node.functions && node.functions.length > 0}
         <button
           class="eyeloss-node-details__section-title eyeloss-node-details__section-title--toggle"
           type="button"
@@ -366,7 +457,18 @@
         {/if}
       {/if}
 
-      {#if viewMode === 'diff'}
+      {#if viewMode === 'bug'}
+        {#if invokeJev}
+          <button type="button" class="btn" onclick={() => { showAnalysis = !showAnalysis; }}>Analyze file with Jev</button>
+          {#if showAnalysis}
+            {#key `${node.file}|${contentVersion}|${getFileContentVersion(node.file)}`}
+              <JevAnalysisPanel invoke={invokeJev} filePath={node.file} sourceId={anatomyComparison?.after?.sourceId || null} onBack={() => { showAnalysis = false; }} />
+            {/key}
+          {/if}
+        {/if}
+        <BugComparison comparison={anatomyComparison} loading={comparisonLoading} file={node.file} assessment={jevAssessment} />
+        <JevTraits assessment={matchingAssessment} />
+      {:else if viewMode === 'diff'}
         {#if diffLoading}
           <div class="eyeloss-node-details__meta" style="margin-top: 16px;">Loading diff...</div>
         {:else if fileDiff}

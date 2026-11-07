@@ -1,5 +1,11 @@
 import { test, expect } from '@playwright/test';
 
+async function openAdvancedOperations(page) {
+  await page.locator('.eyeloss-controls__view-btn').click();
+  await page.getByLabel('Developer mode').check();
+  return page.getByRole('tablist', { name: 'Advanced operation sections' });
+}
+
 test.describe('CodeGraph E2E', () => {
   test('should load the graph and display mock data', async ({ page }) => {
     await page.goto('/');
@@ -18,6 +24,20 @@ test.describe('CodeGraph E2E', () => {
     // Check the nav panel for the mock node (now shows filenames)
     const navPanel = page.locator('.eyeloss-nav-panel');
     await expect(navPanel).toContainText('MockModule');
+  });
+
+  test('Given the repository map, When zoom changes, Then shared anatomy grammar and static edges stay stable', async ({ page }) => {
+    await page.goto('/');
+    const canvas = page.locator('.eyeloss-graph-canvas');
+    await expect(canvas).toHaveAttribute('data-phenotype-grammar', 'shared-callable-metrics');
+    const callableCount = await canvas.getAttribute('data-callable-count');
+    const staticLinkCount = await canvas.getAttribute('data-static-link-count');
+    await expect(canvas).toHaveAttribute('data-detail-level', 'anatomy');
+    for (let index = 0; index < 50; index += 1) await page.keyboard.press('Control+-');
+    await expect(canvas).toHaveAttribute('data-detail-level', 'repository');
+    await expect(canvas).toHaveAttribute('data-phenotype-grammar', 'shared-callable-metrics');
+    await expect(canvas).toHaveAttribute('data-callable-count', callableCount);
+    await expect(canvas).toHaveAttribute('data-static-link-count', staticLinkCount);
   });
 
   test('should allow changing the repository path', async ({ page }) => {
@@ -130,7 +150,7 @@ test.describe('CodeGraph E2E', () => {
     await helperItem.click();
 
     const windows = page.locator('.window');
-    await expect(windows).toHaveCount(2);
+    await expect(windows).toHaveCount(4);
 
     const firstWindow = windows.first();
     const beforeStyle = await firstWindow.getAttribute('style');
@@ -147,9 +167,8 @@ test.describe('CodeGraph E2E', () => {
   test('should drive the mission flow across tabs', async ({ page }) => {
     await page.goto('/');
 
-    await page.locator('.eyeloss-controls__view-btn').click();
+    const missionTabs = await openAdvancedOperations(page);
 
-    const missionTabs = page.locator('.eyeloss-primary-tabs');
     await expect(missionTabs.getByRole('button', { name: 'Mission', exact: true })).toBeVisible();
     await expect(missionTabs.getByRole('button', { name: 'Runs', exact: true })).toBeVisible();
     await expect(missionTabs.getByRole('button', { name: 'Debug', exact: true })).toBeVisible();
@@ -190,11 +209,11 @@ test.describe('CodeGraph E2E', () => {
 
     await page.reload();
     await expect(page.locator('.eyeloss-spinner')).not.toBeVisible();
-    await page.locator('.eyeloss-controls__view-btn').click();
+    const reloadedMissionTabs = await openAdvancedOperations(page);
     await expect(page.getByRole('heading', { name: 'Mission Brief' })).toBeVisible();
     await expect(page.locator('.eyeloss-mission-panel')).toContainText('M8A mission flow');
     await expect(page.locator('.eyeloss-mission-panel')).toContainText('Normalize mission state and keep form state across tabs.');
-    await page.getByRole('tablist', { name: 'Mission sections' }).getByRole('button', { name: 'Runs', exact: true }).click();
+    await reloadedMissionTabs.getByRole('button', { name: 'Runs', exact: true }).click();
     await expect(page.locator('.eyeloss-mission-runs-panel')).toContainText('code-session-1');
     await expect(page.locator('.eyeloss-mission-runs-panel')).toContainText('verification-1');
 
@@ -209,7 +228,7 @@ test.describe('CodeGraph E2E', () => {
   test('should gate mission runs with viewer-first review actions', async ({ page }) => {
     await page.goto('/');
 
-    await page.locator('.eyeloss-controls__view-btn').click();
+    const missionTabs = await openAdvancedOperations(page);
 
     await page.getByLabel('Title').fill('M9 viewer-first gating');
     await page.getByLabel('Brief').fill('Keep the viewer on the active session and mirror review state.');
@@ -220,7 +239,7 @@ test.describe('CodeGraph E2E', () => {
     await page.locator('.eyeloss-mission-panel').getByRole('button', { name: 'Save', exact: true }).click();
     await page.locator('.eyeloss-mission-panel').getByRole('button', { name: 'Plan', exact: true }).click();
 
-    await page.getByRole('tablist', { name: 'Mission sections' }).getByRole('button', { name: 'Runs', exact: true }).click();
+    await missionTabs.getByRole('button', { name: 'Runs', exact: true }).click();
 
     const panel = page.locator('.eyeloss-mission-runs-panel');
     await page.locator('.eyeloss-mission-runs-panel').getByRole('button', { name: 'Run code worker', exact: true }).click();
@@ -244,8 +263,8 @@ test.describe('CodeGraph E2E', () => {
 
     await page.reload();
     await expect(page.locator('.eyeloss-spinner')).not.toBeVisible();
-    await page.locator('.eyeloss-controls__view-btn').click();
-    await page.getByRole('tablist', { name: 'Mission sections' }).getByRole('button', { name: 'Runs', exact: true }).click();
+    const reloadedMissionTabs = await openAdvancedOperations(page);
+    await reloadedMissionTabs.getByRole('button', { name: 'Runs', exact: true }).click();
     await expect(page.locator('.eyeloss-mission-runs-panel')).toContainText('viewer profile: local-code-worker');
     await expect(page.locator('.eyeloss-mission-runs-panel')).toContainText('review: accepted');
     await expect(page.locator('.eyeloss-mission-runs-panel')).toContainText('apply: applied');
@@ -255,8 +274,8 @@ test.describe('CodeGraph E2E', () => {
   test('should plan scoped multi-objective missions and expose scheduler controls', async ({ page }) => {
     await page.goto('/');
 
-    await page.locator('.eyeloss-controls__view-btn').click();
-    await page.getByRole('tablist', { name: 'Mission sections' }).getByRole('button', { name: 'Mission', exact: true }).click();
+    const missionTabs = await openAdvancedOperations(page);
+    await missionTabs.getByRole('button', { name: 'Mission', exact: true }).click();
 
     await page.getByLabel('Title').fill('M10 scheduler mission');
     await page.getByLabel('Brief').fill([
@@ -268,7 +287,7 @@ test.describe('CodeGraph E2E', () => {
     await page.locator('.eyeloss-mission-panel').getByRole('button', { name: 'Save', exact: true }).click();
     await page.locator('.eyeloss-mission-panel').getByRole('button', { name: 'Plan', exact: true }).click();
 
-    await page.getByRole('tablist', { name: 'Mission sections' }).getByRole('button', { name: 'Runs', exact: true }).click();
+    await missionTabs.getByRole('button', { name: 'Runs', exact: true }).click();
     const runs = page.locator('.eyeloss-mission-runs-panel');
     await expect(runs).toContainText('scheduler');
     await expect(runs.locator('.eyeloss-mission__item-id')).toHaveCount(3);
@@ -278,7 +297,7 @@ test.describe('CodeGraph E2E', () => {
 
   test('should save and use an active agent profile from debug', async ({ page }) => {
     await page.goto('/');
-    await page.locator('.eyeloss-controls__view-btn').click();
+    const missionTabs = await openAdvancedOperations(page);
 
     await page.getByLabel('Title').fill('M9 profile flow');
     await page.getByLabel('Brief').fill('Run code worker through saved active profile.');
@@ -286,7 +305,6 @@ test.describe('CodeGraph E2E', () => {
     await page.locator('.eyeloss-mission-panel').getByRole('button', { name: 'Save', exact: true }).click();
     await page.locator('.eyeloss-mission-panel').getByRole('button', { name: 'Plan', exact: true }).click();
 
-    const missionTabs = page.getByRole('tablist', { name: 'Mission sections' });
     await missionTabs.getByRole('button', { name: 'Debug', exact: true }).click();
     const debugTabs = page.getByRole('tablist', { name: 'Debug sections' });
     await debugTabs.getByRole('button', { name: 'Profiles', exact: true }).click();

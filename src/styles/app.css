@@ -183,7 +183,7 @@ textarea {
   border-color: var(--secondary);
 }
 
-.eyeloss-container canvas {
+.eyeloss-container > .eyeloss-graph-canvas {
   display: block;
   width: 100%;
   height: 100%;
@@ -285,6 +285,70 @@ textarea {
 .eyeloss-controls__view-btn {
   color: var(--text);
   border-color: var(--primary);
+}
+
+.eyeloss-window-dock {
+  position: absolute;
+  left: 16px;
+  bottom: 16px;
+  z-index: 1410;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  max-width: calc(100% - 32px);
+  padding: 6px;
+  border: 1px solid var(--bg-300);
+  background: color-mix(in srgb, var(--bg-100) 92%, transparent);
+  backdrop-filter: blur(6px);
+  box-shadow: var(--shadow);
+}
+
+.eyeloss-window-dock__button {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 8px;
+  min-width: 176px;
+  max-width: 260px;
+  padding: 7px 10px;
+  border: 1px solid var(--primary);
+  background: var(--bg-200);
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-size: 0.66rem;
+  cursor: pointer;
+}
+
+.eyeloss-window-dock__button:hover,
+.eyeloss-window-dock__button:focus-visible {
+  border-color: var(--secondary);
+  outline: none;
+}
+
+.eyeloss-window-dock__title {
+  color: var(--text);
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.eyeloss-window-dock__state {
+  min-width: 0;
+  color: var(--secondary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+@media (max-width: 680px) {
+  .eyeloss-window-dock {
+    right: 16px;
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .eyeloss-window-dock__button {
+    width: 100%;
+    max-width: none;
+  }
 }
 
 .eyeloss-control-page {

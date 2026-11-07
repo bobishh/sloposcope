@@ -1,10 +1,15 @@
 import { test, expect } from '@playwright/test';
 
+async function openAdvancedOperations(page) {
+  await page.locator('.eyeloss-controls__view-btn').click();
+  await page.getByLabel('Developer mode').check();
+  return page.getByRole('tablist', { name: 'Advanced operation sections' });
+}
+
 test('should gate and apply a worker patch from mission runs', async ({ page }) => {
   await page.goto('/');
-  await page.locator('.eyeloss-controls__view-btn').click();
 
-  const missionTabs = page.locator('.eyeloss-primary-tabs');
+  const missionTabs = await openAdvancedOperations(page);
   await missionTabs.getByRole('button', { name: 'Mission', exact: true }).click();
   await page.getByLabel('Title').fill('M9 apply flow');
   await page.getByLabel('Brief').fill('Apply code-worker patch into active map with gate.');
@@ -33,9 +38,8 @@ test('should gate and apply a worker patch from mission runs', async ({ page }) 
 
 test('should plan scheduler objectives, run next schedulable worker, and show stale sweep no-op', async ({ page }) => {
   await page.goto('/');
-  await page.locator('.eyeloss-controls__view-btn').click();
 
-  const missionTabs = page.locator('.eyeloss-primary-tabs');
+  const missionTabs = await openAdvancedOperations(page);
 
   // Given a multiline brief with scope tags
   await missionTabs.getByRole('button', { name: 'Mission', exact: true }).click();

@@ -314,6 +314,7 @@ export function buildMissionInputFromForm(form) {
 }
 
 export function buildAgentProfileInputFromForm(form) {
+  const isReviewer = form?.isReviewer ?? form?.is_reviewer;
   return {
     id: toOptionalString(form?.id),
     label: String(form?.label || '').trim(),
@@ -325,6 +326,7 @@ export function buildAgentProfileInputFromForm(form) {
     capabilities: parseMultilineInput(form?.capabilities),
     transportKind: String(form?.transportKind || 'pty').trim() || 'pty',
     active: Boolean(form?.active),
+    isReviewer: Boolean(isReviewer),
   };
 }
 
@@ -356,6 +358,38 @@ export function deriveMissionFormValues(view, createDefaultMissionState) {
 
 export async function fetchMissionState(invokeTraced) {
   return invokeTraced('get_mission_state', {}, { warnAfterMs: 5000 });
+}
+
+export async function fetchCoordinatorState(invokeTraced, missionId = null, threadId = null) {
+  return invokeTraced('get_coordinator_state', { missionId, threadId }, { warnAfterMs: 5000 });
+}
+
+export async function resumeCoordinatorThread(invokeTraced, threadId) {
+  return invokeTraced('resume_mission_thread', { threadId }, { warnAfterMs: 5000 });
+}
+
+export async function startCoordinatorThread(invokeTraced) {
+  return invokeTraced('start_coordinator_thread', {}, { warnAfterMs: 5000 });
+}
+
+export async function sendCoordinatorMessage(invokeTraced, content, missionId = null, threadId = null) {
+  return invokeTraced('send_coordinator_message', { content, missionId, threadId }, { warnAfterMs: 10000 });
+}
+
+export async function approveCoordinatorPlan(invokeTraced, missionId = null, threadId = null) {
+  return invokeTraced('approve_coordinator_plan', { missionId, threadId }, { warnAfterMs: 10000 });
+}
+
+export async function launchCoordinatorWorkers(invokeTraced, missionId = null, threadId = null, profileId = null) {
+  return invokeTraced('launch_coordinator_workers', { missionId, threadId, profileId }, { warnAfterMs: 30000 });
+}
+
+export async function requestCoordinatorReport(invokeTraced, missionId = null, threadId = null) {
+  return invokeTraced('request_coordinator_report', { missionId, threadId }, { warnAfterMs: 10000 });
+}
+
+export async function nudgeWorkerSession(invokeTraced, content, missionId = null, threadId = null, sessionId = null) {
+  return invokeTraced('nudge_worker_session', { content, missionId, threadId, sessionId }, { warnAfterMs: 10000 });
 }
 
 export async function saveMissionInput(invokeTraced, missionInput) {

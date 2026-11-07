@@ -2,6 +2,7 @@ use crate::watchdog;
 use crate::work_store::{AgentProfile, MissionRecord, ObjectiveRecord};
 use serde::Serialize;
 use std::fs;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 const HARNESS_SOURCE: &str = include_str!("../scripts/agent_harness.py");
@@ -17,6 +18,7 @@ pub struct AgentHarnessBundle {
     pub session_context_path: String,
     pub context_snapshot_path: String,
     pub prompt_path: String,
+    pub nudge_path: String,
     pub mcp_config_path: String,
     pub opencode_config_path: String,
     pub pi_config_dir: String,
@@ -89,10 +91,7 @@ pub fn is_pi_cli_provider(provider: &str) -> bool {
 }
 
 pub fn prompt_to_stdin_for_provider(provider: &str) -> bool {
-    matches!(
-        provider.trim(),
-        "gemini_cli" | "codex_cli" | "claude_cli"
-    )
+    matches!(provider.trim(), "gemini_cli" | "codex_cli" | "claude_cli")
 }
 
 fn provider_prompt_hint(profile: &AgentProfile) -> Option<&'static str> {
@@ -145,6 +144,35 @@ fn ensure_bundle_dir(workspace_path: &str, session_id: &str) -> Result<PathBuf, 
     Ok(dir)
 }
 
+pub fn session_nudge_path(workspace_path: &str, session_id: &str) -> PathBuf {
+    Path::new(workspace_path)
+        .join(".sloposcope")
+        .join("agent-sessions")
+        .join(session_id)
+        .join("nudges.ndjson")
+}
+
+pub fn append_session_nudge(
+    workspace_path: &str,
+    session_id: &str,
+    message: &str,
+) -> Result<PathBuf, String> {
+    let path = session_nudge_path(workspace_path, session_id);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|err| format!("create nudge dir {}: {err}", parent.display()))?;
+    }
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .map_err(|err| format!("open nudge file {}: {err}", path.display()))?;
+    let payload = format!("{}\n", message.trim());
+    file.write_all(payload.as_bytes())
+        .map_err(|err| format!("append nudge file {}: {err}", path.display()))?;
+    Ok(path)
+}
+
 fn opencode_config_path(workspace_path: &str) -> PathBuf {
     Path::new(workspace_path)
         .join(".sloposcope")
@@ -152,7 +180,9 @@ fn opencode_config_path(workspace_path: &str) -> PathBuf {
 }
 
 fn pi_config_dir(workspace_path: &str) -> PathBuf {
-    Path::new(workspace_path).join(".sloposcope").join("pi-agent")
+    Path::new(workspace_path)
+        .join(".sloposcope")
+        .join("pi-agent")
 }
 
 fn pi_config_path(workspace_path: &str) -> PathBuf {
@@ -204,18 +234,15 @@ fn default_mcp_command() -> Vec<String> {
 }
 
 fn profile_env_lookup(profile: &AgentProfile, keys: &[&str]) -> Option<String> {
-    let from_profile = profile
-        .env
-        .as_object()
-        .and_then(|map| {
-            keys.iter().find_map(|key| {
-                map.get(*key)
-                    .and_then(|value| value.as_str())
-                    .map(str::trim)
-                    .filter(|value| !value.is_empty())
-                    .map(|value| value.to_string())
-            })
-        });
+    let from_profile = profile.env.as_object().and_then(|map| {
+        keys.iter().find_map(|key| {
+            map.get(*key)
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(|value| value.to_string())
+        })
+    });
     if from_profile.is_some() {
         return from_profile;
     }
@@ -331,54 +358,56 @@ fn write_pi_config(profile: &AgentProfile, workspace_path: &str) -> Result<(), S
     let nim_model = opencode_nim_model(profile);
     let nim_base_url = opencode_nim_base_url(profile);
     let model_ref = format!("sloposcope_nim/{nim_model}");
-    let config = serde_yaml::to_string(&serde_yaml::Value::Mapping(serde_yaml::Mapping::from_iter([
-        (
-            serde_yaml::Value::String("defaultThinkingLevel".to_string()),
-            serde_yaml::Value::String("medium".to_string()),
-        ),
-        (
-            serde_yaml::Value::String("enabledModels".to_string()),
-            serde_yaml::Value::Sequence(vec![serde_yaml::Value::String(
-                "sloposcope_nim/*".to_string(),
-            )]),
-        ),
-        (
-            serde_yaml::Value::String("modelProviderOrder".to_string()),
-            serde_yaml::Value::Sequence(vec![serde_yaml::Value::String(
-                "sloposcope_nim".to_string(),
-            )]),
-        ),
-        (
-            serde_yaml::Value::String("modelRoles".to_string()),
-            serde_yaml::Value::Mapping(serde_yaml::Mapping::from_iter([
-                (
-                    serde_yaml::Value::String("default".to_string()),
-                    serde_yaml::Value::String(model_ref.clone()),
-                ),
-                (
-                    serde_yaml::Value::String("smol".to_string()),
-                    serde_yaml::Value::String(model_ref.clone()),
-                ),
-                (
-                    serde_yaml::Value::String("slow".to_string()),
-                    serde_yaml::Value::String(model_ref.clone()),
-                ),
-                (
-                    serde_yaml::Value::String("plan".to_string()),
-                    serde_yaml::Value::String(model_ref.clone()),
-                ),
-                (
-                    serde_yaml::Value::String("commit".to_string()),
-                    serde_yaml::Value::String(model_ref),
-                ),
-            ])),
-        ),
-    ])))
+    let config = serde_yaml::to_string(&serde_yaml::Value::Mapping(
+        serde_yaml::Mapping::from_iter([
+            (
+                serde_yaml::Value::String("defaultThinkingLevel".to_string()),
+                serde_yaml::Value::String("medium".to_string()),
+            ),
+            (
+                serde_yaml::Value::String("enabledModels".to_string()),
+                serde_yaml::Value::Sequence(vec![serde_yaml::Value::String(
+                    "sloposcope_nim/*".to_string(),
+                )]),
+            ),
+            (
+                serde_yaml::Value::String("modelProviderOrder".to_string()),
+                serde_yaml::Value::Sequence(vec![serde_yaml::Value::String(
+                    "sloposcope_nim".to_string(),
+                )]),
+            ),
+            (
+                serde_yaml::Value::String("modelRoles".to_string()),
+                serde_yaml::Value::Mapping(serde_yaml::Mapping::from_iter([
+                    (
+                        serde_yaml::Value::String("default".to_string()),
+                        serde_yaml::Value::String(model_ref.clone()),
+                    ),
+                    (
+                        serde_yaml::Value::String("smol".to_string()),
+                        serde_yaml::Value::String(model_ref.clone()),
+                    ),
+                    (
+                        serde_yaml::Value::String("slow".to_string()),
+                        serde_yaml::Value::String(model_ref.clone()),
+                    ),
+                    (
+                        serde_yaml::Value::String("plan".to_string()),
+                        serde_yaml::Value::String(model_ref.clone()),
+                    ),
+                    (
+                        serde_yaml::Value::String("commit".to_string()),
+                        serde_yaml::Value::String(model_ref),
+                    ),
+                ])),
+            ),
+        ]),
+    ))
     .map_err(|err| format!("serialize pi config: {err}"))?;
     write_if_changed(&pi_config_path(workspace_path), &config)?;
 
-    let models = serde_yaml::to_string(&serde_yaml::Value::Mapping(serde_yaml::Mapping::from_iter([
-        (
+    let models = serde_yaml::to_string(&serde_yaml::Value::Mapping(
+        serde_yaml::Mapping::from_iter([(
             serde_yaml::Value::String("providers".to_string()),
             serde_yaml::Value::Mapping(serde_yaml::Mapping::from_iter([(
                 serde_yaml::Value::String("sloposcope_nim".to_string()),
@@ -453,7 +482,9 @@ fn write_pi_config(profile: &AgentProfile, workspace_path: &str) -> Result<(), S
                                 (
                                     serde_yaml::Value::String("compat".to_string()),
                                     serde_yaml::Value::Mapping(serde_yaml::Mapping::from_iter([(
-                                        serde_yaml::Value::String("supportsDeveloperRole".to_string()),
+                                        serde_yaml::Value::String(
+                                            "supportsDeveloperRole".to_string(),
+                                        ),
                                         serde_yaml::Value::Bool(false),
                                     )])),
                                 ),
@@ -462,8 +493,8 @@ fn write_pi_config(profile: &AgentProfile, workspace_path: &str) -> Result<(), S
                     ),
                 ])),
             )])),
-        ),
-    ])))
+        )]),
+    ))
     .map_err(|err| format!("serialize pi models: {err}"))?;
     write_if_changed(&pi_models_path(workspace_path), &models)?;
 
@@ -519,7 +550,10 @@ fn render_prompt(
         format!("- Mission facts: {}", bundle.mission_facts_path),
         format!("- Objective contract: {}", bundle.objective_contract_path),
         format!("- Session context: {}", bundle.session_context_path),
-        format!("- Runtime context snapshot: {}", bundle.context_snapshot_path),
+        format!(
+            "- Runtime context snapshot: {}",
+            bundle.context_snapshot_path
+        ),
         format!("- Active MCP config: {}", bundle.mcp_config_path),
         "".to_string(),
         "Required sequence:".to_string(),
@@ -568,6 +602,7 @@ pub fn prepare_agent_harness_bundle(
     let session_context_path = bundle_dir.join("session_context.json");
     let context_snapshot_path = bundle_dir.join("runtime_context.json");
     let prompt_path = bundle_dir.join("prompt.md");
+    let nudge_path = bundle_dir.join("nudges.ndjson");
     let mcp_config_path = bundle_dir.join("active_mcp.json");
     let diagnostics_path = bundle_dir.join("harness_diagnostics.json");
     let opencode_config_path = opencode_config_path(workspace_path);
@@ -585,6 +620,7 @@ pub fn prepare_agent_harness_bundle(
         session_context_path: session_context_path.display().to_string(),
         context_snapshot_path: context_snapshot_path.display().to_string(),
         prompt_path: prompt_path.display().to_string(),
+        nudge_path: nudge_path.display().to_string(),
         mcp_config_path: mcp_config_path.display().to_string(),
         opencode_config_path: opencode_config_path.display().to_string(),
         pi_config_dir: pi_config_dir.display().to_string(),
@@ -643,6 +679,7 @@ pub fn prepare_agent_harness_bundle(
     )
     .map_err(|err| format!("write {}: {err}", session_context_path.display()))?;
     write_if_changed(&context_snapshot_path, "{}\n")?;
+    write_if_changed(&nudge_path, "")?;
     fs::write(
         &mcp_config_path,
         serde_json::to_vec_pretty(&ActiveMcpConfig {
@@ -665,7 +702,10 @@ pub fn prepare_agent_harness_bundle(
         .map_err(|err| format!("serialize active MCP config: {err}"))?,
     )
     .map_err(|err| format!("write {}: {err}", mcp_config_path.display()))?;
-    write_if_changed(&prompt_path, &render_prompt(mission, objective, profile, &bundle))?;
+    write_if_changed(
+        &prompt_path,
+        &render_prompt(mission, objective, profile, &bundle),
+    )?;
     if is_opencode_cli_provider(&profile.provider) {
         write_opencode_config(profile, &bundle)?;
     }
@@ -731,6 +771,7 @@ mod tests {
             capabilities: vec!["can_edit".into()],
             transport_kind: "pty".into(),
             active: true,
+            is_reviewer: false,
             created_at: "unix:1".into(),
             updated_at: "unix:1".into(),
         };
@@ -757,13 +798,11 @@ mod tests {
             config.get("missionId").and_then(serde_json::Value::as_str),
             Some("mission-ui")
         );
-        assert!(
-            config["tools"]
-                .as_array()
-                .expect("tools array")
-                .iter()
-                .any(|value| value.as_str() == Some("agent_request_context"))
-        );
+        assert!(config["tools"]
+            .as_array()
+            .expect("tools array")
+            .iter()
+            .any(|value| value.as_str() == Some("agent_request_context")));
         assert!(Path::new(&bundle.harness_script_path).is_file());
     }
 
@@ -830,6 +869,7 @@ mod tests {
             capabilities: vec!["can_edit".into()],
             transport_kind: "pipe".into(),
             active: true,
+            is_reviewer: false,
             created_at: "unix:1".into(),
             updated_at: "unix:1".into(),
         };
@@ -845,7 +885,10 @@ mod tests {
         .expect("bundle");
 
         let config_path = worktree.join(".sloposcope").join("opencode.json");
-        assert_eq!(bundle.opencode_config_path, config_path.display().to_string());
+        assert_eq!(
+            bundle.opencode_config_path,
+            config_path.display().to_string()
+        );
         assert!(config_path.is_file());
         let config: serde_json::Value =
             serde_json::from_slice(&fs::read(&config_path).expect("opencode config"))
@@ -934,6 +977,7 @@ mod tests {
             capabilities: vec!["can_edit".into()],
             transport_kind: "pipe".into(),
             active: true,
+            is_reviewer: false,
             created_at: "unix:1".into(),
             updated_at: "unix:1".into(),
         };
